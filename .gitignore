@@ -3,6 +3,10 @@ data/
 checkpoints/
 earth_world_model/checkpoints/
 models/attentive_probe/*.pt
+Docs/
+Manuscript/
+Initial_Idea/
+results/
 __pycache__/
 *.py[cod]
 *.joblib
