@@ -1,0 +1,261 @@
+schema_version: 1
+
+paper_axes:
+  - paper.source_family
+  - paper.sample_budget_train
+  - paper.sample_budget_eval
+  - paper.cadence
+  - paper.recipe
+  - paper.token_mode
+  - paper.spatial_fusion
+  - paper.temporal_block_type
+  - paper.continuation
+  - paper.epochs
+  - paper.lr_schedule
+
+experiments:
+  - id: ssl4eo_50k_control_v1
+    status: runnable_now
+    kind: pretrain
+    description: Plain 50k SSL4EO breadth control using the legacy pooled recipe.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: breadth_50k
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: control
+      token_mode: pooled
+      spatial_fusion: early_mean
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: constant
+      main_question: Does scale alone help before any JEPA-2.1-inspired upgrades?
+
+  - id: ssl4eo_50k_stagea_v1
+    status: runnable_now
+    kind: pretrain
+    description: 50k SSL4EO with visible-context loss added on top of the control recipe.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_stagea_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: breadth_50k
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_a_context_loss
+      token_mode: pooled
+      spatial_fusion: early_mean
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: constant
+      main_question: Does adding visible-context loss help without changing representation structure?
+
+  - id: ssl4eo_50k_stageb_v1
+    status: runnable_now
+    kind: pretrain
+    description: 50k SSL4EO with hierarchical teacher supervision on the pooled recipe.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_stageb_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: breadth_50k
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_b_hierarchical
+      token_mode: pooled
+      spatial_fusion: early_mean
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: constant
+      main_question: Does hierarchical supervision help before switching to dense tokens?
+
+  - id: ssl4eo_50k_stagec_v1
+    status: runnable_now
+    kind: pretrain
+    description: 50k SSL4EO Stage C dense-token breadth run.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_stagec_dense_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: breadth_50k
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does the dense Stage C recipe outperform the pooled breadth baselines?
+
+  - id: ssl4eo_50k_staged_rope_v1
+    status: runnable_now
+    kind: pretrain
+    description: 50k SSL4EO Stage D-style breadth run with RoPE-based temporal blocks.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_staged_rope_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: breadth_50k
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_d_rope
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: stage_d_rope
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does the Stage D architecture help on breadth-only data?
+
+  - id: dense_cdse_stagec_scratch_pilot_v1
+    status: runnable_after_dense_materialization
+    kind: pretrain
+    description: Scratch dense-temporal Stage C training on a materialized CDSE pilot corpus.
+    launcher:
+      kind: direct_train
+    config_path: earth_world_model/configs/dense_temporal_index_vjepa21_stagec_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: dense_cdse_pilot
+      source_family:
+        - CDSE-custom-dense
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: pilot_dependent
+      sample_budget_eval: pilot_dependent
+      cadence: weekly_or_biweekly
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does the dense corpus and loader train stably before continuation experiments?
+
+  - id: dense_cdse_5k_biweekly_stagec_continue_v1
+    status: runnable_after_dense_materialization
+    kind: pretrain
+    description: Continue the best SSL4EO Stage C checkpoint on 5k dense CDSE biweekly sequences, keeping Stage C fixed.
+    launcher:
+      kind: direct_train
+    config_path: earth_world_model/configs/dense_temporal_index_vjepa21_stagec_cuda_gpu_vm.yaml
+    resume_from_experiment: ssl4eo_50k_stagec_v1
+    paper:
+      comparison_group: dense_continuation
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+        - CDSE-custom-dense
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 5000
+      sample_budget_eval: dense_val_split
+      cadence: biweekly
+      continuation: ssl4eo_50k_stagec_v1
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does dense temporal continuation add value beyond the breadth Stage C checkpoint?
+
+  - id: dense_cdse_5k_biweekly_staged_continue_v1
+    status: runnable_after_dense_materialization
+    kind: pretrain
+    description: Continue the best SSL4EO Stage C checkpoint on 5k dense CDSE biweekly sequences with Stage D enabled.
+    launcher:
+      kind: direct_train
+    config_path: earth_world_model/configs/dense_temporal_index_vjepa21_staged_rope_cuda_gpu_vm.yaml
+    resume_from_experiment: ssl4eo_50k_stagec_v1
+    paper:
+      comparison_group: dense_continuation
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+        - CDSE-custom-dense
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 5000
+      sample_budget_eval: dense_val_split
+      cadence: biweekly
+      continuation: ssl4eo_50k_stagec_v1
+      recipe: stage_d_rope
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: stage_d_rope
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: After the clean continuation test, does Stage D add further value on the dense corpus?
+
+  - id: mixed_ssl4eo_cdse_stagec_80_20_v1
+    status: planned_sampler_work
+    kind: pretrain
+    description: Mixed-source Stage C run with 80 percent SSL4EO and 20 percent dense CDSE.
+    launcher:
+      kind: planned
+    paper:
+      comparison_group: mixed_source
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+        - CDSE-custom-dense
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: mixed_sampler
+      sample_budget_eval: 2048_plus_dense_val
+      cadence: seasonal_plus_biweekly
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does mixed sampling regularize the dense model after the sequential path is understood?
+      blocked_by:
+        - multi-corpus sampler
+        - mixed-source batch accounting

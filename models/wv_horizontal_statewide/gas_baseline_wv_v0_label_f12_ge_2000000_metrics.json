@@ -1,0 +1,146 @@
+{
+  "generated_at_utc": "2026-03-20T14:34:00.295950+00:00",
+  "dataset": "gas_training_table_wv_v0",
+  "basin_id": "wv_horizontal_statewide",
+  "basin_name": "West Virginia Horizontal Statewide",
+  "model_type": "xgboost_classifier_gpu",
+  "label_column": "label_f12_ge_2000000",
+  "label_definition": "True first-life gas labels anchored on first non-zero gas month from WVDEP H6A production history.",
+  "row_count_train": 2617,
+  "row_count_test": 643,
+  "positive_rate_train": 0.3412304165074513,
+  "positive_rate_test": 0.8740279937791602,
+  "roc_auc_test": 0.8135736566934669,
+  "average_precision_test": 0.9638004296648361,
+  "temporal_holdout_quantile": 0.8,
+  "temporal_holdout_cutoff_date": "2022-03-01",
+  "train_first_prod_start": "2018-01-01",
+  "train_first_prod_end": "2022-03-01",
+  "test_first_prod_start": "2022-04-01",
+  "test_first_prod_end": "2025-01-01",
+  "feature_cols_numeric": [
+    "latitude",
+    "longitude",
+    "producing_well_count_2km",
+    "producing_well_count_5km",
+    "nearest_producing_well_distance_km",
+    "permit_count_2km",
+    "permit_count_5km",
+    "nearest_permit_distance_km",
+    "mature_f12_neighbor_count_5km",
+    "mature_f12_neighbor_median_gas_5km",
+    "mature_f12_neighbor_p90_gas_5km",
+    "mature_f12_neighbor_count_10km",
+    "mature_f12_neighbor_median_gas_10km",
+    "mature_f12_neighbor_p90_gas_10km"
+  ],
+  "feature_cols_categorical": [
+    "county_code",
+    "formation_name",
+    "marcellus_flag"
+  ],
+  "scale_pos_weight_train": 1.9305711086226205,
+  "top_feature_importances": [
+    {
+      "feature": "num__mature_f12_neighbor_count_10km",
+      "importance": 0.211317241191864
+    },
+    {
+      "feature": "num__mature_f12_neighbor_p90_gas_10km",
+      "importance": 0.07800105959177017
+    },
+    {
+      "feature": "cat__formation_name_Utica",
+      "importance": 0.0486331470310688
+    },
+    {
+      "feature": "num__producing_well_count_5km",
+      "importance": 0.04494250938296318
+    },
+    {
+      "feature": "cat__county_code_9",
+      "importance": 0.0416446253657341
+    },
+    {
+      "feature": "cat__marcellus_flag_n",
+      "importance": 0.04046893119812012
+    },
+    {
+      "feature": "cat__county_code_95",
+      "importance": 0.036446116864681244
+    },
+    {
+      "feature": "num__mature_f12_neighbor_median_gas_5km",
+      "importance": 0.03503285348415375
+    },
+    {
+      "feature": "cat__formation_name_Point Pleasant",
+      "importance": 0.03159523755311966
+    },
+    {
+      "feature": "cat__county_code_61",
+      "importance": 0.030447885394096375
+    },
+    {
+      "feature": "cat__county_code_17",
+      "importance": 0.02910650707781315
+    },
+    {
+      "feature": "num__mature_f12_neighbor_count_5km",
+      "importance": 0.027514828369021416
+    },
+    {
+      "feature": "num__mature_f12_neighbor_p90_gas_5km",
+      "importance": 0.025491876527667046
+    },
+    {
+      "feature": "cat__county_code_73",
+      "importance": 0.02533050812780857
+    },
+    {
+      "feature": "num__latitude",
+      "importance": 0.023308342322707176
+    },
+    {
+      "feature": "num__mature_f12_neighbor_median_gas_10km",
+      "importance": 0.02116832137107849
+    },
+    {
+      "feature": "num__permit_count_5km",
+      "importance": 0.019147884100675583
+    },
+    {
+      "feature": "num__longitude",
+      "importance": 0.018772050738334656
+    },
+    {
+      "feature": "num__permit_count_2km",
+      "importance": 0.016909705474972725
+    },
+    {
+      "feature": "cat__county_code_49",
+      "importance": 0.016895601525902748
+    },
+    {
+      "feature": "num__nearest_permit_distance_km",
+      "importance": 0.016391215845942497
+    },
+    {
+      "feature": "cat__marcellus_flag_y",
+      "importance": 0.01624542847275734
+    },
+    {
+      "feature": "cat__county_code_51",
+      "importance": 0.016147581860423088
+    },
+    {
+      "feature": "cat__formation_name_Point Pleasant,Trenton Group",
+      "importance": 0.015067126601934433
+    },
+    {
+      "feature": "num__nearest_producing_well_distance_km",
+      "importance": 0.014567691832780838
+    }
+  ],
+  "evaluation_note": "Metrics are from a temporal first-production holdout. The saved deployment model is retrained on the full labeled WV dataset after evaluation."
+}

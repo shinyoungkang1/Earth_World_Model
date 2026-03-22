@@ -1,0 +1,135 @@
+{
+  "generated_at_utc": "2026-03-20T12:17:16.180625+00:00",
+  "dataset": "gas_training_table_v1",
+  "basin_id": "swpa_core_washington_greene",
+  "basin_name": "SWPA Core - Washington and Greene",
+  "model_type": "lightgbm_classifier",
+  "label_column": "label_recent12_ge_250000",
+  "label_definition": "Recent 12-month unconventional gas sum over the currently ingested PA DEP monthly window; not a true first-life F12 label.",
+  "row_count_train": 3182,
+  "row_count_test": 793,
+  "positive_rate_train": 0.4129478315524827,
+  "positive_rate_test": 0.8297604035308953,
+  "roc_auc_test": 0.5240290442418103,
+  "average_precision_test": 0.825504510451069,
+  "temporal_holdout_quantile": 0.8,
+  "temporal_holdout_cutoff_date": "2019-01-16",
+  "train_spud_start": "1982-06-18",
+  "train_spud_end": "2019-01-16",
+  "test_spud_start": "2019-01-25",
+  "test_spud_end": "2026-02-11",
+  "feature_cols_numeric": [
+    "latitude_decimal",
+    "longitude_decimal",
+    "elevation_m",
+    "slope_deg",
+    "relief_3px_m",
+    "fault_distance_km",
+    "well_count_2km",
+    "well_count_5km",
+    "nearest_well_distance_km",
+    "permit_count_2km",
+    "permit_count_5km",
+    "nearest_permit_distance_km"
+  ],
+  "feature_cols_categorical": [
+    "geology_map_symbol",
+    "geology_age",
+    "geology_lith1"
+  ],
+  "top_feature_importances": [
+    {
+      "feature": "num__nearest_well_distance_km",
+      "importance": 1964
+    },
+    {
+      "feature": "num__longitude_decimal",
+      "importance": 1591
+    },
+    {
+      "feature": "num__latitude_decimal",
+      "importance": 1334
+    },
+    {
+      "feature": "num__well_count_5km",
+      "importance": 1333
+    },
+    {
+      "feature": "num__fault_distance_km",
+      "importance": 1202
+    },
+    {
+      "feature": "num__elevation_m",
+      "importance": 1062
+    },
+    {
+      "feature": "num__slope_deg",
+      "importance": 1059
+    },
+    {
+      "feature": "num__relief_3px_m",
+      "importance": 986
+    },
+    {
+      "feature": "num__well_count_2km",
+      "importance": 954
+    },
+    {
+      "feature": "num__nearest_permit_distance_km",
+      "importance": 215
+    },
+    {
+      "feature": "num__permit_count_5km",
+      "importance": 98
+    },
+    {
+      "feature": "num__permit_count_2km",
+      "importance": 42
+    },
+    {
+      "feature": "cat__geology_map_symbol_Pg",
+      "importance": 35
+    },
+    {
+      "feature": "cat__geology_map_symbol_Pw",
+      "importance": 35
+    },
+    {
+      "feature": "cat__geology_map_symbol_PPw",
+      "importance": 28
+    },
+    {
+      "feature": "cat__geology_age_Permian",
+      "importance": 25
+    },
+    {
+      "feature": "cat__geology_map_symbol_Pm",
+      "importance": 15
+    },
+    {
+      "feature": "cat__geology_age_Pennsylvanian",
+      "importance": 7
+    },
+    {
+      "feature": "cat__geology_lith1_Limestone",
+      "importance": 6
+    },
+    {
+      "feature": "cat__geology_lith1_Sandstone",
+      "importance": 5
+    },
+    {
+      "feature": "cat__geology_age_Permian and Pennsylvanian",
+      "importance": 4
+    },
+    {
+      "feature": "cat__geology_map_symbol_Pcc",
+      "importance": 0
+    },
+    {
+      "feature": "cat__geology_lith1_Shale",
+      "importance": 0
+    }
+  ],
+  "evaluation_note": "Metrics are from a temporal holdout only. The saved deployment model is retrained on the full basin-labeled dataset after evaluation."
+}

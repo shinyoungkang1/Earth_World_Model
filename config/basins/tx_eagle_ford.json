@@ -1,0 +1,30 @@
+{
+  "basin_id": "tx_eagle_ford",
+  "display_name": "Texas Eagle Ford Shale",
+  "resource_type": "oil_and_gas",
+  "region_type": "basin_geographic",
+  "state": "Texas",
+  "counties": [
+    "Webb",
+    "La Salle",
+    "McMullen",
+    "Dimmit",
+    "Maverick",
+    "Zavala",
+    "Frio",
+    "Atascosa",
+    "Live Oak",
+    "Karnes",
+    "DeWitt",
+    "Gonzales",
+    "Lavaca",
+    "Wilson"
+  ],
+  "map_center": {
+    "longitude": -98.5,
+    "latitude": 28.8
+  },
+  "default_grid_step_deg": 0.025,
+  "default_grid_max_distance_km": 12.0,
+  "notes": "Texas Eagle Ford Shale play spanning the oil and gas windows."
+}

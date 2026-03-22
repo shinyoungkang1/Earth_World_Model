@@ -1,0 +1,24 @@
+{
+  "basin_id": "tx_haynesville",
+  "display_name": "Texas Haynesville Shale",
+  "resource_type": "gas",
+  "region_type": "basin_geographic",
+  "state": "Texas",
+  "counties": [
+    "Harrison",
+    "Panola",
+    "Rusk",
+    "Shelby",
+    "San Augustine",
+    "Sabine",
+    "Nacogdoches",
+    "Angelina"
+  ],
+  "map_center": {
+    "longitude": -94.5,
+    "latitude": 32.0
+  },
+  "default_grid_step_deg": 0.05,
+  "default_grid_max_distance_km": 15.0,
+  "notes": "Texas Haynesville Shale gas play in East Texas."
+}

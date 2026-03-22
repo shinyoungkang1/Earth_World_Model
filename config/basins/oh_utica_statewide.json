@@ -1,0 +1,14 @@
+{
+  "basin_id": "oh_utica_statewide",
+  "display_name": "Ohio Utica Shale Statewide",
+  "resource_type": "gas",
+  "region_type": "statewide_horizontal",
+  "state": "Ohio",
+  "map_center": {
+    "longitude": -81.3,
+    "latitude": 40.1
+  },
+  "default_grid_step_deg": 0.05,
+  "default_grid_max_distance_km": 15.0,
+  "notes": "Ohio Utica Shale statewide horizontal well region."
+}

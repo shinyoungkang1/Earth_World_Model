@@ -1,0 +1,35 @@
+{
+  "generated_at_utc": "2026-03-20T07:04:12.410601+00:00",
+  "dataset": "gas_training_table_v0",
+  "model_type": "logistic_regression",
+  "label_column": "label_obs12_ge_250000",
+  "row_count_train": 11775,
+  "row_count_test": 3557,
+  "positive_rate_train": 0.43278131634819533,
+  "positive_rate_test": 0.39612032611751474,
+  "roc_auc_test": 0.823924875071534,
+  "average_precision_test": 0.6725825994746384,
+  "held_out_counties": [
+    "Blair",
+    "Clinton",
+    "Elk",
+    "Erie",
+    "Greene",
+    "Lycoming",
+    "McKean",
+    "Wayne"
+  ],
+  "feature_cols_numeric": [
+    "latitude_decimal",
+    "longitude_decimal",
+    "spud_year",
+    "spud_month"
+  ],
+  "feature_cols_categorical": [
+    "county_name",
+    "municipality_name",
+    "geology_map_symbol",
+    "geology_age",
+    "geology_lith1"
+  ]
+}

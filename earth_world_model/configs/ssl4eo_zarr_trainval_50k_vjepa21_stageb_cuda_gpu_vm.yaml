@@ -1,0 +1,61 @@
+runtime:
+  backend: ${EWM_BACKEND:-cuda}
+  seed: 42
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_phase2_50k_gpu/checkpoints/ssl4eo_zarr_trainval_50k_vjepa21_stageb_cuda}
+  autocast_dtype: float16
+
+data:
+  kind: ssl4eo_zarr
+  root_dir: ${EWM_SSL4EO_ROOT:-/tmp/ewm_phase2_scale_gpu/data/ssl4eo_zarr_50k}
+  split: train
+  patch_size: 128
+  max_shards: 0
+  sample_offset: 0
+  max_samples: 50000
+  min_clear_fraction: 0.8
+  crop_mode: random
+  repeat_factor: 1
+  num_workers: 4
+  assume_single_sample_per_shard: false
+  max_open_shards: 16
+
+model:
+  input_mode: s2s1
+  embed_dim: 384
+  patch_px: 8
+  temporal_depth: 6
+  predictor_depth: 3
+  num_heads: 8
+  hierarchical_layers: [1, 3, 5]
+
+training:
+  batch_size: 64
+  epochs: 3
+  lr: 3.0e-4
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 50
+  save_every_epochs: 1
+  max_steps_per_epoch: 0
+  predict_visible_context: true
+  context_loss_weight: 0.5
+  context_loss_distance_weighted: true
+  context_loss_sqrt_distance: true
+
+eval:
+  enabled: true
+  every_epochs: 1
+  batch_size: 64
+  max_batches: 0
+  mask_mode: all
+  data:
+    split: val
+    sample_offset: 0
+    max_samples: 2048
+    crop_mode: center
+    repeat_factor: 1
+    num_workers: 4
+    assume_single_sample_per_shard: false
+    max_open_shards: 16

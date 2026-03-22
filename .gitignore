@@ -1,0 +1,8 @@
+.env
+data/
+checkpoints/
+earth_world_model/checkpoints/
+models/attentive_probe/*.pt
+__pycache__/
+*.py[cod]
+*.joblib

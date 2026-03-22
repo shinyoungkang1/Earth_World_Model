@@ -1,0 +1,123 @@
+{
+  "registry_version": 1,
+  "regions": [
+    {
+      "region_id": "swpa_core",
+      "basin_config": "swpa_core_washington_greene",
+      "state": "PA",
+      "canonical_dir": "pa_mvp",
+      "label_method": "day_prorated",
+      "label_kwargs": {
+        "well_api_col": "permit_num",
+        "start_col": "production_period_start_date",
+        "end_col": "production_period_end_date",
+        "gas_col": "gas_quantity",
+        "scope_col": "production_scope",
+        "scope_value": "unconventional"
+      },
+      "column_renames": "PA_COLUMN_RENAMES",
+      "estimated_wells": 3200
+    },
+    {
+      "region_id": "pa_northeast",
+      "basin_config": "pa_northeast_susquehanna",
+      "state": "PA",
+      "canonical_dir": "pa_mvp",
+      "label_method": "day_prorated",
+      "label_kwargs": {
+        "well_api_col": "permit_num",
+        "start_col": "production_period_start_date",
+        "end_col": "production_period_end_date",
+        "gas_col": "gas_quantity",
+        "scope_col": "production_scope",
+        "scope_value": "unconventional"
+      },
+      "column_renames": "PA_COLUMN_RENAMES",
+      "estimated_wells": 2800
+    },
+    {
+      "region_id": "wv_horizontal",
+      "basin_config": "wv_horizontal_statewide",
+      "state": "WV",
+      "canonical_dir": "wv_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "WV_COLUMN_RENAMES",
+      "estimated_wells": 2500
+    },
+    {
+      "region_id": "oh_utica",
+      "basin_config": "oh_utica_statewide",
+      "state": "OH",
+      "canonical_dir": "oh_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "OH_COLUMN_RENAMES",
+      "estimated_wells": 2700
+    },
+    {
+      "region_id": "co_dj_basin",
+      "basin_config": "co_dj_basin_wattenberg",
+      "state": "CO",
+      "canonical_dir": "co_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "CO_COLUMN_RENAMES",
+      "estimated_wells": 5000
+    },
+    {
+      "region_id": "tx_permian",
+      "basin_config": "tx_permian_delaware_midland",
+      "state": "TX",
+      "canonical_dir": "tx_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "TX_COLUMN_RENAMES",
+      "estimated_wells": 15000
+    },
+    {
+      "region_id": "tx_eagle_ford",
+      "basin_config": "tx_eagle_ford",
+      "state": "TX",
+      "canonical_dir": "tx_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "TX_COLUMN_RENAMES",
+      "estimated_wells": 8000
+    },
+    {
+      "region_id": "tx_haynesville",
+      "basin_config": "tx_haynesville",
+      "state": "TX",
+      "canonical_dir": "tx_mvp",
+      "label_method": "month_based",
+      "label_kwargs": {
+        "well_api_col": "well_api",
+        "period_col": "period_start_date",
+        "gas_col": "gas_quantity"
+      },
+      "column_renames": "TX_COLUMN_RENAMES",
+      "estimated_wells": 3500
+    }
+  ]
+}

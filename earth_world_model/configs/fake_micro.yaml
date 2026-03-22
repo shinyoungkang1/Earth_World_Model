@@ -1,0 +1,29 @@
+runtime:
+  backend: cpu
+  seed: 42
+  checkpoint_dir: earth_world_model/checkpoints/fake_micro
+
+data:
+  kind: fake
+  num_samples: 1024
+  patch_size: 128
+  max_timestamps: 4
+  num_workers: 0
+
+model:
+  embed_dim: 128
+  patch_px: 8
+  temporal_depth: 4
+  predictor_depth: 2
+  num_heads: 4
+
+training:
+  batch_size: 8
+  epochs: 2
+  lr: 3.0e-4
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 10
+  save_every_epochs: 1

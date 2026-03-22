@@ -1,0 +1,44 @@
+{
+  "generated_at_utc": "2026-03-21T22:08:32.174299+00:00",
+  "dataset": "gas_f12_regression_comparison_v1",
+  "basin_id": "swpa_core_washington_greene",
+  "cohort_name": "prithvi_f12_volume",
+  "fused_path": "/tmp/regression_inputs/fused_features_v1.parquet",
+  "target_column": "f12_gas",
+  "target_transform": "log1p",
+  "row_count_cohort": 256,
+  "row_count_train": 205,
+  "row_count_test": 51,
+  "embedding_column_count": 1024,
+  "temporal_holdout_quantile": 0.8,
+  "temporal_holdout_cutoff_date": "2019-07-01",
+  "train_first_prod_start": "2012-01-01",
+  "train_first_prod_end": "2019-07-01",
+  "test_first_prod_start": "2019-09-01",
+  "test_first_prod_end": "2025-03-01",
+  "baseline": {
+    "rmse_model_scale": 6.720121229253404,
+    "mae_model_scale": 6.133604833806214,
+    "r2_model_scale": -0.3538039628500451,
+    "rmse_raw": 1422569.7440158068,
+    "mae_raw": 1089357.2640325236,
+    "r2_raw": -1.4072650402443485,
+    "spearman_raw": 0.27488052158155124
+  },
+  "fused": {
+    "rmse_model_scale": 6.791593477594651,
+    "mae_model_scale": 6.296946148070363,
+    "r2_model_scale": -0.3827540234102538,
+    "rmse_raw": 1392557.600366434,
+    "mae_raw": 1062399.6337771572,
+    "r2_raw": -1.3067637041944309,
+    "spearman_raw": 0.43425809568379375
+  },
+  "notes": [
+    "Baseline and fused models were trained on the same fused cohort.",
+    "This isolates the value of adding embeddings better than comparing across different cohorts."
+  ],
+  "baseline_model_path": "/home/shin/Mineral_Gas_Locator/models/swpa_core_washington_greene/gas_f12_regression_baseline_prithvi_f12_volume.joblib",
+  "fused_model_path": "/home/shin/Mineral_Gas_Locator/models/swpa_core_washington_greene/gas_f12_regression_fused_prithvi_f12_volume.joblib",
+  "metrics_path": "/home/shin/Mineral_Gas_Locator/models/swpa_core_washington_greene/gas_f12_regression_compare_prithvi_f12_volume_metrics.json"
+}

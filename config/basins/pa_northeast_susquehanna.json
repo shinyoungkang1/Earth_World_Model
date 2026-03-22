@@ -1,0 +1,20 @@
+{
+  "basin_id": "pa_northeast_susquehanna",
+  "display_name": "PA Northeast - Susquehanna Basin",
+  "resource_type": "gas",
+  "region_type": "county_cluster",
+  "counties": [
+    "Susquehanna",
+    "Bradford",
+    "Tioga",
+    "Wyoming",
+    "Lycoming"
+  ],
+  "map_center": {
+    "longitude": -76.3,
+    "latitude": 41.7
+  },
+  "default_grid_step_deg": 0.025,
+  "default_grid_max_distance_km": 12.0,
+  "notes": "NE PA unconventional gas region covering the Susquehanna Basin counties."
+}

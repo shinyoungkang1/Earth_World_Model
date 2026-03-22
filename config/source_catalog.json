@@ -1,0 +1,297 @@
+{
+  "catalog_version": 1,
+  "project": "SubTerra Multi-Region",
+  "sources": [
+    {
+      "source_id": "pa_dep_inventory",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_pa_dep.py", "--inventory-only"],
+      "raw_manifests": ["data/raw/pa_dep/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/pa_mvp/wells.csv"],
+      "ontology_entities": ["Well", "RawAsset"],
+      "notes": "Small PA DEP well inventory snapshot. Re-pull when triggered."
+    },
+    {
+      "source_id": "pa_dep_production",
+      "status": "active",
+      "refresh_strategy": "incremental_by_period_id",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/download_pa_dep.py",
+        "--production-only",
+        "--skip-existing-production"
+      ],
+      "raw_manifests": ["data/raw/pa_dep/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/pa_mvp/production.csv"],
+      "ontology_entities": ["ProductionRecord", "Well", "Permit", "RawAsset"],
+      "notes": "Checks the recent PA DEP production periods and only downloads missing period IDs."
+    },
+    {
+      "source_id": "pa_dep_permits",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_pa_arcgis.py"],
+      "raw_manifests": ["data/raw/arcgis_download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/permits.csv",
+        "data/canonical/pa_mvp/permits.geojson"
+      ],
+      "ontology_entities": ["Permit", "Well", "RawAsset"],
+      "notes": "Current unconventional permits and SPUD dates from the PA DEP ArcGIS layer."
+    },
+    {
+      "source_id": "pa_dcnr_bedrock_geology",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_pa_bedrock_geology_chunks.py", "--chunk-size", "500"],
+      "raw_manifests": ["data/raw/dcnr/download_manifest_bedrock_geology_chunks.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/bedrock_geology.geojson",
+        "data/canonical/pa_mvp/bedrock_geology_units.csv"
+      ],
+      "ontology_entities": ["BedrockGeologyPolygon", "BedrockGeologyUnit", "RawAsset"],
+      "notes": "Chunked PASDA-hosted DCNR bedrock geology snapshot."
+    },
+    {
+      "source_id": "usgs_dem_arc1",
+      "status": "active",
+      "refresh_strategy": "incremental_by_tile",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_usgs_pa.py", "--arc", "1"],
+      "raw_manifests": ["data/raw/usgs/download_manifest_arc1.json"],
+      "canonical_outputs": ["data/canonical/pa_mvp/raw_asset_status.csv"],
+      "ontology_entities": ["RasterTile", "RawAsset"],
+      "notes": "Fetches only missing DEM tiles for the current PA well footprint."
+    },
+    {
+      "source_id": "usgs_geophysics",
+      "status": "active",
+      "refresh_strategy": "if_missing_static_bundle",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_usgs_geophysics.py"],
+      "raw_manifests": ["data/raw/usgs/download_manifest_geophysics.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/raw_archive_members.csv",
+        "data/canonical/pa_mvp/raw_asset_status.csv"
+      ],
+      "ontology_entities": ["GeophysicsBundle", "RawAsset", "ArchiveMember"],
+      "notes": "Static USGS DS9 gravity and magnetic archive."
+    },
+    {
+      "source_id": "satellite_landsat_catalog",
+      "status": "active",
+      "refresh_strategy": "incremental_by_scene_id",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/refresh_cdse_stac_catalog.py",
+        "--source-id",
+        "satellite_landsat_catalog",
+        "--collection",
+        "landsat-c2-l1-oli-tirs",
+        "--bootstrap-days",
+        "90"
+      ],
+      "raw_manifests": ["data/raw/satellite_catalog/satellite_landsat_catalog/download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/raster_scenes_landsat.csv",
+        "data/canonical/pa_mvp/raster_catalogs.csv"
+      ],
+      "ontology_entities": ["RasterScene", "RasterComposite", "RasterTile", "RawAsset"],
+      "notes": "Incremental CDSE STAC Landsat scene catalog for the PA footprint."
+    },
+    {
+      "source_id": "satellite_sentinel2_catalog",
+      "status": "active",
+      "refresh_strategy": "incremental_by_scene_id",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/refresh_cdse_stac_catalog.py",
+        "--source-id",
+        "satellite_sentinel2_catalog",
+        "--collection",
+        "sentinel-2-l2a",
+        "--bootstrap-days",
+        "90",
+        "--cloud-cover-max",
+        "30"
+      ],
+      "raw_manifests": ["data/raw/satellite_catalog/satellite_sentinel2_catalog/download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/raster_scenes_sentinel2.csv",
+        "data/canonical/pa_mvp/raster_catalogs.csv"
+      ],
+      "ontology_entities": ["RasterScene", "RasterComposite", "RasterTile", "RawAsset"],
+      "notes": "Incremental CDSE STAC Sentinel-2 scene catalog for the PA footprint."
+    },
+    {
+      "source_id": "satellite_sentinel2_quicklooks",
+      "status": "active",
+      "refresh_strategy": "incremental_by_scene_id",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/materialize_sentinel_quicklooks.py"
+      ],
+      "raw_manifests": ["data/raw/satellite_assets/satellite_sentinel2_quicklooks/download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/raster_assets.csv",
+        "data/canonical/pa_mvp/raster_composites.csv"
+      ],
+      "ontology_entities": ["RasterAsset", "RasterComposite", "RasterCatalog", "RawAsset"],
+      "notes": "Downloads a bounded set of latest least-cloudy Sentinel quicklook thumbnails and builds a PA preview mosaic."
+    },
+    {
+      "source_id": "planet_psscene_catalog",
+      "status": "active",
+      "refresh_strategy": "incremental_by_scene_id",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_pa_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/refresh_planet_psscene_catalog.py"
+      ],
+      "raw_manifests": ["data/raw/planet_catalog/planet_psscene_catalog/download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/pa_mvp/planet_scenes_psscene.csv",
+        "data/canonical/pa_mvp/planet_scenes_psscene.geojson",
+        "data/canonical/pa_mvp/planet_order_drafts.csv"
+      ],
+      "ontology_entities": ["RasterScene", "AcquisitionOrderDraft", "RawAsset"],
+      "notes": "Refreshes a bounded Planet PSScene catalog over the PA footprint and generates non-submitted order drafts for visual and analytic bundles."
+    },
+    {
+      "source_id": "planet_basemaps_catalog",
+      "status": "manual",
+      "refresh_strategy": "api_status_check",
+      "default_mode": "manual",
+      "trigger_argv": ["python", "scripts/check_planet_basemaps.py"],
+      "raw_manifests": ["data/raw/satellite_catalog/planet_basemaps_catalog/download_manifest.json"],
+      "canonical_outputs": [],
+      "ontology_entities": ["RasterCatalog", "RasterTile", "RawAsset"],
+      "notes": "Manual Planet basemaps availability probe. Kept out of --all until credentials and product access are confirmed."
+    },
+    {
+      "source_id": "wv_dep_horizontal_wells",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/normalize_wv_mvp.py"],
+      "trigger_argv": ["python", "scripts/download_wv_dep.py", "--wells-only"],
+      "raw_manifests": ["data/raw/wv_dep/download_manifest.json"],
+      "canonical_outputs": [
+        "data/canonical/wv_mvp/wells.csv",
+        "data/canonical/wv_mvp/permits.csv",
+        "data/canonical/wv_mvp/laterals.geojson"
+      ],
+      "ontology_entities": ["Well", "Permit", "LateralFeature", "RawAsset"],
+      "notes": "West Virginia horizontal-only oil and gas wells and laterals from the official WVDEP ArcGIS service."
+    },
+    {
+      "source_id": "wv_dep_h6a_production",
+      "status": "active",
+      "refresh_strategy": "incremental_by_year",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/normalize_wv_mvp.py"],
+      "trigger_argv": [
+        "python",
+        "scripts/download_wv_dep.py",
+        "--production-only",
+        "--h6a-start-year",
+        "2018",
+        "--skip-existing-production"
+      ],
+      "raw_manifests": ["data/raw/wv_dep/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/wv_mvp/production.csv"],
+      "ontology_entities": ["ProductionRecord", "Well", "Permit", "RawAsset"],
+      "notes": "West Virginia official H6A horizontal-well production files from the WVDEP production report page."
+    },
+    {
+      "source_id": "oh_odnr_wells",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_ohio.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_ohio.py", "--wells-only"],
+      "raw_manifests": ["data/raw/oh_odnr/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/oh_mvp/wells.csv"],
+      "ontology_entities": ["Well", "RawAsset"],
+      "notes": "Ohio ODNR horizontal well inventory from the ODNR GIS service."
+    },
+    {
+      "source_id": "oh_odnr_production",
+      "status": "active",
+      "refresh_strategy": "incremental_by_year",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_ohio.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_ohio.py", "--production-only", "--skip-existing"],
+      "raw_manifests": ["data/raw/oh_odnr/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/oh_mvp/production.csv"],
+      "ontology_entities": ["ProductionRecord", "Well", "RawAsset"],
+      "notes": "Ohio ODNR horizontal well monthly production data."
+    },
+    {
+      "source_id": "co_cogcc_wells",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_colorado.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_colorado.py", "--wells-only"],
+      "raw_manifests": ["data/raw/co_cogcc/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/co_mvp/wells.csv"],
+      "ontology_entities": ["Well", "RawAsset"],
+      "notes": "Colorado COGCC horizontal well inventory."
+    },
+    {
+      "source_id": "co_cogcc_production",
+      "status": "active",
+      "refresh_strategy": "incremental_by_year",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_colorado.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_colorado.py", "--production-only", "--skip-existing"],
+      "raw_manifests": ["data/raw/co_cogcc/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/co_mvp/production.csv"],
+      "ontology_entities": ["ProductionRecord", "Well", "RawAsset"],
+      "notes": "Colorado COGCC horizontal well monthly production data."
+    },
+    {
+      "source_id": "tx_rrc_wells",
+      "status": "active",
+      "refresh_strategy": "snapshot_replace",
+      "default_mode": "if_missing",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_texas.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_texas.py", "--wells-only"],
+      "raw_manifests": ["data/raw/tx_rrc/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/tx_mvp/wells.csv"],
+      "ontology_entities": ["Well", "RawAsset"],
+      "notes": "Texas RRC horizontal well inventory. Serves Permian, Eagle Ford, and Haynesville basins."
+    },
+    {
+      "source_id": "tx_rrc_production",
+      "status": "active",
+      "refresh_strategy": "incremental_by_year",
+      "default_mode": "always",
+      "normalizer_argv": ["python", "scripts/multiregion/normalize_texas.py"],
+      "trigger_argv": ["python", "scripts/multiregion/download_texas.py", "--production-only", "--skip-existing", "--start-year", "2010"],
+      "raw_manifests": ["data/raw/tx_rrc/download_manifest.json"],
+      "canonical_outputs": ["data/canonical/tx_mvp/production.csv"],
+      "ontology_entities": ["ProductionRecord", "Well", "RawAsset"],
+      "notes": "Texas RRC horizontal well monthly production data. One download serves all three TX basins."
+    }
+  ]
+}

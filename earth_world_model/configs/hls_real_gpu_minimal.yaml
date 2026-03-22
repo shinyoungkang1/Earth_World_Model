@@ -1,0 +1,34 @@
+runtime:
+  backend: cuda
+  seed: 42
+  checkpoint_dir: earth_world_model/checkpoints/hls_real_gpu_minimal
+  autocast_dtype: float16
+
+data:
+  kind: hls_chip_index
+  index_path: data/features/swpa_core_washington_greene/hls_chip_index_v1.parquet
+  patch_size: 224
+  max_timestamps: 4
+  max_samples: 32
+  min_valid_fraction: 0.9
+  num_workers: 0
+
+model:
+  input_mode: hls6
+  embed_dim: 128
+  patch_px: 8
+  temporal_depth: 2
+  predictor_depth: 1
+  num_heads: 4
+
+training:
+  batch_size: 2
+  epochs: 1
+  lr: 3.0e-4
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 1
+  save_every_epochs: 1
+  max_steps_per_epoch: 4

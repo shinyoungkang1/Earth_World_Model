@@ -1,0 +1,24 @@
+{
+  "basin_id": "co_dj_basin_wattenberg",
+  "display_name": "Colorado DJ Basin - Wattenberg",
+  "resource_type": "gas",
+  "region_type": "basin_geographic",
+  "state": "Colorado",
+  "counties": [
+    "Weld",
+    "Adams",
+    "Arapahoe",
+    "Boulder",
+    "Broomfield",
+    "Denver",
+    "Larimer",
+    "Morgan"
+  ],
+  "map_center": {
+    "longitude": -104.6,
+    "latitude": 40.3
+  },
+  "default_grid_step_deg": 0.025,
+  "default_grid_max_distance_km": 12.0,
+  "notes": "Colorado DJ Basin Wattenberg field and surrounding counties."
+}

@@ -1,0 +1,31 @@
+runtime:
+  backend: cuda
+  seed: 42
+  checkpoint_dir: earth_world_model/checkpoints/gpu_8gb_smoke
+  autocast_dtype: float16
+
+data:
+  kind: fake
+  num_samples: 32
+  patch_size: 128
+  max_timestamps: 4
+  num_workers: 0
+
+model:
+  embed_dim: 96
+  patch_px: 8
+  temporal_depth: 2
+  predictor_depth: 1
+  num_heads: 4
+
+training:
+  batch_size: 2
+  epochs: 1
+  lr: 3.0e-4
+  weight_decay: 0.05
+  mask_ratio: 0.5
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 1
+  save_every_epochs: 1
+  max_steps_per_epoch: 4

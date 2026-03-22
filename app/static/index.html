@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SubTerra PA MVP Map</title>
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+    <link href="/static/styles.css" rel="stylesheet" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <h1>SubTerra PA MVP</h1>
+      <p class="muted">Current data, scene coverage, and optional Planet imagery.</p>
+
+      <section>
+        <h2>Summary</h2>
+        <dl id="summary"></dl>
+      </section>
+
+      <section>
+        <h2>Base</h2>
+        <label><input type="radio" name="base-layer" value="osm" checked /> OSM</label>
+        <label><input type="radio" name="base-layer" value="planet" /> Planet</label>
+        <div id="planet-status" class="note"></div>
+        <select id="planet-mosaics" disabled></select>
+      </section>
+
+      <section>
+        <h2>Overlays</h2>
+        <label><input type="checkbox" data-layer="wells" checked /> Wells</label>
+        <label><input type="checkbox" data-layer="permits" checked /> Permits</label>
+        <label><input type="checkbox" data-layer="geology" /> Bedrock geology</label>
+        <label><input type="checkbox" data-layer="sentinel_scenes" /> Sentinel-2 scenes</label>
+        <label><input type="checkbox" data-layer="landsat_scenes" /> Landsat scenes</label>
+        <label><input type="checkbox" data-layer="planet_scenes" /> Planet scenes</label>
+        <label><input type="checkbox" data-layer="gas_prospect_cells_v0" /> Gas prospect cells v0</label>
+        <label><input type="checkbox" data-layer="gas_prospect_cells_v1" checked /> Gas prospect cells v1</label>
+        <label><input type="checkbox" data-composite="sentinel2_recent_quicklook_mosaic" /> Sentinel quicklook mosaic</label>
+      </section>
+
+      <section>
+        <h2>Model</h2>
+        <div id="model-status" class="note"></div>
+      </section>
+
+      <section>
+        <h2>Top Prospects</h2>
+        <div id="top-prospects" class="prospect-list"></div>
+      </section>
+
+      <section>
+        <h2>Viewport</h2>
+        <div id="layer-status" class="note"></div>
+      </section>
+    </aside>
+    <main id="map"></main>
+
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+  </html>

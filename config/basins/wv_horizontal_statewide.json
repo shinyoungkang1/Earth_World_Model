@@ -1,0 +1,14 @@
+{
+  "basin_id": "wv_horizontal_statewide",
+  "display_name": "West Virginia Horizontal Statewide",
+  "resource_type": "gas",
+  "region_type": "statewide_horizontal",
+  "state": "West Virginia",
+  "map_center": {
+    "longitude": -80.75,
+    "latitude": 39.35
+  },
+  "default_grid_step_deg": 0.05,
+  "default_grid_max_distance_km": 15.0,
+  "notes": "First WV trainable slice using official WVDEP horizontal wells, laterals, and H6A production."
+}

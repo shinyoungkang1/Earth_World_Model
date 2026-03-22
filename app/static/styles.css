@@ -1,0 +1,130 @@
+:root {
+  --bg: #f3f0e7;
+  --panel: rgba(253, 248, 239, 0.96);
+  --ink: #1f2a20;
+  --muted: #5f675f;
+  --line: rgba(31, 42, 32, 0.18);
+  --accent: #1d5f5a;
+  --warm: #b8662f;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+body {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+}
+
+.sidebar {
+  padding: 20px 18px;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 252, 246, 0.98), var(--panel));
+}
+
+.sidebar h1,
+.sidebar h2 {
+  margin: 0 0 10px;
+  font-family: "IBM Plex Serif", Georgia, serif;
+}
+
+.sidebar h1 {
+  font-size: 1.5rem;
+}
+
+.sidebar h2 {
+  font-size: 1rem;
+  margin-top: 18px;
+}
+
+.sidebar label,
+.sidebar .note,
+.sidebar .muted,
+.sidebar dl {
+  font-size: 0.92rem;
+}
+
+.sidebar label {
+  display: block;
+  margin: 8px 0;
+}
+
+.muted,
+.note {
+  color: var(--muted);
+}
+
+dl {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 10px;
+  margin: 0;
+}
+
+dl dt,
+dl dd {
+  margin: 0;
+}
+
+#planet-mosaics {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  background: white;
+}
+
+.prospect-list {
+  display: grid;
+  gap: 8px;
+}
+
+.prospect-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.prospect-rank {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.prospect-main {
+  min-width: 0;
+}
+
+#map {
+  height: 100vh;
+}
+
+.maplibregl-popup-content {
+  font: 12px/1.4 "IBM Plex Sans", sans-serif;
+}
+
+@media (max-width: 900px) {
+  body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    max-height: 42vh;
+  }
+
+  #map {
+    height: 58vh;
+  }
+}

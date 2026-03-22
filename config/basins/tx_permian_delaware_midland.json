@@ -1,0 +1,36 @@
+{
+  "basin_id": "tx_permian_delaware_midland",
+  "display_name": "Texas Permian Basin - Delaware & Midland",
+  "resource_type": "oil_and_gas",
+  "region_type": "basin_geographic",
+  "state": "Texas",
+  "counties": [
+    "Loving",
+    "Reeves",
+    "Ward",
+    "Winkler",
+    "Pecos",
+    "Crane",
+    "Upton",
+    "Reagan",
+    "Irion",
+    "Crockett",
+    "Midland",
+    "Martin",
+    "Howard",
+    "Glasscock",
+    "Ector",
+    "Andrews",
+    "Gaines",
+    "Dawson",
+    "Borden",
+    "Lea"
+  ],
+  "map_center": {
+    "longitude": -102.5,
+    "latitude": 31.8
+  },
+  "default_grid_step_deg": 0.05,
+  "default_grid_max_distance_km": 15.0,
+  "notes": "Texas Permian Basin covering the Delaware and Midland sub-basins."
+}

@@ -1,0 +1,17 @@
+{
+  "basin_id": "swpa_core_washington_greene",
+  "display_name": "SWPA Core - Washington and Greene",
+  "resource_type": "gas",
+  "region_type": "county_cluster",
+  "counties": [
+    "Washington",
+    "Greene"
+  ],
+  "map_center": {
+    "longitude": -80.15,
+    "latitude": 39.95
+  },
+  "default_grid_step_deg": 0.025,
+  "default_grid_max_distance_km": 12.0,
+  "notes": "First basin-scoped MVP region for Pennsylvania unconventional gas."
+}
