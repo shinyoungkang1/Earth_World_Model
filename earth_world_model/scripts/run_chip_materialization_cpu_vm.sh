@@ -87,16 +87,36 @@ echo "  GCS output:   $GCS_OUTPUT_URI"
 echo "============================================================"
 
 # ── Step 1: Download training tables from GCS if not local ──
+# Region IDs (short) map to feature directory names (full basin name) via the registry.
+# We use the registry to resolve paths, but also need to download from GCS where
+# directories use the full basin_config name.
 echo ""
 echo "Step 1: Ensuring training tables are available..."
+
+# Map of region_id → GCS feature directory name
+# This is derived from config/multiregion/region_registry.json basin_config field
+# and _STATE_TABLE_TEMPLATES in scripts/multiregion/merge.py
+declare -A REGION_TO_GCS_DIR
+REGION_TO_GCS_DIR=(
+  [swpa_core]="swpa_core_washington_greene"
+  [pa_northeast]="pa_northeast_susquehanna"
+  [wv_horizontal]="wv_horizontal_statewide"
+  [oh_utica]="oh_utica_statewide"
+  [co_dj_basin]="co_dj_basin_wattenberg"
+  [tx_permian]="tx_permian_delaware_midland"
+  [tx_eagle_ford]="tx_eagle_ford"
+  [tx_haynesville]="tx_haynesville"
+)
+
 for region in $REGIONS; do
-  region_dir="$REPO_ROOT/data/features/$region"
+  gcs_dir="${REGION_TO_GCS_DIR[$region]:-$region}"
+  region_dir="$REPO_ROOT/data/features/$gcs_dir"
   if [ ! -d "$region_dir" ] || [ -z "$(ls "$region_dir"/*.csv 2>/dev/null)" ]; then
-    echo "  Downloading $region from GCS..."
+    echo "  Downloading $region ($gcs_dir) from GCS..."
     mkdir -p "$region_dir"
-    gsutil -m cp "gs://$GCS_BUCKET/earth_world_model/data/features/$region/*" "$region_dir/" 2>&1 | tail -2
+    gsutil -m cp "gs://$GCS_BUCKET/earth_world_model/data/features/$gcs_dir/*" "$region_dir/" 2>&1 | tail -2
   else
-    echo "  $region: already local"
+    echo "  $region ($gcs_dir): already local"
   fi
 done
 
