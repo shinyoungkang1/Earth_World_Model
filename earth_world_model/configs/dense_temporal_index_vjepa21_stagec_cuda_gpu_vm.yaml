@@ -7,7 +7,7 @@ runtime:
 data:
   kind: dense_temporal_index
   index_path: ${EWM_DENSE_INDEX_PATH:-/tmp/ewm_dense_temporal/data/train/dense_temporal_index.parquet}
-  patch_size: 128
+  patch_size: 256
   max_samples: 0
   min_paired_frames: 4
   min_paired_fraction: 0.0
@@ -28,6 +28,7 @@ model:
   spatial_fusion: late_concat
   use_modality_embeddings: true
   use_patch_positional_encoding: true
+  use_missing_modality_embeddings: true
 
 training:
   batch_size: 16

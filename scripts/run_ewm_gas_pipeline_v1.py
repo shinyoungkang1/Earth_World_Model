@@ -222,6 +222,14 @@ def load_checkpoint_teacher_weights(model: EarthWorldModel, teacher_state: dict[
                 "spatial.hls_mod_embed",
             }
         )
+    if not getattr(model.spatial, "use_missing_modality_embeddings", False):
+        allowed_missing.update(
+            {
+                "spatial.s1_missing_embed",
+                "spatial.s2_missing_embed",
+                "spatial.hls_missing_embed",
+            }
+        )
 
     disallowed_missing = sorted(set(incompatible.missing_keys) - allowed_missing)
     unexpected = sorted(incompatible.unexpected_keys)

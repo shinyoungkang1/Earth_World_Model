@@ -15,7 +15,8 @@ data:
   min_clear_fraction: 0.8
   crop_mode: random
   repeat_factor: 1
-  num_workers: 2
+  num_workers: ${EWM_NUM_WORKERS:-8}
+  prefetch_factor: ${EWM_PREFETCH_FACTOR:-2}
   assume_single_sample_per_shard: true
 
 model:
@@ -50,5 +51,6 @@ eval:
     max_samples: 256
     crop_mode: center
     repeat_factor: 1
-    num_workers: 2
+    num_workers: ${EWM_EVAL_NUM_WORKERS:-8}
+    prefetch_factor: ${EWM_EVAL_PREFETCH_FACTOR:-2}
     assume_single_sample_per_shard: true

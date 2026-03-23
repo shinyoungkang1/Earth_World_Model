@@ -16,6 +16,27 @@ from typing import Any
 import numpy as np
 
 
+def shard_key(path: Path) -> str:
+    name = path.name
+    if name.endswith(".zarr.zip"):
+        return name[: -len(".zarr.zip")]
+    if name.endswith(".zarr"):
+        return name[: -len(".zarr")]
+    return path.stem
+
+
+def resolve_modality_paths(root_dir: Path, split: str, modality: str) -> list[Path]:
+    split_dir = root_dir / split / modality
+    zip_paths = sorted(split_dir.glob("*.zarr.zip"))
+    dir_paths = sorted(path for path in split_dir.glob("*.zarr") if path.is_dir())
+    by_key: dict[str, Path] = {}
+    for path in zip_paths:
+        by_key[shard_key(path)] = path
+    for path in dir_paths:
+        by_key[shard_key(path)] = path
+    return [by_key[key] for key in sorted(by_key)]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root-dir", type=Path, required=True)
@@ -35,9 +56,43 @@ def import_xarray():
     return xr
 
 
+def open_zarr_target(path: Path):
+    xr = import_xarray()
+    if path.name.endswith(".zarr.zip"):
+        try:
+            import fsspec
+        except ImportError as exc:
+            raise RuntimeError("fsspec is required to inspect zipped SSL4EO shards") from exc
+        zip_fs = fsspec.filesystem("zip", fo=str(path))
+        root_listing = zip_fs.ls("")
+        top_level_files: set[str] = set()
+        top_level_dirs: list[str] = []
+        for item in root_listing:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip("/")
+                item_type = str(item.get("type", ""))
+            else:
+                name = str(item).strip("/")
+                item_type = ""
+            if not name:
+                continue
+            if item_type == "directory":
+                top_level_dirs.append(name)
+            else:
+                top_level_files.add(name)
+        if {".zgroup", ".zattrs", ".zmetadata"} & top_level_files:
+            mapper = zip_fs.get_mapper("")
+        elif len(top_level_dirs) == 1:
+            mapper = zip_fs.get_mapper(top_level_dirs[0])
+        else:
+            mapper = zip_fs.get_mapper(path.stem)
+        return xr.open_zarr(mapper)
+    return xr.open_zarr(str(path))
+
+
 def resolve_shard_pairs(root_dir: Path, split: str, max_shards: int) -> list[tuple[Path, Path]]:
-    s2_paths = sorted((root_dir / split / "S2L2A").glob("*.zarr.zip"))
-    s1_paths = sorted((root_dir / split / "S1GRD").glob("*.zarr.zip"))
+    s2_paths = resolve_modality_paths(root_dir, split, "S2L2A")
+    s1_paths = resolve_modality_paths(root_dir, split, "S1GRD")
     if max_shards > 0:
         s2_paths = s2_paths[:max_shards]
         s1_paths = s1_paths[:max_shards]
@@ -48,15 +103,15 @@ def resolve_shard_pairs(root_dir: Path, split: str, max_shards: int) -> list[tup
 
     pairs: list[tuple[Path, Path]] = []
     for s2_path, s1_path in zip(s2_paths, s1_paths):
-        if s2_path.name != s1_path.name:
+        if shard_key(s2_path) != shard_key(s1_path):
             raise ValueError(f"Mismatched shard pair names: {s2_path.name} vs {s1_path.name}")
         pairs.append((s2_path, s1_path))
     return pairs
 
 
 def count_shard_samples(xr: Any, s2_path: Path, s1_path: Path) -> dict[str, Any]:
-    ds_s2 = xr.open_zarr(str(s2_path))
-    ds_s1 = xr.open_zarr(str(s1_path))
+    ds_s2 = open_zarr_target(s2_path)
+    ds_s1 = open_zarr_target(s1_path)
     try:
         if "sample" in ds_s2.dims and int(ds_s2.sizes.get("sample", 0)) > 1:
             s2_samples = np.asarray(ds_s2.coords["sample"].values)

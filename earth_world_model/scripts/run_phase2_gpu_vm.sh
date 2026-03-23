@@ -19,6 +19,7 @@ DATA_ACCESS_MODE="${DATA_ACCESS_MODE:-auto}"
 USE_GCS_DATA_DIRECT="${USE_GCS_DATA_DIRECT:-}"
 USE_GCSFUSE_MOUNT="${USE_GCSFUSE_MOUNT:-}"
 CONTINUOUS_GCS_SYNC="${CONTINUOUS_GCS_SYNC:-1}"
+FINAL_GCS_SYNC="${FINAL_GCS_SYNC:-$CONTINUOUS_GCS_SYNC}"
 GCSFUSE_MOUNT_POINT="${GCSFUSE_MOUNT_POINT:-$LOCAL_RUN_ROOT/gcsfuse_mount}"
 GCSFUSE_CACHE_DISK_MOUNT="${GCSFUSE_CACHE_DISK_MOUNT:-$LOCAL_RUN_ROOT/gcsfuse_cache_disk}"
 GCSFUSE_CACHE_DIR="${GCSFUSE_CACHE_DIR:-$GCSFUSE_CACHE_DISK_MOUNT/gcsfuse-cache}"
@@ -32,6 +33,15 @@ SEQUENTIAL_READ_SIZE_MB="${SEQUENTIAL_READ_SIZE_MB:-0}"
 GCSFUSE_STAT_CACHE_MAX_SIZE_MB="${GCSFUSE_STAT_CACHE_MAX_SIZE_MB:-256}"
 GCSFUSE_KERNEL_LIST_CACHE_TTL_SECS="${GCSFUSE_KERNEL_LIST_CACHE_TTL_SECS:-300}"
 PYTHON_BIN="${PYTHON_BIN:-}"
+EWM_NUM_WORKERS="${EWM_NUM_WORKERS:-8}"
+EWM_EVAL_NUM_WORKERS="${EWM_EVAL_NUM_WORKERS:-8}"
+EWM_PREFETCH_FACTOR="${EWM_PREFETCH_FACTOR:-2}"
+EWM_EVAL_PREFETCH_FACTOR="${EWM_EVAL_PREFETCH_FACTOR:-2}"
+CUDA_DDP_PROCS="${CUDA_DDP_PROCS:-1}"
+SAVE_CODE_SNAPSHOT="${SAVE_CODE_SNAPSHOT:-1}"
+EWM_LAUNCHER_SCRIPT="${EWM_LAUNCHER_SCRIPT:-$PROJECT_ROOT/earth_world_model/scripts/run_phase2_gpu_vm.sh}"
+EWM_RUN_LABEL="${EWM_RUN_LABEL:-${GCS_RUN_URI##*/}}"
+EWM_EXPERIMENT_ID="${EWM_EXPERIMENT_ID:-}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -67,6 +77,32 @@ ensure_parent_dir() {
   local parent_dir
   parent_dir="$(dirname "$dir_path")"
   mkdir -p "$parent_dir"
+}
+
+configure_nccl_env_for_gpu() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local primary_gpu
+  primary_gpu="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 | tr -d '\r')"
+  if [[ -z "$primary_gpu" ]]; then
+    return 0
+  fi
+
+  if [[ "$primary_gpu" == *"H100"* || "$primary_gpu" == *"H200"* || "$primary_gpu" == *"B200"* ]]; then
+    if [[ -f /usr/local/gib/scripts/set_nccl_env.sh ]]; then
+      # shellcheck source=/usr/local/gib/scripts/set_nccl_env.sh
+      . /usr/local/gib/scripts/set_nccl_env.sh
+      echo "Configured gIB NCCL environment for GPU: $primary_gpu"
+    else
+      echo "gIB NCCL setup script not found; keeping current NCCL environment for GPU: $primary_gpu"
+    fi
+    return 0
+  fi
+
+  export NCCL_NET=Socket
+  echo "Configured socket NCCL environment for GPU: $primary_gpu"
 }
 
 storage_rsync() {
@@ -167,6 +203,9 @@ echo "Selected data access mode: $DATA_ACCESS_MODE"
 echo "Data root: $DATA_ROOT"
 
 sync_outputs() {
+  if [[ "$FINAL_GCS_SYNC" != "1" ]]; then
+    return 0
+  fi
   if [[ -d "$LOCAL_CHECKPOINT_DIR" ]]; then
     storage_rsync "$LOCAL_CHECKPOINT_DIR" "$GCS_RUN_URI/checkpoints" || true
   fi
@@ -220,15 +259,43 @@ fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   nvidia-smi || true
 fi
+configure_nccl_env_for_gpu
 
 export PYTHONPATH="$PROJECT_ROOT/earth_world_model/src:$PROJECT_ROOT"
 export PYTHONUNBUFFERED=1
 export EWM_BACKEND=cuda
 export EWM_SSL4EO_ROOT="$DATA_ROOT"
 export EWM_CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR"
+export EWM_NUM_WORKERS
+export EWM_EVAL_NUM_WORKERS
+export EWM_PREFETCH_FACTOR
+export EWM_EVAL_PREFETCH_FACTOR
+export EWM_LAUNCHER_SCRIPT
+export EWM_RUN_LABEL
+export EWM_EXPERIMENT_ID
 if [[ "$USE_GCSFUSE_MOUNT" == "1" ]]; then
   export EWM_FORCE_SINGLE_PROCESS_IO=1
 fi
+
+cmd=("$PYTHON_BIN")
+if [[ "$CUDA_DDP_PROCS" -gt 1 ]]; then
+  cmd+=(-m torch.distributed.run --standalone --nnodes=1 --nproc_per_node "$CUDA_DDP_PROCS")
+fi
+cmd+=("$PROJECT_ROOT/earth_world_model/train_tpu.py" --config "$CONFIG_PATH")
+if [[ -n "$RESUME_FROM_LOCAL" ]]; then
+  cmd+=(--resume-from "$RESUME_FROM_LOCAL")
+fi
+
+RUN_COMMAND="$(printf '%q ' "${cmd[@]}")"
+RUN_COMMAND="${RUN_COMMAND% }"
+
+env \
+  PROJECT_ROOT="$PROJECT_ROOT" \
+  CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR" \
+  CONFIG_PATH="$CONFIG_PATH" \
+  RUN_COMMAND="$RUN_COMMAND" \
+  SAVE_CODE_SNAPSHOT="$SAVE_CODE_SNAPSHOT" \
+  bash "$PROJECT_ROOT/earth_world_model/scripts/capture_run_metadata.sh"
 
 if [[ "$CONTINUOUS_GCS_SYNC" == "1" ]]; then
   nohup env \
@@ -236,13 +303,10 @@ if [[ "$CONTINUOUS_GCS_SYNC" == "1" ]]; then
     TRAIN_LOG="$RUN_LOG_PATH" \
     METRICS_PATH="$LOCAL_CHECKPOINT_DIR/metrics.jsonl" \
     SUMMARY_PATH="$LOCAL_CHECKPOINT_DIR/training_summary.json" \
+    MANIFEST_PATH="$LOCAL_CHECKPOINT_DIR/run_manifest.json" \
+    CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR" \
     bash "$PROJECT_ROOT/earth_world_model/scripts/sync_run_artifacts_loop.sh" \
     > "$LOCAL_RUN_ROOT/artifact_sync.log" 2>&1 < /dev/null &
-fi
-
-cmd=("$PYTHON_BIN" "$PROJECT_ROOT/earth_world_model/train_tpu.py" --config "$CONFIG_PATH")
-if [[ -n "$RESUME_FROM_LOCAL" ]]; then
-  cmd+=(--resume-from "$RESUME_FROM_LOCAL")
 fi
 
 echo "Running: ${cmd[*]}"

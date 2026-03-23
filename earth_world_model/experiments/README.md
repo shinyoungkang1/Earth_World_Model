@@ -37,6 +37,7 @@ python earth_world_model/scripts/run_registered_experiment.py list
 python earth_world_model/scripts/run_registered_experiment.py show ssl4eo_50k_stagec_v1
 python earth_world_model/scripts/run_registered_experiment.py compare ssl4eo_50k_control_v1 ssl4eo_50k_stagec_v1
 python earth_world_model/scripts/run_registered_experiment.py command ssl4eo_50k_stagec_v1
+python earth_world_model/scripts/run_registered_experiment.py command ssl4eo_50k_stagec_v1 --cuda-ddp-procs 2
 python earth_world_model/scripts/run_registered_experiment.py probe-command ssl4eo_50k_stagec_v1
 ```
 

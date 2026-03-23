@@ -15,6 +15,28 @@ if [[ -z "$PYTHON_BIN" ]]; then
   fi
 fi
 
+ensure_pip() {
+  if "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    return 0
+  fi
+  if "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y python3-pip python3-venv
+    else
+      apt-get update
+      apt-get install -y python3-pip python3-venv
+    fi
+    return 0
+  fi
+  echo "Unable to bootstrap pip for $PYTHON_BIN" >&2
+  exit 1
+}
+
+ensure_pip
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -r "$PROJECT_ROOT/earth_world_model/requirements.txt"
 

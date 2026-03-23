@@ -305,6 +305,8 @@ def _prepare_dense_temporal_sample(
     s2: torch.Tensor,
     s1: torch.Tensor,
     frame_mask: torch.Tensor,
+    s2_frame_mask: torch.Tensor | None,
+    s1_frame_mask: torch.Tensor | None,
     dates: torch.Tensor,
     s2_valid_mask: torch.Tensor,
     s1_valid_mask: torch.Tensor,
@@ -346,7 +348,28 @@ def _prepare_dense_temporal_sample(
 
     full_s2 = (full_s2 - SSL4EO_S2L2A_MEAN.unsqueeze(0)) / (SSL4EO_S2L2A_STD.unsqueeze(0) + 1e-6)
     s1 = (s1 - SSL4EO_S1GRD_MEAN.unsqueeze(0)) / (SSL4EO_S1GRD_STD.unsqueeze(0) + 1e-6)
-    return {"s2": full_s2, "s1": s1, "dates": dates.to(torch.int32), "mask": frame_mask.to(torch.bool)}
+    s2_present = (
+        s2_frame_mask.to(torch.bool)
+        if s2_frame_mask is not None
+        else s2_valid_mask.reshape(s2_valid_mask.shape[0], -1).any(dim=1)
+    )
+    s1_present = (
+        s1_frame_mask.to(torch.bool)
+        if s1_frame_mask is not None
+        else s1_valid_mask.reshape(s1_valid_mask.shape[0], -1).any(dim=1)
+    )
+    timestep_mask = frame_mask.to(torch.bool) | s2_present | s1_present
+    return {
+        "s2": full_s2,
+        "s1": s1,
+        "dates": dates.to(torch.int32),
+        "mask": timestep_mask,
+        "paired_mask": frame_mask.to(torch.bool),
+        "s2_present": s2_present,
+        "s1_present": s1_present,
+        "s2_valid_mask": s2_valid_mask.to(torch.bool),
+        "s1_valid_mask": s1_valid_mask.to(torch.bool),
+    }
 
 
 class FakeTemporalDataset(Dataset):
@@ -373,7 +396,19 @@ class FakeTemporalDataset(Dataset):
         s1 = torch.randn(self.timesteps, 2, self.patch_size, self.patch_size, generator=generator)
         mask = torch.ones(self.timesteps, dtype=torch.bool)
         dates = DEFAULT_DATES[: self.timesteps].clone()
-        return {"s2": s2.float(), "s1": s1.float(), "dates": dates, "mask": mask}
+        s2_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
+        s1_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
+        return {
+            "s2": s2.float(),
+            "s1": s1.float(),
+            "dates": dates,
+            "mask": mask,
+            "paired_mask": mask,
+            "s2_present": mask,
+            "s1_present": mask,
+            "s2_valid_mask": s2_valid_mask,
+            "s1_valid_mask": s1_valid_mask,
+        }
 
 
 class ManifestTemporalDataset(Dataset):
@@ -566,10 +601,22 @@ class DenseTemporalNPZDataset(Dataset):
                 if "s1_valid_mask" in sample.files
                 else torch.isfinite(s1).all(dim=1)
             )
+            s2_frame_mask = (
+                torch.from_numpy(np.asarray(sample["s2_frame_mask"])).to(torch.bool)
+                if "s2_frame_mask" in sample.files
+                else s2_valid_mask.reshape(s2_valid_mask.shape[0], -1).any(dim=1)
+            )
+            s1_frame_mask = (
+                torch.from_numpy(np.asarray(sample["s1_frame_mask"])).to(torch.bool)
+                if "s1_frame_mask" in sample.files
+                else s1_valid_mask.reshape(s1_valid_mask.shape[0], -1).any(dim=1)
+            )
         return _prepare_dense_temporal_sample(
             s2=s2,
             s1=s1,
             frame_mask=frame_mask,
+            s2_frame_mask=s2_frame_mask,
+            s1_frame_mask=s1_frame_mask,
             dates=dates,
             s2_valid_mask=s2_valid_mask,
             s1_valid_mask=s1_valid_mask,
@@ -658,6 +705,8 @@ class DenseTemporalZarrDataset(Dataset):
         s2 = torch.from_numpy(np.asarray(group["s2"][row_idx, :frame_count])).float()
         s1 = torch.from_numpy(np.asarray(group["s1"][row_idx, :frame_count])).float()
         frame_mask = torch.from_numpy(np.asarray(group["frame_mask"][row_idx, :frame_count])).to(torch.bool)
+        s2_frame_mask = torch.from_numpy(np.asarray(group["s2_frame_mask"][row_idx, :frame_count])).to(torch.bool)
+        s1_frame_mask = torch.from_numpy(np.asarray(group["s1_frame_mask"][row_idx, :frame_count])).to(torch.bool)
         dates = torch.from_numpy(np.asarray(group["day_of_year"][row_idx, :frame_count])).to(torch.int32)
         s2_valid_mask = torch.from_numpy(np.asarray(group["s2_valid_mask"][row_idx, :frame_count])).to(torch.bool)
         s1_valid_mask = torch.from_numpy(np.asarray(group["s1_valid_mask"][row_idx, :frame_count])).to(torch.bool)
@@ -666,6 +715,8 @@ class DenseTemporalZarrDataset(Dataset):
             s2=s2,
             s1=s1,
             frame_mask=frame_mask,
+            s2_frame_mask=s2_frame_mask,
+            s1_frame_mask=s1_frame_mask,
             dates=dates,
             s2_valid_mask=s2_valid_mask,
             s1_valid_mask=s1_valid_mask,

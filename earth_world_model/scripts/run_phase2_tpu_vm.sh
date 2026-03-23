@@ -31,6 +31,14 @@ FILE_CACHE_PARALLEL_DOWNLOADS_PER_FILE="${FILE_CACHE_PARALLEL_DOWNLOADS_PER_FILE
 SEQUENTIAL_READ_SIZE_MB="${SEQUENTIAL_READ_SIZE_MB:-0}"
 GCSFUSE_STAT_CACHE_MAX_SIZE_MB="${GCSFUSE_STAT_CACHE_MAX_SIZE_MB:-256}"
 GCSFUSE_KERNEL_LIST_CACHE_TTL_SECS="${GCSFUSE_KERNEL_LIST_CACHE_TTL_SECS:-300}"
+EWM_NUM_WORKERS="${EWM_NUM_WORKERS:-8}"
+EWM_EVAL_NUM_WORKERS="${EWM_EVAL_NUM_WORKERS:-8}"
+EWM_PREFETCH_FACTOR="${EWM_PREFETCH_FACTOR:-2}"
+EWM_EVAL_PREFETCH_FACTOR="${EWM_EVAL_PREFETCH_FACTOR:-2}"
+SAVE_CODE_SNAPSHOT="${SAVE_CODE_SNAPSHOT:-1}"
+EWM_LAUNCHER_SCRIPT="${EWM_LAUNCHER_SCRIPT:-$PROJECT_ROOT/earth_world_model/scripts/run_phase2_tpu_vm.sh}"
+EWM_RUN_LABEL="${EWM_RUN_LABEL:-${GCS_RUN_URI##*/}}"
+EWM_EXPERIMENT_ID="${EWM_EXPERIMENT_ID:-}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -206,9 +214,32 @@ export PYTHONUNBUFFERED=1
 export EWM_BACKEND=tpu
 export EWM_SSL4EO_ROOT="$DATA_ROOT"
 export EWM_CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR"
+export EWM_NUM_WORKERS
+export EWM_EVAL_NUM_WORKERS
+export EWM_PREFETCH_FACTOR
+export EWM_EVAL_PREFETCH_FACTOR
+export EWM_LAUNCHER_SCRIPT
+export EWM_RUN_LABEL
+export EWM_EXPERIMENT_ID
 if [[ "$USE_GCSFUSE_MOUNT" == "1" ]]; then
   export EWM_FORCE_SINGLE_PROCESS_IO=1
 fi
+
+cmd=(python "$PROJECT_ROOT/earth_world_model/train_tpu.py" --config "$CONFIG_PATH")
+if [[ -n "$RESUME_FROM_LOCAL" ]]; then
+  cmd+=(--resume-from "$RESUME_FROM_LOCAL")
+fi
+
+RUN_COMMAND="$(printf '%q ' "${cmd[@]}")"
+RUN_COMMAND="${RUN_COMMAND% }"
+
+env \
+  PROJECT_ROOT="$PROJECT_ROOT" \
+  CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR" \
+  CONFIG_PATH="$CONFIG_PATH" \
+  RUN_COMMAND="$RUN_COMMAND" \
+  SAVE_CODE_SNAPSHOT="$SAVE_CODE_SNAPSHOT" \
+  bash "$PROJECT_ROOT/earth_world_model/scripts/capture_run_metadata.sh"
 
 if [[ "$CONTINUOUS_GCS_SYNC" == "1" ]]; then
   nohup env \
@@ -216,13 +247,10 @@ if [[ "$CONTINUOUS_GCS_SYNC" == "1" ]]; then
     TRAIN_LOG="$RUN_LOG_PATH" \
     METRICS_PATH="$LOCAL_CHECKPOINT_DIR/metrics.jsonl" \
     SUMMARY_PATH="$LOCAL_CHECKPOINT_DIR/training_summary.json" \
+    MANIFEST_PATH="$LOCAL_CHECKPOINT_DIR/run_manifest.json" \
+    CHECKPOINT_DIR="$LOCAL_CHECKPOINT_DIR" \
     bash "$PROJECT_ROOT/earth_world_model/scripts/sync_run_artifacts_loop.sh" \
     > "$LOCAL_RUN_ROOT/artifact_sync.log" 2>&1 < /dev/null &
-fi
-
-cmd=(python "$PROJECT_ROOT/earth_world_model/train_tpu.py" --config "$CONFIG_PATH")
-if [[ -n "$RESUME_FROM_LOCAL" ]]; then
-  cmd+=(--resume-from "$RESUME_FROM_LOCAL")
 fi
 
 echo "Running: ${cmd[*]}"

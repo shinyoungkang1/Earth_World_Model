@@ -10,18 +10,25 @@ import math
 import os
 import random
 import re
+import socket
+import subprocess
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data._utils.collate import default_collate
 
 from ewm.data.dataset import (
     DenseTemporalNPZDataset,
@@ -33,6 +40,106 @@ from ewm.data.dataset import (
     SSL4EOZarrDataset,
 )
 from ewm.models.world_model import EarthWorldModel
+
+
+@dataclass
+class SSL4EOShardBatchSampler:
+    """Batch samples shard-locally to avoid ZIP shard thrash under global shuffle."""
+
+    dataset: SSL4EOZarrDataset
+    batch_size: int
+    shuffle: bool
+    drop_last: bool
+    num_replicas: int = 1
+    rank: int = 0
+    seed: int = 0
+    epoch: int = 0
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive for SSL4EOShardBatchSampler")
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive for SSL4EOShardBatchSampler")
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError("rank must be in [0, num_replicas) for SSL4EOShardBatchSampler")
+        self._groups = self._build_groups()
+
+    def _build_groups(self) -> list[list[int]]:
+        groups: dict[int, list[int]] = {}
+        base_row_count = int(getattr(self.dataset, "base_row_count", len(self.dataset)))
+        base_rows = self.dataset.rows[:base_row_count]
+        for row_index, row in enumerate(base_rows):
+            shard_index = int(row["shard_index"])
+            groups.setdefault(shard_index, []).append(row_index)
+        return [groups[key] for key in sorted(groups)]
+
+    def __len__(self) -> int:
+        per_repeat = 0
+        global_batch_size = self.batch_size * self.num_replicas
+        for group in self._groups:
+            if self.drop_last:
+                per_repeat += len(group) // global_batch_size
+            else:
+                per_repeat += math.ceil(len(group) / global_batch_size)
+        return per_repeat * int(getattr(self.dataset, "repeat_factor", 1))
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        repeat_factor = int(getattr(self.dataset, "repeat_factor", 1))
+        global_batch_size = self.batch_size * self.num_replicas
+        for _repeat_idx in range(repeat_factor):
+            group_order = list(range(len(self._groups)))
+            if self.shuffle:
+                rng.shuffle(group_order)
+            for group_idx in group_order:
+                batch_indices = list(self._groups[group_idx])
+                if self.shuffle and len(batch_indices) > 1:
+                    rng.shuffle(batch_indices)
+                for start in range(0, len(batch_indices), global_batch_size):
+                    batch = batch_indices[start : start + global_batch_size]
+                    if len(batch) < global_batch_size and self.drop_last:
+                        continue
+                    if self.num_replicas == 1:
+                        yield batch
+                        continue
+                    local_start = self.rank * self.batch_size
+                    local_batch = batch[local_start : local_start + self.batch_size]
+                    if local_batch:
+                        yield local_batch
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool = False
+    world_size: int = 1
+    rank: int = 0
+    local_rank: int = 0
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+
+def should_use_ssl4eo_shard_sampler(dataset: torch.utils.data.Dataset, data_cfg: dict[str, Any], batch_size: int) -> bool:
+    mode = str(data_cfg.get("batch_sampler", "auto")).strip().lower()
+    if mode in {"off", "none", "disabled", "false", "0"}:
+        return False
+    if not isinstance(dataset, SSL4EOZarrDataset):
+        return False
+    if getattr(dataset, "assume_single_sample_per_shard", False):
+        return False
+    if batch_size <= 1:
+        return False
+    return True
+
+
+def ewm_collate(batch):
+    if isinstance(batch, dict):
+        return batch
+    return default_collate(batch)
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,36 +301,91 @@ def make_loader(
     config: dict,
     section: str = "data",
     *,
+    distributed: DistributedContext | None = None,
     batch_size: int | None = None,
     shuffle: bool = True,
     drop_last: bool = True,
 ) -> DataLoader:
+    distributed = distributed or DistributedContext()
     data_cfg = config[section]
     train_cfg = config["training"]
+    global_batch_size = int(batch_size or train_cfg["batch_size"])
+    effective_batch_size = global_batch_size
+    if distributed.enabled:
+        if global_batch_size % distributed.world_size != 0:
+            raise ValueError(
+                f"{section} batch size {global_batch_size} must be divisible by WORLD_SIZE={distributed.world_size}"
+            )
+        effective_batch_size = global_batch_size // distributed.world_size
     requested_num_workers = int(data_cfg.get("num_workers", 0))
     num_workers = requested_num_workers
     if getattr(dataset, "requires_single_process_io", False) and num_workers > 0:
         num_workers = 0
-    print(
-        json.dumps(
-            {
-                "event": "loader_config",
-                "section": section,
-                "dataset_class": dataset.__class__.__name__,
-                "requested_num_workers": requested_num_workers,
-                "effective_num_workers": num_workers,
-                "requires_single_process_io": bool(getattr(dataset, "requires_single_process_io", False)),
-            }
+    use_shard_sampler = should_use_ssl4eo_shard_sampler(dataset, data_cfg, effective_batch_size)
+    if distributed.enabled and not drop_last:
+        use_shard_sampler = False
+    batch_sampler = None
+    sampler = None
+    if use_shard_sampler:
+        batch_sampler = SSL4EOShardBatchSampler(
+            dataset=dataset,
+            batch_size=effective_batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            seed=int(config["runtime"].get("seed", 42)),
         )
-    )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size or train_cfg["batch_size"],
-        shuffle=shuffle,
-        num_workers=num_workers,
-        drop_last=drop_last,
-        persistent_workers=bool(num_workers),
-    )
+    elif distributed.enabled:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            seed=int(config["runtime"].get("seed", 42)),
+        )
+    prefetch_factor = None
+    if num_workers > 0:
+        prefetch_factor = int(data_cfg.get("prefetch_factor", 2))
+    if distributed.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "event": "loader_config",
+                    "section": section,
+                    "dataset_class": dataset.__class__.__name__,
+                    "requested_num_workers": requested_num_workers,
+                    "effective_num_workers": num_workers,
+                    "requires_single_process_io": bool(getattr(dataset, "requires_single_process_io", False)),
+                    "batch_size_global": global_batch_size,
+                    "batch_size_per_rank": effective_batch_size,
+                    "batch_sampler": batch_sampler.__class__.__name__ if batch_sampler is not None else None,
+                    "sampler": sampler.__class__.__name__ if sampler is not None else None,
+                    "distributed": distributed.enabled,
+                    "world_size": distributed.world_size,
+                    "prefetch_factor": prefetch_factor,
+                }
+            )
+        )
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "num_workers": num_workers,
+        "persistent_workers": bool(num_workers),
+    }
+    if isinstance(dataset, SSL4EOZarrDataset):
+        loader_kwargs["collate_fn"] = ewm_collate
+    if prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    if batch_sampler is not None:
+        loader_kwargs["batch_sampler"] = batch_sampler
+    else:
+        loader_kwargs["batch_size"] = effective_batch_size
+        loader_kwargs["shuffle"] = shuffle if sampler is None else False
+        loader_kwargs["drop_last"] = drop_last
+        if sampler is not None:
+            loader_kwargs["sampler"] = sampler
+    return DataLoader(**loader_kwargs)
 
 
 def make_model(config: dict, device: torch.device) -> EarthWorldModel:
@@ -240,6 +402,7 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         spatial_fusion=model_cfg.get("spatial_fusion", "early_mean"),
         use_modality_embeddings=model_cfg.get("use_modality_embeddings", False),
         use_patch_positional_encoding=model_cfg.get("use_patch_positional_encoding", False),
+        use_missing_modality_embeddings=model_cfg.get("use_missing_modality_embeddings", False),
         temporal_block_type=model_cfg.get("temporal_block_type", "standard"),
         use_rope_temporal_attention=model_cfg.get("use_rope_temporal_attention", False),
         rope_base=model_cfg.get("rope_base", 10000.0),
@@ -248,22 +411,70 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
     return model.to(device)
 
 
-def resolve_backend(config: dict) -> tuple[str, torch.device]:
+class StudentStepModule(torch.nn.Module):
+    def __init__(self, student: EarthWorldModel, backend: str, config: dict):
+        super().__init__()
+        self.student = student
+        self.backend = backend
+        self.config = config
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        teacher_embeddings: torch.Tensor,
+        visible_idx: torch.Tensor,
+        masked_idx: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        device = next(self.student.parameters()).device
+        return compute_prediction_losses(
+            self.student,
+            teacher_embeddings,
+            batch,
+            visible_idx,
+            masked_idx,
+            self.backend,
+            device,
+            self.config,
+        )
+
+
+def resolve_backend(config: dict) -> tuple[str, torch.device, DistributedContext]:
     backend = config["runtime"]["backend"]
     if backend == "cuda":
-        print(
-            json.dumps(
-                {
-                    "backend_probe": "cuda",
-                    "python": sys.executable,
-                    "cuda_available": torch.cuda.is_available(),
-                    "device_count": torch.cuda.device_count(),
-                }
-            )
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        distributed = DistributedContext(
+            enabled=world_size > 1,
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
         )
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "backend_probe": "cuda",
+                        "python": sys.executable,
+                        "cuda_available": torch.cuda.is_available(),
+                        "device_count": torch.cuda.device_count(),
+                        "distributed": distributed.enabled,
+                        "world_size": distributed.world_size,
+                    }
+                )
+            )
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA backend requested, but no CUDA device is available")
-        return backend, torch.device("cuda")
+        if distributed.enabled:
+            if local_rank >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"LOCAL_RANK={local_rank} is out of range for {torch.cuda.device_count()} visible CUDA devices"
+                )
+            torch.cuda.set_device(local_rank)
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
+            return backend, torch.device("cuda", local_rank), distributed
+        return backend, torch.device("cuda"), distributed
     if backend == "tpu":
         try:
             import torch_xla.core.xla_model as xm  # noqa: F401
@@ -271,8 +482,8 @@ def resolve_backend(config: dict) -> tuple[str, torch.device]:
             raise RuntimeError("TPU backend requested, but torch_xla is not installed") from exc
         import torch_xla.core.xla_model as xm
 
-        return backend, xm.xla_device()
-    return "cpu", torch.device("cpu")
+        return backend, xm.xla_device(), DistributedContext()
+    return "cpu", torch.device("cpu"), DistributedContext()
 
 
 def save_checkpoint(path: Path, backend: str, payload: dict) -> None:
@@ -296,6 +507,165 @@ def append_jsonl(path: Path, payload: dict) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def barrier_if_needed(distributed: DistributedContext) -> None:
+    if distributed.enabled and dist.is_initialized():
+        dist.barrier()
+
+
+def destroy_distributed_process_group(distributed: DistributedContext) -> None:
+    if distributed.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def reduce_scalar_sum(value: float | int, device: torch.device, distributed: DistributedContext) -> float:
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    if distributed.enabled:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def reduce_scalar_mean(
+    value: torch.Tensor | float,
+    *,
+    distributed: DistributedContext,
+    device: torch.device,
+) -> torch.Tensor:
+    if torch.is_tensor(value):
+        tensor = value.detach().to(device=device, dtype=torch.float64)
+    else:
+        tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    if distributed.enabled:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= distributed.world_size
+    return tensor
+
+
+def reduce_scalar_max(value: float, device: torch.device, distributed: DistributedContext) -> float:
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    if distributed.enabled:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def set_loader_epoch(loader: DataLoader, epoch: int) -> None:
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+    sampler = getattr(loader, "sampler", None)
+    if sampler is not None and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+
+
+def try_git_commit(cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(cwd),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def collect_run_manifest(
+    *,
+    args: argparse.Namespace,
+    config: dict,
+    backend: str,
+    device: torch.device,
+    distributed: DistributedContext,
+    checkpoint_dir: Path,
+    dataset: torch.utils.data.Dataset,
+    eval_dataset: torch.utils.data.Dataset | None,
+    metrics_path: Path,
+    loader: DataLoader,
+    eval_loader: DataLoader | None,
+) -> dict[str, Any]:
+    interesting_env_prefixes = ("EWM_",)
+    interesting_env_names = {
+        "CONFIG_PATH",
+        "GCS_RUN_URI",
+        "GCS_DATA_URI",
+        "LOCAL_RUN_ROOT",
+        "LOCAL_DATA_ROOT",
+        "LOCAL_CHECKPOINT_DIR",
+        "RUN_LOG_PATH",
+        "DATA_ACCESS_MODE",
+    }
+    env_payload = {
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key.startswith(interesting_env_prefixes) or key in interesting_env_names
+    }
+    project_root = Path(__file__).resolve().parents[1]
+    return {
+        "created_at": time.time(),
+        "hostname": socket.gethostname(),
+        "python_executable": sys.executable,
+        "argv": sys.argv,
+        "backend": backend,
+        "device": str(device),
+        "distributed": {
+            "enabled": distributed.enabled,
+            "world_size": distributed.world_size,
+            "rank": distributed.rank,
+            "local_rank": distributed.local_rank,
+        },
+        "config_path": str(args.config.resolve()),
+        "checkpoint_dir": str(checkpoint_dir),
+        "metrics_path": str(metrics_path),
+        "launcher_script": os.environ.get("EWM_LAUNCHER_SCRIPT"),
+        "experiment_id": os.environ.get("EWM_EXPERIMENT_ID"),
+        "run_label": os.environ.get("EWM_RUN_LABEL"),
+        "git_commit": try_git_commit(project_root),
+        "config": config,
+        "loader": {
+            "class_name": loader.__class__.__name__,
+            "num_workers": int(getattr(loader, "num_workers", 0)),
+            "batch_size": getattr(loader, "batch_size", None),
+            "prefetch_factor": getattr(loader, "prefetch_factor", None),
+            "pin_memory": bool(getattr(loader, "pin_memory", False)),
+            "persistent_workers": bool(getattr(loader, "persistent_workers", False)),
+            "batch_sampler": loader.batch_sampler.__class__.__name__ if getattr(loader, "batch_sampler", None) else None,
+            "sampler": loader.sampler.__class__.__name__ if getattr(loader, "sampler", None) else None,
+        },
+        "dataset": {
+            "class_name": dataset.__class__.__name__,
+            "row_count": len(dataset),
+            "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
+            "requires_single_process_io": bool(getattr(dataset, "requires_single_process_io", False)),
+            "root_dir": getattr(dataset, "root_dir", None),
+            "split": getattr(dataset, "split", None),
+        },
+        "eval_dataset": {
+            "class_name": eval_dataset.__class__.__name__ if eval_dataset is not None else None,
+            "row_count": len(eval_dataset) if eval_dataset is not None else 0,
+            "base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset)) if eval_dataset is not None else 0,
+        },
+        "eval_loader": {
+            "class_name": eval_loader.__class__.__name__ if eval_loader is not None else None,
+            "num_workers": int(getattr(eval_loader, "num_workers", 0)) if eval_loader is not None else 0,
+            "batch_size": getattr(eval_loader, "batch_size", None) if eval_loader is not None else None,
+            "prefetch_factor": getattr(eval_loader, "prefetch_factor", None) if eval_loader is not None else None,
+            "pin_memory": bool(getattr(eval_loader, "pin_memory", False)) if eval_loader is not None else False,
+            "persistent_workers": bool(getattr(eval_loader, "persistent_workers", False))
+            if eval_loader is not None
+            else False,
+            "batch_sampler": eval_loader.batch_sampler.__class__.__name__
+            if eval_loader is not None and getattr(eval_loader, "batch_sampler", None)
+            else None,
+            "sampler": eval_loader.sampler.__class__.__name__
+            if eval_loader is not None and getattr(eval_loader, "sampler", None)
+            else None,
+        },
+        "environment": env_payload,
+    }
 
 
 def load_checkpoint(path: Path, backend: str):
@@ -490,6 +860,8 @@ def student_visible_embeddings(
         None if s1 is None else s1[:, visible_idx],
         dates[:, visible_idx],
         valid[:, visible_idx],
+        s2_present=None if batch.get("s2_present") is None else batch["s2_present"][:, visible_idx],
+        s1_present=None if batch.get("s1_present") is None else batch["s1_present"][:, visible_idx],
         hls=None if hls is None else hls[:, visible_idx],
     )
 
@@ -505,6 +877,8 @@ def compute_teacher_embeddings(
         batch.get("s1"),
         batch["dates"],
         batch["mask"],
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
         hls=batch.get("hls"),
         return_hierarchical=return_hierarchical,
     )
@@ -579,6 +953,85 @@ def select_teacher_targets(
     return teacher_embeddings[:, gathered, :]
 
 
+def _pool_patch_validity(valid_mask: torch.Tensor, patch_px: int) -> torch.Tensor:
+    if valid_mask.ndim != 4:
+        raise ValueError(f"Expected validity mask [B, T, H, W], got {tuple(valid_mask.shape)}")
+    batch, timesteps, height, width = valid_mask.shape
+    pooled = F.avg_pool2d(
+        valid_mask.to(dtype=torch.float32).reshape(batch * timesteps, 1, height, width),
+        kernel_size=patch_px,
+        stride=patch_px,
+    )
+    return pooled.reshape(batch, timesteps, -1)
+
+
+def _combine_loss_weights(
+    base_weights: torch.Tensor | None,
+    extra_weights: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if base_weights is None:
+        return extra_weights
+    if extra_weights is None:
+        return base_weights
+    extra = extra_weights.to(device=base_weights.device, dtype=base_weights.dtype)
+    if extra.ndim == 1:
+        extra = extra.view(1, -1)
+    return base_weights * extra
+
+
+def select_teacher_target_weights(
+    teacher: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    step_idx: torch.Tensor,
+) -> torch.Tensor | None:
+    if teacher.token_mode != "dense":
+        mask = batch.get("mask")
+        if mask is None:
+            return None
+        return mask[:, step_idx].to(dtype=torch.float32)
+
+    patch_px = int(teacher.spatial.patch_px)
+    fusion_mode = str(teacher.spatial.fusion_mode)
+    input_mode = str(teacher.input_mode)
+    tokens_per_timestep = int(teacher.last_tokens_per_timestep)
+
+    s2_valid_mask = batch.get("s2_valid_mask")
+    s1_valid_mask = batch.get("s1_valid_mask")
+    s2_present = batch.get("s2_present")
+    s1_present = batch.get("s1_present")
+
+    if input_mode == "s2s1" and fusion_mode == "late_concat":
+        token_pieces: list[torch.Tensor] = []
+        if s2_valid_mask is not None:
+            token_pieces.append(_pool_patch_validity(s2_valid_mask[:, step_idx], patch_px))
+        elif s2_present is not None:
+            patch_count = tokens_per_timestep // 2
+            token_pieces.append(
+                s2_present[:, step_idx].to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
+            )
+        if s1_valid_mask is not None:
+            token_pieces.append(_pool_patch_validity(s1_valid_mask[:, step_idx], patch_px))
+        elif s1_present is not None:
+            patch_count = tokens_per_timestep // 2
+            token_pieces.append(
+                s1_present[:, step_idx].to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
+            )
+        if not token_pieces:
+            return None
+        return torch.cat(token_pieces, dim=-1).reshape(batch["dates"].shape[0], -1)
+
+    if s2_valid_mask is not None:
+        return _pool_patch_validity(s2_valid_mask[:, step_idx], patch_px).reshape(batch["dates"].shape[0], -1)
+
+    mask = batch.get("mask")
+    if mask is None:
+        return None
+    repeated = mask[:, step_idx].to(dtype=torch.float32)
+    if tokens_per_timestep > 1:
+        repeated = repeated.unsqueeze(-1).expand(-1, -1, tokens_per_timestep).reshape(batch["dates"].shape[0], -1)
+    return repeated
+
+
 def weighted_embedding_mse(
     predicted: torch.Tensor,
     target: torch.Tensor,
@@ -591,9 +1044,15 @@ def weighted_embedding_mse(
     )
     if weights is None:
         return errors.mean()
-    weight_tensor = weights.view(1, -1, 1).to(device=errors.device, dtype=errors.dtype)
+    if weights.ndim == 1:
+        weight_tensor = weights.view(1, -1, 1)
+    elif weights.ndim == 2:
+        weight_tensor = weights.unsqueeze(-1)
+    else:
+        raise ValueError(f"Expected 1D or 2D weights, got {tuple(weights.shape)}")
+    weight_tensor = weight_tensor.to(device=errors.device, dtype=errors.dtype)
     weighted_errors = errors * weight_tensor
-    normalizer = errors.shape[0] * errors.shape[-1] * weight_tensor.sum().clamp_min(1.0e-6)
+    normalizer = errors.shape[-1] * weight_tensor.sum().clamp_min(1.0e-6)
     return weighted_errors.sum() / normalizer
 
 
@@ -622,7 +1081,8 @@ def compute_prediction_losses(
             dates[:, masked_idx],
         )
         masked_target = select_teacher_targets(student, teacher_embeddings, masked_idx).detach()
-        masked_loss = weighted_embedding_mse(predicted_masked, masked_target)
+        masked_weights = select_teacher_target_weights(student, batch, masked_idx)
+        masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
 
         context_loss = torch.zeros_like(masked_loss)
         if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
@@ -637,6 +1097,8 @@ def compute_prediction_losses(
                     sqrt_distance=context_loss_sqrt_distance,
                 )
                 context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
+            context_target_weights = select_teacher_target_weights(student, batch, visible_idx)
+            context_weights = _combine_loss_weights(context_target_weights, context_weights)
             context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
 
         total_loss = masked_loss + (context_loss_weight * context_loss)
@@ -648,6 +1110,22 @@ def compute_prediction_losses(
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "predict_visible_context": torch.tensor(1 if predict_visible_context else 0, device=total_loss.device),
     }
+
+
+def compute_student_loss_terms(
+    student: EarthWorldModel,
+    student_stepper: torch.nn.Module | None,
+    teacher_embeddings: torch.Tensor,
+    batch: dict[str, torch.Tensor],
+    visible_idx: torch.Tensor,
+    masked_idx: torch.Tensor,
+    backend: str,
+    device: torch.device,
+    config: dict,
+) -> dict[str, torch.Tensor]:
+    if student_stepper is not None:
+        return student_stepper(batch, teacher_embeddings, visible_idx, masked_idx)
+    return compute_prediction_losses(student, teacher_embeddings, batch, visible_idx, masked_idx, backend, device, config)
 
 
 def resolve_eval_config(config: dict) -> dict | None:
@@ -668,17 +1146,21 @@ def resolve_eval_config(config: dict) -> dict | None:
 
 def evaluate(
     student: EarthWorldModel,
+    student_stepper: torch.nn.Module | None,
     teacher: EarthWorldModel,
     loader: DataLoader,
     backend: str,
     device: torch.device,
     config: dict,
     eval_cfg: dict,
+    distributed: DistributedContext,
 ) -> dict:
     mask_ratio = float(config["training"]["mask_ratio"])
     mask_mode = eval_cfg["mask_mode"]
     max_batches = int(eval_cfg.get("max_batches", 0))
     student.eval()
+    if student_stepper is not None:
+        student_stepper.eval()
     teacher.eval()
 
     loss_total = 0.0
@@ -700,7 +1182,17 @@ def evaluate(
                 raise ValueError(f"Unsupported eval.mask_mode: {mask_mode}")
 
             batch_losses = [
-                compute_prediction_losses(student, teacher_embeddings, batch, visible_idx, masked_idx, backend, device, config)
+                compute_student_loss_terms(
+                    student,
+                    student_stepper,
+                    teacher_embeddings,
+                    batch,
+                    visible_idx,
+                    masked_idx,
+                    backend,
+                    device,
+                    config,
+                )
                 for visible_idx, masked_idx in mask_pairs
             ]
             batch_loss = torch.stack([loss_terms["total_loss"] for loss_terms in batch_losses]).mean()
@@ -713,6 +1205,12 @@ def evaluate(
 
             if max_batches > 0 and step >= max_batches:
                 break
+
+    if distributed.enabled:
+        loss_total = reduce_scalar_sum(loss_total, device, distributed)
+        masked_loss_total = reduce_scalar_sum(masked_loss_total, device, distributed)
+        context_loss_total = reduce_scalar_sum(context_loss_total, device, distributed)
+        step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
 
     return {
         "mean_loss": loss_total / max(step_count, 1),
@@ -737,302 +1235,400 @@ def main() -> None:
         config["data"]["max_samples"] = args.max_samples
 
     set_seed(int(config["runtime"].get("seed", 42)))
-    backend, device = resolve_backend(config)
-    dataset = build_dataset(config, section="data")
-    loader = make_loader(dataset, config, section="data", shuffle=True, drop_last=True)
-    loader = maybe_wrap_loader(loader, device, backend)
-    eval_cfg = resolve_eval_config(config)
-    eval_dataset = None
-    eval_loader = None
-    if eval_cfg is not None:
-        config["eval"]["data"] = eval_cfg["data"]
-        eval_dataset = build_dataset_from_cfg(eval_cfg["data"])
-        eval_config = deepcopy(config)
-        eval_config["data"] = eval_cfg["data"]
-        eval_loader = make_loader(
-            eval_dataset,
-            eval_config,
-            section="data",
-            batch_size=eval_cfg["batch_size"],
-            shuffle=False,
-            drop_last=False,
-        )
-        eval_loader = maybe_wrap_loader(eval_loader, device, backend)
+    backend, device, distributed = resolve_backend(config)
 
-    student = make_model(config, device)
-    teacher = deepcopy(student).to(device)
-    teacher.requires_grad_(False)
-    teacher.eval()
-
-    # Performance: cuDNN autotuning + torch.compile (V-JEPA 2.1 pattern)
-    if backend == "cuda":
-        torch.backends.cudnn.benchmark = True
-        compile_model = config["training"].get("compile_model", False)
-        if compile_model:
-            print(json.dumps({"action": "compiling_models", "note": "student + teacher + predictor via torch.compile"}))
-            torch._dynamo.config.optimize_ddp = False
-            student = torch.compile(student)
-            teacher = torch.compile(teacher)
-
-    optimizer = torch.optim.AdamW(
-        student.parameters(),
-        lr=float(config["training"]["lr"]),
-        weight_decay=float(config["training"]["weight_decay"]),
-        betas=(0.9, 0.95),
-    )
-    grad_scaler = make_grad_scaler(backend, config)
-
-    checkpoint_dir = Path(config["runtime"]["checkpoint_dir"])
-    epochs = int(config["training"]["epochs"])
-    log_every = int(config["training"].get("log_every_steps", 10))
-    save_every = int(config["training"].get("save_every_epochs", 1))
-    max_steps_per_epoch = int(config["training"].get("max_steps_per_epoch", 0))
-    mask_ratio = float(config["training"]["mask_ratio"])
-    ema_start = float(config["training"].get("ema_momentum_start", 0.996))
-    ema_end = float(config["training"].get("ema_momentum_end", 0.999))
-    steps_per_epoch = len(loader)
-    total_steps = max(1, epochs * max(steps_per_epoch, 1))
-    start_epoch = 0
-    global_step = 0
-    epoch_summaries: list[dict] = []
-    eval_summaries: list[dict] = []
-    best_validation_mean_loss = None
-    resumed_from_checkpoint = None
-    train_started_at = time.time()
-    metrics_path = checkpoint_dir / "metrics.jsonl"
-
-    if args.resume_from is not None:
-        resume_path = args.resume_from.resolve()
-        checkpoint = load_checkpoint(resume_path, backend)
-        load_module_state(student, checkpoint["student"], "student")
-        load_module_state(teacher, checkpoint.get("teacher", checkpoint["student"]), "teacher")
-        optimizer_resumed = True
-        try:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            move_optimizer_state(optimizer, device, backend)
-        except ValueError as exc:
-            optimizer_resumed = False
-            print(
-                json.dumps(
-                    {
-                        "resume_from": str(resume_path),
-                        "optimizer_state_restored": False,
-                        "warning": str(exc),
-                    },
-                    indent=2,
-                )
+    try:
+        dataset = build_dataset(config, section="data")
+        loader = make_loader(dataset, config, section="data", distributed=distributed, shuffle=True, drop_last=True)
+        loader = maybe_wrap_loader(loader, device, backend)
+        eval_cfg = resolve_eval_config(config)
+        eval_dataset = None
+        eval_loader = None
+        if eval_cfg is not None:
+            config["eval"]["data"] = eval_cfg["data"]
+            eval_dataset = build_dataset_from_cfg(eval_cfg["data"])
+            eval_config = deepcopy(config)
+            eval_config["data"] = eval_cfg["data"]
+            eval_loader = make_loader(
+                eval_dataset,
+                eval_config,
+                section="data",
+                distributed=distributed,
+                batch_size=eval_cfg["batch_size"],
+                shuffle=False,
+                drop_last=False,
             )
-        start_epoch = int(checkpoint.get("epoch", -1)) + 1
-        global_step = int(checkpoint.get("global_step", start_epoch * max(steps_per_epoch, 1)))
-        best_validation_mean_loss = checkpoint.get("best_validation_mean_loss")
-        resumed_from_checkpoint = str(resume_path)
-        print(
-            json.dumps(
+            eval_loader = maybe_wrap_loader(eval_loader, device, backend)
+
+        student = make_model(config, device)
+        teacher = deepcopy(student).to(device)
+        teacher.requires_grad_(False)
+        teacher.eval()
+
+        # Performance: cuDNN autotuning + torch.compile (V-JEPA 2.1 pattern)
+        if backend == "cuda":
+            torch.backends.cudnn.benchmark = True
+            compile_model = config["training"].get("compile_model", False)
+            if compile_model and distributed.enabled and distributed.is_main_process:
+                print(json.dumps({"warning": "compile_model disabled under CUDA DDP"}))
+            elif compile_model:
+                print(json.dumps({"action": "compiling_models", "note": "student + teacher + predictor via torch.compile"}))
+                torch._dynamo.config.optimize_ddp = False
+                student = torch.compile(student)
+                teacher = torch.compile(teacher)
+
+        optimizer = torch.optim.AdamW(
+            student.parameters(),
+            lr=float(config["training"]["lr"]),
+            weight_decay=float(config["training"]["weight_decay"]),
+            betas=(0.9, 0.95),
+        )
+        grad_scaler = make_grad_scaler(backend, config)
+
+        checkpoint_dir = Path(config["runtime"]["checkpoint_dir"])
+        epochs = int(config["training"]["epochs"])
+        log_every = int(config["training"].get("log_every_steps", 10))
+        save_every = int(config["training"].get("save_every_epochs", 1))
+        max_steps_per_epoch = int(config["training"].get("max_steps_per_epoch", 0))
+        mask_ratio = float(config["training"]["mask_ratio"])
+        ema_start = float(config["training"].get("ema_momentum_start", 0.996))
+        ema_end = float(config["training"].get("ema_momentum_end", 0.999))
+        steps_per_epoch = len(loader)
+        total_steps = max(1, epochs * max(steps_per_epoch, 1))
+        start_epoch = 0
+        global_step = 0
+        epoch_summaries: list[dict] = []
+        eval_summaries: list[dict] = []
+        best_validation_mean_loss = None
+        resumed_from_checkpoint = None
+        train_started_at = time.time()
+        metrics_path = checkpoint_dir / "metrics.jsonl"
+        manifest_path = checkpoint_dir / "run_manifest.json"
+
+        if args.resume_from is not None:
+            resume_path = args.resume_from.resolve()
+            checkpoint = load_checkpoint(resume_path, backend)
+            load_module_state(student, checkpoint["student"], "student")
+            load_module_state(teacher, checkpoint.get("teacher", checkpoint["student"]), "teacher")
+            optimizer_resumed = True
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                move_optimizer_state(optimizer, device, backend)
+            except ValueError as exc:
+                optimizer_resumed = False
+                if distributed.is_main_process:
+                    print(
+                        json.dumps(
+                            {
+                                "resume_from": str(resume_path),
+                                "optimizer_state_restored": False,
+                                "warning": str(exc),
+                            },
+                            indent=2,
+                        )
+                    )
+            start_epoch = int(checkpoint.get("epoch", -1)) + 1
+            global_step = int(checkpoint.get("global_step", start_epoch * max(steps_per_epoch, 1)))
+            best_validation_mean_loss = checkpoint.get("best_validation_mean_loss")
+            resumed_from_checkpoint = str(resume_path)
+            if distributed.is_main_process:
+                print(
+                    json.dumps(
+                        {
+                            "resume_from": resumed_from_checkpoint,
+                            "start_epoch": start_epoch + 1,
+                            "global_step": global_step,
+                            "best_validation_mean_loss": best_validation_mean_loss,
+                            "optimizer_state_restored": optimizer_resumed,
+                        },
+                        indent=2,
+                    )
+                )
+
+        student_stepper: torch.nn.Module | None = None
+        if distributed.enabled:
+            student_stepper = DDP(
+                StudentStepModule(student, backend, config).to(device),
+                device_ids=[distributed.local_rank],
+                output_device=distributed.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
+
+        if distributed.is_main_process:
+            write_json(
+                manifest_path,
+                collect_run_manifest(
+                    args=args,
+                    config=config,
+                    backend=backend,
+                    device=device,
+                    distributed=distributed,
+                    checkpoint_dir=checkpoint_dir,
+                    dataset=dataset,
+                    eval_dataset=eval_dataset,
+                    metrics_path=metrics_path,
+                    loader=loader,
+                    eval_loader=eval_loader,
+                ),
+            )
+
+            print(json.dumps(
                 {
-                    "resume_from": resumed_from_checkpoint,
+                    "backend": backend,
+                    "device": str(device),
+                    "distributed": distributed.enabled,
+                    "world_size": distributed.world_size,
+                    "rows": len(dataset),
+                    "base_rows": getattr(dataset, "base_row_count", len(dataset)),
+                    "steps_per_epoch": steps_per_epoch,
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "eval_rows": len(eval_dataset) if eval_dataset is not None else 0,
+                    "eval_base_rows": getattr(eval_dataset, "base_row_count", len(eval_dataset))
+                    if eval_dataset is not None
+                    else 0,
                     "start_epoch": start_epoch + 1,
-                    "global_step": global_step,
-                    "best_validation_mean_loss": best_validation_mean_loss,
-                    "optimizer_state_restored": optimizer_resumed,
+                    "manifest_path": str(manifest_path),
                 },
                 indent=2,
-            )
-        )
-
-    print(json.dumps(
-        {
-            "backend": backend,
-            "device": str(device),
-            "rows": len(dataset),
-            "base_rows": getattr(dataset, "base_row_count", len(dataset)),
-            "steps_per_epoch": steps_per_epoch,
-            "checkpoint_dir": str(checkpoint_dir),
-            "eval_rows": len(eval_dataset) if eval_dataset is not None else 0,
-            "eval_base_rows": getattr(eval_dataset, "base_row_count", len(eval_dataset)) if eval_dataset is not None else 0,
-            "start_epoch": start_epoch + 1,
-        },
-        indent=2,
-    ))
-    append_jsonl(
-        metrics_path,
-        {
-            "event": "run_start",
-            "timestamp": train_started_at,
-            "backend": backend,
-            "device": str(device),
-            "row_count": len(dataset),
-            "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
-            "eval_row_count": len(eval_dataset) if eval_dataset is not None else 0,
-            "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset))
-            if eval_dataset is not None
-            else 0,
-            "steps_per_epoch": steps_per_epoch,
-            "epochs": epochs,
-            "start_epoch": start_epoch + 1,
-            "resume_from_checkpoint": resumed_from_checkpoint,
-            "checkpoint_dir": str(checkpoint_dir),
-        },
-    )
-
-    for epoch in range(start_epoch, epochs):
-        student.train()
-        running_loss = None
-        running_masked_loss = None
-        running_context_loss = None
-        epoch_loss_total = 0.0
-        epoch_masked_loss_total = 0.0
-        epoch_context_loss_total = 0.0
-        epoch_step_count = 0
-        epoch_started_at = time.time()
-
-        for step, batch in enumerate(loader, start=1):
-            batch = move_batch(batch, device, backend)
-            dates = batch["dates"]
-            visible_idx, masked_idx = temporal_mask_indices(dates.shape[1], mask_ratio, dates.device)
-            current_lr, current_wd = apply_training_schedules(
-                optimizer,
-                global_step=global_step,
-                total_steps=total_steps,
-                training_cfg=config["training"],
-            )
-
-            with torch.no_grad():
-                teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
-
-            loss_terms = compute_prediction_losses(student, teacher_embeddings, batch, visible_idx, masked_idx, backend, device, config)
-            loss = loss_terms["total_loss"]
-
-            optimizer.zero_grad(set_to_none=True)
-            if grad_scaler is not None:
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
-
-                if backend == "tpu":
-                    import torch_xla.core.xla_model as xm
-
-                    xm.optimizer_step(optimizer)
-                else:
-                    optimizer.step()
-
-            progress = global_step / total_steps
-            momentum = ema_end - (ema_end - ema_start) * ((1 + math.cos(math.pi * progress)) / 2)
-            with torch.no_grad():
-                for student_param, teacher_param in zip(student.parameters(), teacher.parameters()):
-                    teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
-
-            detached_loss = loss.detach()
-            detached_masked_loss = loss_terms["masked_loss"]
-            detached_context_loss = loss_terms["context_loss"]
-            running_loss = detached_loss if running_loss is None else running_loss + detached_loss
-            running_masked_loss = (
-                detached_masked_loss
-                if running_masked_loss is None
-                else running_masked_loss + detached_masked_loss
-            )
-            running_context_loss = (
-                detached_context_loss
-                if running_context_loss is None
-                else running_context_loss + detached_context_loss
-            )
-            epoch_loss_total += float(detached_loss.cpu().item())
-            epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
-            epoch_context_loss_total += float(detached_context_loss.cpu().item())
-            epoch_step_count += 1
-            global_step += 1
-
-            if step % log_every == 0:
-                mean_loss = running_loss / log_every
-                mean_masked_loss = running_masked_loss / log_every
-                mean_context_loss = running_context_loss / log_every
-                train_step_metrics = {
-                    "event": "train_step",
-                    "timestamp": time.time(),
-                    "elapsed_sec": time.time() - train_started_at,
-                    "epoch": epoch + 1,
-                    "step_in_epoch": step,
-                    "global_step": global_step,
+            ))
+            append_jsonl(
+                metrics_path,
+                {
+                    "event": "run_start",
+                    "timestamp": train_started_at,
+                    "backend": backend,
+                    "device": str(device),
+                    "distributed": distributed.enabled,
+                    "world_size": distributed.world_size,
+                    "row_count": len(dataset),
+                    "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
+                    "eval_row_count": len(eval_dataset) if eval_dataset is not None else 0,
+                    "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset))
+                    if eval_dataset is not None
+                    else 0,
                     "steps_per_epoch": steps_per_epoch,
-                    "loss": float(mean_loss.cpu().item()),
-                    "masked_loss": float(mean_masked_loss.cpu().item()),
-                    "context_loss": float(mean_context_loss.cpu().item()),
-                    "lr": float(current_lr),
-                    "weight_decay": float(current_wd),
-                    "momentum": float(momentum),
-                }
-                if backend == "tpu":
-                    import torch_xla.core.xla_model as xm
-
-                    xm.master_print(
-                        f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
-                        f"loss={mean_loss.cpu().item():.6f} "
-                        f"masked_loss={mean_masked_loss.cpu().item():.6f} "
-                        f"context_loss={mean_context_loss.cpu().item():.6f} "
-                        f"lr={current_lr:.6e} wd={current_wd:.6f} "
-                        f"momentum={momentum:.6f}"
-                    )
-                else:
-                    print(
-                        f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
-                        f"loss={mean_loss.cpu().item():.6f} "
-                        f"masked_loss={mean_masked_loss.cpu().item():.6f} "
-                        f"context_loss={mean_context_loss.cpu().item():.6f} "
-                        f"lr={current_lr:.6e} wd={current_wd:.6f} "
-                        f"momentum={momentum:.6f}"
-                    )
-                append_jsonl(metrics_path, train_step_metrics)
-                running_loss = None
-                running_masked_loss = None
-                running_context_loss = None
-
-            if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
-                break
-
-        epoch_duration_sec = time.time() - epoch_started_at
-        epoch_mean_loss = epoch_loss_total / max(epoch_step_count, 1)
-        epoch_summary = {
-            "event": "epoch_summary",
-            "timestamp": time.time(),
-            "elapsed_sec": time.time() - train_started_at,
-            "epoch": epoch + 1,
-            "step_count": epoch_step_count,
-            "mean_loss": epoch_mean_loss,
-            "mean_masked_loss": epoch_masked_loss_total / max(epoch_step_count, 1),
-            "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
-            "duration_sec": epoch_duration_sec,
-        }
-        if backend == "cuda":
-            peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
-            print(f"epoch={epoch + 1} peak_gpu_mem_mb={peak_memory_mb:.1f}")
-            torch.cuda.reset_peak_memory_stats(device)
-            epoch_summary["peak_gpu_mem_mb"] = peak_memory_mb
-
-        if eval_loader is not None and eval_cfg is not None and (epoch + 1) % eval_cfg["every_epochs"] == 0:
-            eval_summary = evaluate(student, teacher, eval_loader, backend, device, config, eval_cfg)
-            eval_summary["epoch"] = epoch + 1
-            eval_summary["event"] = "validation"
-            eval_summary["timestamp"] = time.time()
-            eval_summary["elapsed_sec"] = time.time() - train_started_at
-            eval_summaries.append(eval_summary)
-            epoch_summary["validation_mean_loss"] = eval_summary["mean_loss"]
-            epoch_summary["validation_mean_masked_loss"] = eval_summary["mean_masked_loss"]
-            epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
-            epoch_summary["validation_step_count"] = eval_summary["step_count"]
-            print(
-                f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
-                f"validation_masked_loss={eval_summary['mean_masked_loss']:.6f} "
-                f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
-                f"validation_steps={eval_summary['step_count']}"
+                    "epochs": epochs,
+                    "start_epoch": start_epoch + 1,
+                    "resume_from_checkpoint": resumed_from_checkpoint,
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "manifest_path": str(manifest_path),
+                },
             )
-            validation_mean_loss = float(eval_summary["mean_loss"])
-            if best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss:
-                best_validation_mean_loss = validation_mean_loss
-                best_path = checkpoint_dir / "ewm_best_val.pt"
+
+        for epoch in range(start_epoch, epochs):
+            set_loader_epoch(loader, epoch)
+            if eval_loader is not None:
+                set_loader_epoch(eval_loader, epoch)
+            student.train()
+            if student_stepper is not None:
+                student_stepper.train()
+            running_loss = None
+            running_masked_loss = None
+            running_context_loss = None
+            epoch_loss_total = 0.0
+            epoch_masked_loss_total = 0.0
+            epoch_context_loss_total = 0.0
+            epoch_step_count = 0
+            epoch_started_at = time.time()
+
+            for step, batch in enumerate(loader, start=1):
+                batch = move_batch(batch, device, backend)
+                dates = batch["dates"]
+                visible_idx, masked_idx = temporal_mask_indices(dates.shape[1], mask_ratio, dates.device)
+                current_lr, current_wd = apply_training_schedules(
+                    optimizer,
+                    global_step=global_step,
+                    total_steps=total_steps,
+                    training_cfg=config["training"],
+                )
+
+                with torch.no_grad():
+                    teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
+
+                loss_terms = compute_student_loss_terms(
+                    student,
+                    student_stepper,
+                    teacher_embeddings,
+                    batch,
+                    visible_idx,
+                    masked_idx,
+                    backend,
+                    device,
+                    config,
+                )
+                loss = loss_terms["total_loss"]
+
+                optimizer.zero_grad(set_to_none=True)
+                if grad_scaler is not None:
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
+
+                    if backend == "tpu":
+                        import torch_xla.core.xla_model as xm
+
+                        xm.optimizer_step(optimizer)
+                    else:
+                        optimizer.step()
+
+                progress = global_step / total_steps
+                momentum = ema_end - (ema_end - ema_start) * ((1 + math.cos(math.pi * progress)) / 2)
+                with torch.no_grad():
+                    for student_param, teacher_param in zip(student.parameters(), teacher.parameters()):
+                        teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
+
+                detached_loss = loss.detach()
+                detached_masked_loss = loss_terms["masked_loss"]
+                detached_context_loss = loss_terms["context_loss"]
+                running_loss = detached_loss if running_loss is None else running_loss + detached_loss
+                running_masked_loss = (
+                    detached_masked_loss
+                    if running_masked_loss is None
+                    else running_masked_loss + detached_masked_loss
+                )
+                running_context_loss = (
+                    detached_context_loss
+                    if running_context_loss is None
+                    else running_context_loss + detached_context_loss
+                )
+                epoch_loss_total += float(detached_loss.cpu().item())
+                epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
+                epoch_context_loss_total += float(detached_context_loss.cpu().item())
+                epoch_step_count += 1
+                global_step += 1
+
+                if step % log_every == 0:
+                    mean_loss = reduce_scalar_mean(running_loss / log_every, distributed=distributed, device=device)
+                    mean_masked_loss = reduce_scalar_mean(
+                        running_masked_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    mean_context_loss = reduce_scalar_mean(
+                        running_context_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    if distributed.is_main_process:
+                        train_step_metrics = {
+                            "event": "train_step",
+                            "timestamp": time.time(),
+                            "elapsed_sec": time.time() - train_started_at,
+                            "epoch": epoch + 1,
+                            "step_in_epoch": step,
+                            "global_step": global_step,
+                            "steps_per_epoch": steps_per_epoch,
+                            "loss": float(mean_loss.cpu().item()),
+                            "masked_loss": float(mean_masked_loss.cpu().item()),
+                            "context_loss": float(mean_context_loss.cpu().item()),
+                            "lr": float(current_lr),
+                            "weight_decay": float(current_wd),
+                            "momentum": float(momentum),
+                        }
+                        if backend == "tpu":
+                            import torch_xla.core.xla_model as xm
+
+                            xm.master_print(
+                                f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
+                                f"loss={mean_loss.cpu().item():.6f} "
+                                f"masked_loss={mean_masked_loss.cpu().item():.6f} "
+                                f"context_loss={mean_context_loss.cpu().item():.6f} "
+                                f"lr={current_lr:.6e} wd={current_wd:.6f} "
+                                f"momentum={momentum:.6f}"
+                            )
+                        else:
+                            print(
+                                f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
+                                f"loss={mean_loss.cpu().item():.6f} "
+                                f"masked_loss={mean_masked_loss.cpu().item():.6f} "
+                                f"context_loss={mean_context_loss.cpu().item():.6f} "
+                                f"lr={current_lr:.6e} wd={current_wd:.6f} "
+                                f"momentum={momentum:.6f}"
+                            )
+                        append_jsonl(metrics_path, train_step_metrics)
+                    running_loss = None
+                    running_masked_loss = None
+                    running_context_loss = None
+
+                if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
+                    break
+
+            epoch_duration_sec = time.time() - epoch_started_at
+            epoch_loss_total = reduce_scalar_sum(epoch_loss_total, device, distributed)
+            epoch_masked_loss_total = reduce_scalar_sum(epoch_masked_loss_total, device, distributed)
+            epoch_context_loss_total = reduce_scalar_sum(epoch_context_loss_total, device, distributed)
+            epoch_step_count = int(round(reduce_scalar_sum(epoch_step_count, device, distributed)))
+            epoch_mean_loss = epoch_loss_total / max(epoch_step_count, 1)
+            epoch_summary = {
+                "event": "epoch_summary",
+                "timestamp": time.time(),
+                "elapsed_sec": time.time() - train_started_at,
+                "epoch": epoch + 1,
+                "step_count": epoch_step_count,
+                "mean_loss": epoch_mean_loss,
+                "mean_masked_loss": epoch_masked_loss_total / max(epoch_step_count, 1),
+                "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
+                "duration_sec": epoch_duration_sec,
+            }
+            if backend == "cuda":
+                peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                peak_memory_mb = reduce_scalar_max(peak_memory_mb, device, distributed)
+                if distributed.is_main_process:
+                    print(f"epoch={epoch + 1} peak_gpu_mem_mb={peak_memory_mb:.1f}")
+                torch.cuda.reset_peak_memory_stats(device)
+                epoch_summary["peak_gpu_mem_mb"] = peak_memory_mb
+
+            if eval_loader is not None and eval_cfg is not None and (epoch + 1) % eval_cfg["every_epochs"] == 0:
+                eval_summary = evaluate(student, student_stepper, teacher, eval_loader, backend, device, config, eval_cfg, distributed)
+                eval_summary["epoch"] = epoch + 1
+                eval_summary["event"] = "validation"
+                eval_summary["timestamp"] = time.time()
+                eval_summary["elapsed_sec"] = time.time() - train_started_at
+                if distributed.is_main_process:
+                    eval_summaries.append(eval_summary)
+                epoch_summary["validation_mean_loss"] = eval_summary["mean_loss"]
+                epoch_summary["validation_mean_masked_loss"] = eval_summary["mean_masked_loss"]
+                epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
+                epoch_summary["validation_step_count"] = eval_summary["step_count"]
+                if distributed.is_main_process:
+                    print(
+                        f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
+                        f"validation_masked_loss={eval_summary['mean_masked_loss']:.6f} "
+                        f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
+                        f"validation_steps={eval_summary['step_count']}"
+                    )
+                validation_mean_loss = float(eval_summary["mean_loss"])
+                if distributed.is_main_process and (
+                    best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss
+                ):
+                    best_validation_mean_loss = validation_mean_loss
+                    best_path = checkpoint_dir / "ewm_best_val.pt"
+                    payload = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "student": student.state_dict(),
+                        "teacher": teacher.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "config": config,
+                        "best_validation_mean_loss": best_validation_mean_loss,
+                    }
+                    save_checkpoint(best_path, backend, payload)
+                    print(f"saved best-val checkpoint: {best_path}")
+                if distributed.is_main_process:
+                    append_jsonl(metrics_path, eval_summary)
+
+            if distributed.is_main_process:
+                epoch_summaries.append(epoch_summary)
+                append_jsonl(metrics_path, epoch_summary)
+
+            if distributed.is_main_process and (epoch + 1) % save_every == 0:
+                checkpoint_path = checkpoint_dir / f"ewm_epoch_{epoch + 1:03d}.pt"
                 payload = {
                     "epoch": epoch,
                     "global_step": global_step,
@@ -1042,59 +1638,56 @@ def main() -> None:
                     "config": config,
                     "best_validation_mean_loss": best_validation_mean_loss,
                 }
-                save_checkpoint(best_path, backend, payload)
-                print(f"saved best-val checkpoint: {best_path}")
-            append_jsonl(metrics_path, eval_summary)
+                save_checkpoint(checkpoint_path, backend, payload)
+                print(f"saved checkpoint: {checkpoint_path}")
 
-        epoch_summaries.append(epoch_summary)
-        append_jsonl(metrics_path, epoch_summary)
+            barrier_if_needed(distributed)
 
-        if (epoch + 1) % save_every == 0:
-            checkpoint_path = checkpoint_dir / f"ewm_epoch_{epoch + 1:03d}.pt"
-            payload = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "student": student.state_dict(),
-                "teacher": teacher.state_dict(),
-                "optimizer": optimizer.state_dict(),
+        if distributed.is_main_process:
+            summary_path = checkpoint_dir / "training_summary.json"
+            summary = {
+                "backend": backend,
+                "device": str(device),
+                "distributed": {
+                    "enabled": distributed.enabled,
+                    "world_size": distributed.world_size,
+                },
+                "row_count": len(dataset),
+                "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
+                "eval_row_count": len(eval_dataset) if eval_dataset is not None else 0,
+                "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset))
+                if eval_dataset is not None
+                else 0,
+                "steps_per_epoch": steps_per_epoch,
+                "epochs": epochs,
+                "global_steps_completed": global_step,
+                "training_duration_sec": time.time() - train_started_at,
+                "epoch_summaries": epoch_summaries,
+                "eval_summaries": eval_summaries,
+                "final_epoch_mean_loss": epoch_summaries[-1]["mean_loss"] if epoch_summaries else None,
+                "best_validation_mean_loss": best_validation_mean_loss,
+                "resume_from_checkpoint": resumed_from_checkpoint,
+                "start_epoch": start_epoch + 1,
+                "manifest_path": str(manifest_path),
                 "config": config,
             }
-            save_checkpoint(checkpoint_path, backend, payload)
-            print(f"saved checkpoint: {checkpoint_path}")
-
-    summary_path = checkpoint_dir / "training_summary.json"
-    summary = {
-        "backend": backend,
-        "device": str(device),
-        "row_count": len(dataset),
-        "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
-        "eval_row_count": len(eval_dataset) if eval_dataset is not None else 0,
-        "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset)) if eval_dataset is not None else 0,
-        "steps_per_epoch": steps_per_epoch,
-        "epochs": epochs,
-        "global_steps_completed": global_step,
-        "training_duration_sec": time.time() - train_started_at,
-        "epoch_summaries": epoch_summaries,
-        "eval_summaries": eval_summaries,
-        "final_epoch_mean_loss": epoch_summaries[-1]["mean_loss"] if epoch_summaries else None,
-        "best_validation_mean_loss": best_validation_mean_loss,
-        "resume_from_checkpoint": resumed_from_checkpoint,
-        "start_epoch": start_epoch + 1,
-        "config": config,
-    }
-    write_json(summary_path, summary)
-    append_jsonl(
-        metrics_path,
-        {
-            "event": "run_end",
-            "timestamp": time.time(),
-            "elapsed_sec": time.time() - train_started_at,
-            "summary_path": str(summary_path),
-            "best_validation_mean_loss": best_validation_mean_loss,
-            "global_steps_completed": global_step,
-        },
-    )
-    print(f"wrote training summary: {summary_path}")
+            write_json(summary_path, summary)
+            append_jsonl(
+                metrics_path,
+                {
+                    "event": "run_end",
+                    "timestamp": time.time(),
+                    "elapsed_sec": time.time() - train_started_at,
+                    "summary_path": str(summary_path),
+                    "manifest_path": str(manifest_path),
+                    "best_validation_mean_loss": best_validation_mean_loss,
+                    "global_steps_completed": global_step,
+                },
+            )
+            print(f"wrote training summary: {summary_path}")
+        barrier_if_needed(distributed)
+    finally:
+        destroy_distributed_process_group(distributed)
 
 
 if __name__ == "__main__":

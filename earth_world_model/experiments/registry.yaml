@@ -9,6 +9,8 @@ paper_axes:
   - paper.token_mode
   - paper.spatial_fusion
   - paper.temporal_block_type
+  - paper.embed_dim
+  - paper.num_heads
   - paper.continuation
   - paper.epochs
   - paper.lr_schedule
@@ -37,6 +39,8 @@ experiments:
       token_mode: pooled
       spatial_fusion: early_mean
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: constant
       main_question: Does scale alone help before any JEPA-2.1-inspired upgrades?
@@ -64,6 +68,8 @@ experiments:
       token_mode: pooled
       spatial_fusion: early_mean
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: constant
       main_question: Does adding visible-context loss help without changing representation structure?
@@ -91,6 +97,8 @@ experiments:
       token_mode: pooled
       spatial_fusion: early_mean
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: constant
       main_question: Does hierarchical supervision help before switching to dense tokens?
@@ -118,6 +126,8 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: Does the dense Stage C recipe outperform the pooled breadth baselines?
@@ -145,9 +155,98 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: stage_d_rope
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: Does the Stage D architecture help on breadth-only data?
+
+  - id: ssl4eo_50k_stagec_width1024_v1
+    status: planned_width_scaling
+    kind: pretrain
+    description: Width-scaled Stage C breadth run at embed_dim 1024 for post-384 scaling ablations.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_stagec_dense_1024_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: width_scaling_breadth
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      embed_dim: 1024
+      num_heads: 16
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: After the 384 Stage C run is understood, does widening the model to 1024 materially improve breadth-only pretraining?
+
+  - id: ssl4eo_50k_staged_rope_width1024_v1
+    status: planned_width_scaling
+    kind: pretrain
+    description: Width-scaled Stage D breadth run at embed_dim 1024 with RoPE-based temporal blocks.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_staged_rope_1024_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: width_scaling_breadth
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_d_rope
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: stage_d_rope
+      embed_dim: 1024
+      num_heads: 16
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: After Stage D at 384 is understood, does widening the RoPE temporal stack to 1024 materially improve breadth-only pretraining?
+
+  - id: ssl4eo_50k_stagec_width1408_v1
+    status: planned_width_scaling
+    kind: pretrain
+    description: Width-scaled Stage C breadth run at embed_dim 1408 for larger V-JEPA-2.1-style scaling.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_50k_vjepa21_stagec_dense_1408_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: width_scaling_breadth
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 50000
+      sample_budget_eval: 2048
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      embed_dim: 1408
+      num_heads: 32
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: If 1024 helps, does a 1408-width Stage C model justify the additional compute and memory cost?
 
   - id: dense_cdse_stagec_scratch_pilot_v1
     status: runnable_after_dense_materialization
@@ -171,6 +270,8 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: Does the dense corpus and loader train stably before continuation experiments?
@@ -199,6 +300,8 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: Does dense temporal continuation add value beyond the breadth Stage C checkpoint?
@@ -227,6 +330,8 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: stage_d_rope
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: After the clean continuation test, does Stage D add further value on the dense corpus?
@@ -253,6 +358,8 @@ experiments:
       token_mode: dense
       spatial_fusion: late_concat
       temporal_block_type: standard
+      embed_dim: 384
+      num_heads: 8
       epochs: 3
       lr_schedule: warmup_hold_cosine
       main_question: Does mixed sampling regularize the dense model after the sequential path is understood?

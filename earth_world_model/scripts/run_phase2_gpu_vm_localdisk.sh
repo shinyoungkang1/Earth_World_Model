@@ -8,5 +8,6 @@ export DATA_ACCESS_MODE="${DATA_ACCESS_MODE:-localdisk}"
 export SKIP_DATA_SYNC="${SKIP_DATA_SYNC:-1}"
 export USE_GCSFUSE_MOUNT="${USE_GCSFUSE_MOUNT:-0}"
 export USE_GCS_DATA_DIRECT="${USE_GCS_DATA_DIRECT:-0}"
+export EWM_LAUNCHER_SCRIPT="${EWM_LAUNCHER_SCRIPT:-$PROJECT_ROOT/earth_world_model/scripts/run_phase2_gpu_vm_localdisk.sh}"
 
 bash "$PROJECT_ROOT/earth_world_model/scripts/run_phase2_gpu_vm.sh"

@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--section", default="data")
     parser.add_argument("--override-root-dir", default=None)
     parser.add_argument("--override-max-samples", type=int, default=None)
+    parser.add_argument("--override-sample-offset", type=int, default=None)
     parser.add_argument("--override-num-workers", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-batches", type=int, default=5)
@@ -52,6 +53,8 @@ def main() -> None:
         data_cfg["root_dir"] = args.override_root_dir
     if args.override_max_samples is not None:
         data_cfg["max_samples"] = int(args.override_max_samples)
+    if args.override_sample_offset is not None:
+        data_cfg["sample_offset"] = int(args.override_sample_offset)
     if args.override_num_workers is not None:
         data_cfg["num_workers"] = int(args.override_num_workers)
     config[args.section] = data_cfg

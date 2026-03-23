@@ -34,6 +34,7 @@ class SpatialEncoder(nn.Module):
         fusion_mode: str = "early_mean",
         use_modality_embeddings: bool = False,
         use_patch_positional_encoding: bool = False,
+        use_missing_modality_embeddings: bool = False,
     ):
         super().__init__()
         self.patch_px = int(patch_px)
@@ -41,6 +42,7 @@ class SpatialEncoder(nn.Module):
         self.fusion_mode = str(fusion_mode)
         self.use_modality_embeddings = bool(use_modality_embeddings)
         self.use_patch_positional_encoding = bool(use_patch_positional_encoding)
+        self.use_missing_modality_embeddings = bool(use_missing_modality_embeddings)
         if self.fusion_mode not in {"early_mean", "late_concat"}:
             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
         self.s2_proj = SensorProjector(12 * self.patch_px * self.patch_px, embed_dim)
@@ -51,10 +53,15 @@ class SpatialEncoder(nn.Module):
         self.s2_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.s1_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.hls_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.s2_missing_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.s1_missing_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if self.use_modality_embeddings:
             nn.init.normal_(self.s2_mod_embed, std=1.0e-6)
             nn.init.normal_(self.s1_mod_embed, std=1.0e-6)
             nn.init.normal_(self.hls_mod_embed, std=1.0e-6)
+        if self.use_missing_modality_embeddings:
+            nn.init.normal_(self.s2_missing_embed, std=1.0e-6)
+            nn.init.normal_(self.s1_missing_embed, std=1.0e-6)
 
     def patchify(self, inputs: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = inputs.shape
@@ -126,6 +133,8 @@ class SpatialEncoder(nn.Module):
         s2: torch.Tensor | None = None,
         s1: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         pieces: list[torch.Tensor] = []
         if hls is not None:
@@ -137,8 +146,16 @@ class SpatialEncoder(nn.Module):
             raise ValueError("s2 and s1 are required when hls is not provided")
         s2_tokens = self.s2_proj(self.patchify(s2))
         s1_tokens = self.s1_proj(self.patchify(s1))
-        pieces.append(self._apply_token_enrichments(s2_tokens, modality="s2"))
-        pieces.append(self._apply_token_enrichments(s1_tokens, modality="s1"))
+        s2_tokens = self._apply_token_enrichments(s2_tokens, modality="s2")
+        s1_tokens = self._apply_token_enrichments(s1_tokens, modality="s1")
+        if self.use_missing_modality_embeddings and s2_present is not None:
+            missing = (~s2_present.to(torch.bool)).view(-1, 1, 1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
+            s2_tokens = s2_tokens + (missing * self.s2_missing_embed.to(device=s2_tokens.device, dtype=s2_tokens.dtype))
+        if self.use_missing_modality_embeddings and s1_present is not None:
+            missing = (~s1_present.to(torch.bool)).view(-1, 1, 1).to(device=s1_tokens.device, dtype=s1_tokens.dtype)
+            s1_tokens = s1_tokens + (missing * self.s1_missing_embed.to(device=s1_tokens.device, dtype=s1_tokens.dtype))
+        pieces.append(s2_tokens)
+        pieces.append(s1_tokens)
         return pieces
 
     def step_token_template(self, tokens_per_step: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -176,9 +193,13 @@ class SpatialEncoder(nn.Module):
         s2: torch.Tensor | None = None,
         s1: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
         return_tokens: bool = False,
     ) -> torch.Tensor:
-        combined = self.fuse_tokens(self.encode_modalities(s2=s2, s1=s1, hls=hls))
+        combined = self.fuse_tokens(
+            self.encode_modalities(s2=s2, s1=s1, hls=hls, s2_present=s2_present, s1_present=s1_present)
+        )
         combined = self.norm(combined)
         if return_tokens:
             return combined

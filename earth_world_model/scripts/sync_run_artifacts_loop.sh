@@ -5,6 +5,8 @@ GCS_RUN_URI="${GCS_RUN_URI:?Set GCS_RUN_URI}"
 TRAIN_LOG="${TRAIN_LOG:?Set TRAIN_LOG}"
 METRICS_PATH="${METRICS_PATH:?Set METRICS_PATH}"
 SUMMARY_PATH="${SUMMARY_PATH:?Set SUMMARY_PATH}"
+MANIFEST_PATH="${MANIFEST_PATH:-}"
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
 CHECK_INTERVAL_SEC="${CHECK_INTERVAL_SEC:-60}"
 
 copy_if_exists() {
@@ -15,13 +17,33 @@ copy_if_exists() {
   fi
 }
 
+sync_dir_if_exists() {
+  local source_dir="$1"
+  local dest_dir="$2"
+  if [[ -d "$source_dir" ]]; then
+    gcloud storage rsync --recursive "$source_dir" "$dest_dir" >/dev/null 2>&1 || true
+  fi
+}
+
 while pgrep -f run_phase2_gpu_vm.sh >/dev/null 2>&1 || pgrep -f run_phase2_tpu_vm.sh >/dev/null 2>&1 || pgrep -f train_tpu.py >/dev/null 2>&1; do
+  if [[ -n "$CHECKPOINT_DIR" ]]; then
+    sync_dir_if_exists "$CHECKPOINT_DIR" "$GCS_RUN_URI/checkpoints"
+  fi
   copy_if_exists "$TRAIN_LOG" "$GCS_RUN_URI/train.log"
   copy_if_exists "$METRICS_PATH" "$GCS_RUN_URI/metrics.jsonl"
   copy_if_exists "$SUMMARY_PATH" "$GCS_RUN_URI/training_summary.json"
+  if [[ -n "$MANIFEST_PATH" ]]; then
+    copy_if_exists "$MANIFEST_PATH" "$GCS_RUN_URI/run_manifest.json"
+  fi
   sleep "$CHECK_INTERVAL_SEC"
 done
 
+if [[ -n "$CHECKPOINT_DIR" ]]; then
+  sync_dir_if_exists "$CHECKPOINT_DIR" "$GCS_RUN_URI/checkpoints"
+fi
 copy_if_exists "$TRAIN_LOG" "$GCS_RUN_URI/train.log"
 copy_if_exists "$METRICS_PATH" "$GCS_RUN_URI/metrics.jsonl"
 copy_if_exists "$SUMMARY_PATH" "$GCS_RUN_URI/training_summary.json"
+if [[ -n "$MANIFEST_PATH" ]]; then
+  copy_if_exists "$MANIFEST_PATH" "$GCS_RUN_URI/run_manifest.json"
+fi

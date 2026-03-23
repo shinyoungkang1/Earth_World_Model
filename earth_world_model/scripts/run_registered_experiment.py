@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -17,6 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = REPO_ROOT / "earth_world_model" / "experiments" / "registry.yaml"
 TRAIN_SCRIPT_PATH = REPO_ROOT / "earth_world_model" / "train_tpu.py"
 PROBE_SCRIPT_PATH = REPO_ROOT / "earth_world_model" / "scripts" / "run_phase3_probe_gpu_vm.sh"
+DEFAULT_GCS_RUNS_ROOT = os.environ.get(
+    "EWM_GCS_RUNS_ROOT",
+    "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs",
+)
 COMPARE_IGNORE_KEYS = {
     "runtime.checkpoint_dir",
     "data.root_dir",
@@ -54,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     command_parser.add_argument("--dense-eval-index-path", default=None)
     command_parser.add_argument("--checkpoint-dir", default=None)
     command_parser.add_argument("--backend", default="cuda")
+    command_parser.add_argument("--cuda-ddp-procs", type=int, default=None)
     command_parser.add_argument(
         "--data-access-mode",
         default="auto",
@@ -120,6 +126,13 @@ def shell_quote(value: str, *, raw: bool = False) -> str:
 
 def shell_placeholder(name: str) -> str:
     return "${%s:?set %s}" % (name, name)
+
+
+def default_gcs_run_uri(experiment: dict[str, Any]) -> str:
+    configured_uri = experiment.get("gcs_run_uri")
+    if configured_uri:
+        return str(configured_uri)
+    return f"{DEFAULT_GCS_RUNS_ROOT.rstrip('/')}/{experiment['id']}"
 
 
 def load_experiment_config(experiment: dict[str, Any]) -> tuple[Path | None, dict[str, Any]]:
@@ -250,11 +263,14 @@ def render_phase2_command(experiment: dict[str, Any], args: argparse.Namespace) 
     data_access_mode = args.data_access_mode
     if args.use_gcs_data_direct:
         data_access_mode = "gcs_direct"
+    gcs_run_uri = args.gcs_run_uri or default_gcs_run_uri(experiment)
     lines = [
         render_export("CONFIG_PATH", str(config_path)),
         render_export("GCS_DATA_URI", args.gcs_data_uri or shell_placeholder("GCS_DATA_URI"), raw=args.gcs_data_uri is None),
-        render_export("GCS_RUN_URI", args.gcs_run_uri or shell_placeholder("GCS_RUN_URI"), raw=args.gcs_run_uri is None),
+        render_export("GCS_RUN_URI", gcs_run_uri),
         render_export("DATA_ACCESS_MODE", data_access_mode),
+        render_export("EWM_EXPERIMENT_ID", experiment["id"]),
+        render_export("EWM_RUN_LABEL", experiment["id"]),
     ]
     if args.local_run_root:
         lines.append(render_export("LOCAL_RUN_ROOT", args.local_run_root))
@@ -264,6 +280,8 @@ def render_phase2_command(experiment: dict[str, Any], args: argparse.Namespace) 
         lines.append(render_export("LOCAL_CHECKPOINT_DIR", args.local_checkpoint_dir))
     if args.run_log_path:
         lines.append(render_export("RUN_LOG_PATH", args.run_log_path))
+    if args.cuda_ddp_procs is not None:
+        lines.append(render_export("CUDA_DDP_PROCS", str(args.cuda_ddp_procs)))
     if args.resume_from_basename:
         lines.append(render_export("RESUME_FROM_BASENAME", args.resume_from_basename))
     if args.skip_data_sync:
@@ -292,6 +310,9 @@ def render_direct_train_command(experiment: dict[str, Any], args: argparse.Names
         render_export("PYTHONPATH", f"{REPO_ROOT / 'earth_world_model' / 'src'}:{REPO_ROOT}"),
         render_export("PYTHONUNBUFFERED", "1"),
         render_export("EWM_BACKEND", args.backend),
+        render_export("EWM_EXPERIMENT_ID", experiment["id"]),
+        render_export("EWM_RUN_LABEL", experiment["id"]),
+        render_export("EWM_LAUNCHER_SCRIPT", str(TRAIN_SCRIPT_PATH)),
         render_export(
             "EWM_DENSE_INDEX_PATH",
             args.dense_index_path or shell_placeholder("EWM_DENSE_INDEX_PATH"),
@@ -310,10 +331,24 @@ def render_direct_train_command(experiment: dict[str, Any], args: argparse.Names
     ]
     command_parts = [
         "python",
-        shlex.quote(str(TRAIN_SCRIPT_PATH)),
-        "--config",
-        shlex.quote(str(config_path)),
     ]
+    if args.cuda_ddp_procs is not None and args.cuda_ddp_procs > 1:
+        command_parts.extend(
+            [
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc_per_node={args.cuda_ddp_procs}",
+            ]
+        )
+    command_parts.extend(
+        [
+            shlex.quote(str(TRAIN_SCRIPT_PATH)),
+            "--config",
+            shlex.quote(str(config_path)),
+        ]
+    )
     if resume_from_value:
         command_parts.extend(
             [
@@ -337,8 +372,10 @@ def render_command(experiment: dict[str, Any], args: argparse.Namespace) -> str:
 
 
 def render_probe_command(args: argparse.Namespace) -> str:
+    experiment = experiments_by_id(load_registry())[args.experiment_id]
+    gcs_run_uri = args.gcs_run_uri or default_gcs_run_uri(experiment)
     lines = [
-        render_export("GCS_RUN_URI", args.gcs_run_uri or shell_placeholder("GCS_RUN_URI"), raw=args.gcs_run_uri is None),
+        render_export("GCS_RUN_URI", gcs_run_uri),
         render_export("PROBE_TASK", args.probe_task),
         render_export("PROBE_NETWORK", args.probe_network),
     ]

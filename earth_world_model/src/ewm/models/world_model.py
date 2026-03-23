@@ -52,6 +52,7 @@ class EarthWorldModel(nn.Module):
         spatial_fusion: str = "early_mean",
         use_modality_embeddings: bool = False,
         use_patch_positional_encoding: bool = False,
+        use_missing_modality_embeddings: bool = False,
         temporal_block_type: str = "standard",
         use_rope_temporal_attention: bool = False,
         rope_base: float = 10000.0,
@@ -77,6 +78,7 @@ class EarthWorldModel(nn.Module):
             fusion_mode=spatial_fusion,
             use_modality_embeddings=use_modality_embeddings,
             use_patch_positional_encoding=use_patch_positional_encoding,
+            use_missing_modality_embeddings=use_missing_modality_embeddings,
         )
         self.temporal_pos = TemporalPositionalEncoding(embed_dim)
         self._last_tokens_per_timestep = 1
@@ -230,6 +232,8 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         mask: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
         return_hierarchical: bool = False,
     ) -> torch.Tensor:
         step_embeddings = []
@@ -240,7 +244,13 @@ class EarthWorldModel(nn.Module):
             else:
                 if s2 is None or s1 is None:
                     raise ValueError("s2 and s1 are required when hls is not provided")
-                spatial_tokens = self.spatial(s2=s2[:, timestep], s1=s1[:, timestep], return_tokens=True)
+                spatial_tokens = self.spatial(
+                    s2=s2[:, timestep],
+                    s1=s1[:, timestep],
+                    s2_present=None if s2_present is None else s2_present[:, timestep],
+                    s1_present=None if s1_present is None else s1_present[:, timestep],
+                    return_tokens=True,
+                )
 
             if self.token_mode == "dense":
                 if use_rope_positions:
@@ -349,6 +359,8 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         mask: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
         mode: str = "mean",
     ) -> torch.Tensor:
         """Extract a fixed-size embedding from an input sequence.
@@ -367,13 +379,15 @@ class EarthWorldModel(nn.Module):
             raise ValueError(f"Unsupported embedding mode {mode!r}; choose from {self._EMBEDDING_MODES}")
 
         if mode == "multilayer":
-            return self._extract_multilayer(s2, s1, dates, mask, hls)
+            return self._extract_multilayer(s2, s1, dates, mask, hls, s2_present, s1_present)
 
         if mode == "ensemble":
-            return self._extract_ensemble(s2, s1, dates, mask, hls)
+            return self._extract_ensemble(s2, s1, dates, mask, hls, s2_present, s1_present)
 
         # Modes that operate on the full encoder timeline
-        timeline = self.encode_timeline(s2=s2, s1=s1, dates=dates, mask=mask, hls=hls)
+        timeline = self.encode_timeline(
+            s2=s2, s1=s1, dates=dates, mask=mask, hls=hls, s2_present=s2_present, s1_present=s1_present
+        )
 
         if mode == "l2_mean":
             return F.normalize(timeline, dim=-1).mean(dim=1)
@@ -396,6 +410,8 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         mask: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Concatenate mean-pooled outputs from encoder layers 1, 3, 5."""
         # Build the pre-encoder timeline (same logic as encode_timeline up to
@@ -408,7 +424,13 @@ class EarthWorldModel(nn.Module):
             else:
                 if s2 is None or s1 is None:
                     raise ValueError("s2 and s1 are required when hls is not provided")
-                spatial_tokens = self.spatial(s2=s2[:, timestep], s1=s1[:, timestep], return_tokens=True)
+                spatial_tokens = self.spatial(
+                    s2=s2[:, timestep],
+                    s1=s1[:, timestep],
+                    s2_present=None if s2_present is None else s2_present[:, timestep],
+                    s1_present=None if s1_present is None else s1_present[:, timestep],
+                    return_tokens=True,
+                )
             if self.token_mode == "dense":
                 step_tokens = spatial_tokens if use_rope else spatial_tokens + self.temporal_pos(dates[:, timestep:timestep + 1]).unsqueeze(1).squeeze(2)
                 step_embeddings.append(step_tokens)
@@ -453,6 +475,8 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         mask: torch.Tensor | None = None,
         hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multi-mask predictor ensemble matching JEPA training distribution.
 
@@ -474,13 +498,15 @@ class EarthWorldModel(nn.Module):
             visible_s2 = s2[:, visible_idx_t] if s2 is not None else None
             visible_s1 = s1[:, visible_idx_t] if s1 is not None else None
             visible_hls = hls[:, visible_idx_t] if hls is not None else None
+            visible_s2_present = s2_present[:, visible_idx_t] if s2_present is not None else None
+            visible_s1_present = s1_present[:, visible_idx_t] if s1_present is not None else None
             visible_dates = dates[:, visible_idx_t]
             visible_mask = mask[:, visible_idx_t] if mask is not None else None
             masked_dates = dates[:, masked_idx_t]
 
             visible_emb = self.encode_timeline(
                 s2=visible_s2, s1=visible_s1, dates=visible_dates,
-                mask=visible_mask, hls=visible_hls,
+                mask=visible_mask, hls=visible_hls, s2_present=visible_s2_present, s1_present=visible_s1_present,
             )
 
             # Run predictor with visible + mask tokens (training distribution)

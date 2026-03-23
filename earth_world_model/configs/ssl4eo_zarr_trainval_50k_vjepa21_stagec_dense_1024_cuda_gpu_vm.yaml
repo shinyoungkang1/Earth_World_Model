@@ -1,7 +1,7 @@
 runtime:
   backend: ${EWM_BACKEND:-cuda}
   seed: 42
-  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_phase2_50k_gpu/checkpoints/ssl4eo_zarr_trainval_50k_vjepa21_stagec_dense_cuda}
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_phase2_50k_gpu/checkpoints/ssl4eo_zarr_trainval_50k_vjepa21_stagec_dense_1024_cuda}
   autocast_dtype: float16
 
 data:
@@ -23,11 +23,11 @@ data:
 
 model:
   input_mode: s2s1
-  embed_dim: 384
+  embed_dim: 1024
   patch_px: 8
   temporal_depth: 6
   predictor_depth: 3
-  num_heads: 8
+  num_heads: 16
   hierarchical_layers: [1, 3, 5]
   token_mode: dense
   spatial_fusion: late_concat

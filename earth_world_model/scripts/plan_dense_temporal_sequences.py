@@ -102,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated asset keys required for Sentinel-1 candidates.",
     )
     parser.add_argument("--s2-cloud-cover-max", type=float, default=40.0)
+    parser.add_argument(
+        "--s2-shortlist-per-bin",
+        type=int,
+        default=5,
+        help="Number of S2 candidates to retain per bin before chip-level SCL reranking during materialization.",
+    )
     parser.add_argument("--max-items-per-search", type=int, default=2000)
     parser.add_argument("--max-attempts", type=int, default=6)
     parser.add_argument("--base-delay-seconds", type=float, default=5.0)
@@ -237,6 +243,81 @@ def point_in_bbox(longitude: float, latitude: float, bbox: list[float] | None) -
     return minx <= longitude <= maxx and miny <= latitude <= maxy
 
 
+def point_on_segment(
+    longitude: float,
+    latitude: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    *,
+    eps: float = 1.0e-9,
+) -> bool:
+    cross = (longitude - x1) * (y2 - y1) - (latitude - y1) * (x2 - x1)
+    if abs(cross) > eps:
+        return False
+    minx = min(x1, x2) - eps
+    maxx = max(x1, x2) + eps
+    miny = min(y1, y2) - eps
+    maxy = max(y1, y2) + eps
+    return minx <= longitude <= maxx and miny <= latitude <= maxy
+
+
+def point_in_ring(longitude: float, latitude: float, ring: list[list[float]]) -> bool:
+    if len(ring) < 4:
+        return False
+    inside = False
+    for idx in range(len(ring) - 1):
+        x1, y1 = float(ring[idx][0]), float(ring[idx][1])
+        x2, y2 = float(ring[idx + 1][0]), float(ring[idx + 1][1])
+        if point_on_segment(longitude, latitude, x1, y1, x2, y2):
+            return True
+        intersects = ((y1 > latitude) != (y2 > latitude)) and (
+            longitude < (x2 - x1) * (latitude - y1) / ((y2 - y1) + 1.0e-15) + x1
+        )
+        if intersects:
+            inside = not inside
+    return inside
+
+
+def point_in_geometry(longitude: float, latitude: float, geometry: dict[str, Any] | None) -> bool:
+    if not geometry:
+        return False
+    geometry_type = str(geometry.get("type") or "")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Polygon" and isinstance(coordinates, list) and coordinates:
+        exterior = coordinates[0]
+        holes = coordinates[1:]
+        if not point_in_ring(longitude, latitude, exterior):
+            return False
+        return not any(point_in_ring(longitude, latitude, hole) for hole in holes)
+    if geometry_type == "MultiPolygon" and isinstance(coordinates, list):
+        for polygon in coordinates:
+            if not polygon:
+                continue
+            exterior = polygon[0]
+            holes = polygon[1:]
+            if point_in_ring(longitude, latitude, exterior) and not any(
+                point_in_ring(longitude, latitude, hole) for hole in holes
+            ):
+                return True
+        return False
+    if geometry_type == "GeometryCollection":
+        return any(
+            point_in_geometry(longitude, latitude, child)
+            for child in geometry.get("geometries", [])
+            if isinstance(child, dict)
+        )
+    return False
+
+
+def point_in_candidate(longitude: float, latitude: float, candidate: dict[str, Any]) -> bool:
+    geometry = candidate.get("geometry")
+    if isinstance(geometry, dict) and geometry:
+        return point_in_geometry(longitude, latitude, geometry)
+    return point_in_bbox(longitude, latitude, candidate.get("bbox"))
+
+
 def normalize_required_assets(text: str) -> list[str]:
     return [asset.strip() for asset in text.split(",") if asset.strip()]
 
@@ -324,6 +405,7 @@ def search_candidates(
                 "collection": collection,
                 "datetime": pd.Timestamp(item.datetime),
                 "cloud_cover": extract_cloud_cover(item),
+                "geometry": item.geometry if item.geometry else None,
                 "bbox": list(item.bbox) if item.bbox else None,
             }
         )
@@ -340,7 +422,7 @@ def candidate_sort_key(candidate: dict[str, Any], *, modality: str, bin_midpoint
     return (time_distance_seconds, 0.0, recency_value)
 
 
-def pick_best_candidate(
+def pick_candidate_shortlist(
     candidates: list[dict[str, Any]],
     *,
     modality: str,
@@ -349,15 +431,20 @@ def pick_best_candidate(
     bin_start: pd.Timestamp,
     bin_end: pd.Timestamp,
     bin_midpoint: pd.Timestamp,
-) -> dict[str, Any] | None:
+    shortlist_size: int = 1,
+) -> list[dict[str, Any]]:
     eligible = [
         candidate
         for candidate in candidates
-        if bin_start <= candidate["datetime"] < bin_end and point_in_bbox(longitude, latitude, candidate["bbox"])
+        if bin_start <= candidate["datetime"] < bin_end and point_in_candidate(longitude, latitude, candidate)
     ]
     if not eligible:
-        return None
-    return min(eligible, key=lambda candidate: candidate_sort_key(candidate, modality=modality, bin_midpoint=bin_midpoint))
+        return []
+    ordered = sorted(
+        eligible,
+        key=lambda candidate: candidate_sort_key(candidate, modality=modality, bin_midpoint=bin_midpoint),
+    )
+    return ordered[: max(1, int(shortlist_size))]
 
 
 def plan_group_sequences(
@@ -369,6 +456,7 @@ def plan_group_sequences(
     cadence_days: int,
     s2_candidates: list[dict[str, Any]],
     s1_candidates: list[dict[str, Any]],
+    s2_shortlist_per_bin: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     plan_rows: list[dict[str, Any]] = []
     summary_rows: list[dict[str, Any]] = []
@@ -383,7 +471,7 @@ def plan_group_sequences(
         s1_found = 0
         paired_found = 0
         for bin_spec in bins:
-            s2_match = pick_best_candidate(
+            s2_shortlist = pick_candidate_shortlist(
                 s2_candidates,
                 modality="s2",
                 longitude=longitude,
@@ -391,8 +479,10 @@ def plan_group_sequences(
                 bin_start=bin_spec["bin_start"],
                 bin_end=bin_spec["bin_end"],
                 bin_midpoint=bin_spec["bin_midpoint"],
+                shortlist_size=s2_shortlist_per_bin,
             )
-            s1_match = pick_best_candidate(
+            s2_match = s2_shortlist[0] if s2_shortlist else None
+            s1_shortlist = pick_candidate_shortlist(
                 s1_candidates,
                 modality="s1",
                 longitude=longitude,
@@ -400,7 +490,9 @@ def plan_group_sequences(
                 bin_start=bin_spec["bin_start"],
                 bin_end=bin_spec["bin_end"],
                 bin_midpoint=bin_spec["bin_midpoint"],
+                shortlist_size=1,
             )
+            s1_match = s1_shortlist[0] if s1_shortlist else None
             if s2_match is not None:
                 s2_found += 1
             if s1_match is not None:
@@ -425,6 +517,17 @@ def plan_group_sequences(
                     "s2_collection": s2_match["collection"] if s2_match is not None else None,
                     "s2_datetime": s2_match["datetime"].isoformat() if s2_match is not None else None,
                     "s2_cloud_cover": s2_match["cloud_cover"] if s2_match is not None else None,
+                    "s2_candidate_items_json": json.dumps(
+                        [
+                            {
+                                "item_id": candidate["item_id"],
+                                "collection": candidate["collection"],
+                                "datetime": candidate["datetime"].isoformat(),
+                                "cloud_cover": candidate["cloud_cover"],
+                            }
+                            for candidate in s2_shortlist
+                        ]
+                    ),
                     "s1_found": s1_match is not None,
                     "s1_item_id": s1_match["item_id"] if s1_match is not None else None,
                     "s1_collection": s1_match["collection"] if s1_match is not None else None,
@@ -521,6 +624,7 @@ def main() -> int:
         "s2_required_assets": normalize_required_assets(args.s2_required_assets),
         "s1_required_assets": normalize_required_assets(args.s1_required_assets),
         "s2_cloud_cover_max": args.s2_cloud_cover_max,
+        "s2_shortlist_per_bin": int(args.s2_shortlist_per_bin),
         "max_items_per_search": int(args.max_items_per_search),
         "dry_run": bool(args.dry_run),
     }
@@ -586,6 +690,7 @@ def main() -> int:
             cadence_days=args.cadence_days,
             s2_candidates=s2_candidates,
             s1_candidates=s1_candidates,
+            s2_shortlist_per_bin=args.s2_shortlist_per_bin,
         )
         plan_rows.extend(planned_rows)
         summary_rows.extend(planned_summaries)

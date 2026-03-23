@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -27,6 +29,8 @@ DEFAULT_CDSE_PROCESS_URL = "https://sh.dataspace.copernicus.eu/api/v1/process"
 DEFAULT_CDSE_TOKEN_URL = (
     "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 )
+DEFAULT_CDSE_S3_ENDPOINT_URL = "https://eodata.dataspace.copernicus.eu"
+DEFAULT_CDSE_S3_REGION = "default"
 DEFAULT_CDSE_RESOLUTION_M = 10.0
 DEFAULT_CDSE_REQUEST_TIMEOUT = 120
 DEFAULT_S2_BAND_ASSETS = (
@@ -46,8 +50,21 @@ DEFAULT_S2_SCL_ASSET = "SCL_20m"
 DEFAULT_S2_INVALID_SCL = (0, 1, 3, 8, 9, 10, 11)
 CDSE_CLIENT_ID_ENV_KEYS = ("CDSE_CLIENT_ID", "SENTINELHUB_CLIENT_ID", "SH_CLIENT_ID")
 CDSE_CLIENT_SECRET_ENV_KEYS = ("CDSE_CLIENT_SECRET", "SENTINELHUB_CLIENT_SECRET", "SH_CLIENT_SECRET")
+CDSE_S3_ACCESS_KEY_ENV_KEYS = ("CDSE_S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID")
+CDSE_S3_SECRET_KEY_ENV_KEYS = ("CDSE_S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY")
+DEFAULT_DIRECT_ASSET_SOURCE = "remote"
 
 _TOKEN_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_TRANSFORMER_CACHE: dict[tuple[str, str], Transformer] = {}
+_RASTER_DATASET_CACHE: "OrderedDict[str, rasterio.io.DatasetReader]" = OrderedDict()
+_CDSE_S3_CLIENT_CACHE: dict[tuple[str, str, str], Any] = {}
+DEFAULT_MAX_OPEN_RASTERS = 64
+_DIRECT_ASSET_CONFIG: dict[str, Any] = {
+    "source": DEFAULT_DIRECT_ASSET_SOURCE,
+    "cache_dir": None,
+    "cdse_s3_endpoint_url": DEFAULT_CDSE_S3_ENDPOINT_URL,
+    "cdse_s3_region": DEFAULT_CDSE_S3_REGION,
+}
 
 
 def load_table(path: Path) -> pd.DataFrame:
@@ -118,6 +135,44 @@ def local_utm_epsg(lon: float, lat: float) -> int:
     return (32600 if float(lat) >= 0.0 else 32700) + zone
 
 
+def _max_open_rasters() -> int:
+    raw = os.environ.get("EWM_MAX_OPEN_RASTERS", str(DEFAULT_MAX_OPEN_RASTERS))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_OPEN_RASTERS
+
+
+def _cached_transformer(src_crs: Any, dst_crs: Any) -> Transformer:
+    cache_key = (str(src_crs), str(dst_crs))
+    cached = _TRANSFORMER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    transformer = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    _TRANSFORMER_CACHE[cache_key] = transformer
+    return transformer
+
+
+def _get_open_raster(asset_href: str):
+    resolved_href = resolve_direct_asset_href(asset_href)
+    cached = _RASTER_DATASET_CACHE.get(resolved_href)
+    if cached is not None:
+        _RASTER_DATASET_CACHE.move_to_end(resolved_href)
+        return cached
+
+    dataset = rasterio.open(resolved_href)
+    _RASTER_DATASET_CACHE[resolved_href] = dataset
+
+    while len(_RASTER_DATASET_CACHE) > _max_open_rasters():
+        _old_href, old_dataset = _RASTER_DATASET_CACHE.popitem(last=False)
+        try:
+            old_dataset.close()
+        except Exception:
+            pass
+
+    return dataset
+
+
 def projected_chip_grid(
     *,
     lon: float,
@@ -132,6 +187,22 @@ def projected_chip_grid(
     bbox = [x - half_extent, y - half_extent, x + half_extent, y + half_extent]
     transform = from_bounds(*bbox, width=int(chip_size), height=int(chip_size))
     return epsg_code, bbox, transform
+
+
+def fixed_chip_target_grid(
+    *,
+    lon: float,
+    lat: float,
+    chip_size: int,
+    resolution_m: float,
+) -> tuple[str, Affine]:
+    epsg_code, _bbox, transform = projected_chip_grid(
+        lon=lon,
+        lat=lat,
+        chip_size=chip_size,
+        resolution_m=resolution_m,
+    )
+    return f"EPSG:{int(epsg_code)}", transform
 
 
 def process_time_range(
@@ -168,6 +239,137 @@ def read_env_first(keys: tuple[str, ...]) -> str | None:
         if value:
             return value
     return None
+
+
+def require_cdse_s3_credentials() -> tuple[str, str]:
+    access_key = read_env_first(CDSE_S3_ACCESS_KEY_ENV_KEYS)
+    secret_key = read_env_first(CDSE_S3_SECRET_KEY_ENV_KEYS)
+    if access_key and secret_key:
+        return access_key, secret_key
+    raise RuntimeError(
+        "CDSE S3 credentials not found. Set one of "
+        f"{CDSE_S3_ACCESS_KEY_ENV_KEYS} and one of {CDSE_S3_SECRET_KEY_ENV_KEYS} to use direct_asset_source=cdse_s3_cache."
+    )
+
+
+def configure_direct_asset_access(
+    *,
+    source: str,
+    cache_dir: str | os.PathLike[str] | None,
+    cdse_s3_endpoint_url: str = DEFAULT_CDSE_S3_ENDPOINT_URL,
+    cdse_s3_region: str = DEFAULT_CDSE_S3_REGION,
+) -> None:
+    normalized_source = str(source or DEFAULT_DIRECT_ASSET_SOURCE).strip().lower()
+    if normalized_source not in {"remote", "cdse_s3_cache"}:
+        raise ValueError(f"Unsupported direct asset source: {source}")
+    _DIRECT_ASSET_CONFIG["source"] = normalized_source
+    _DIRECT_ASSET_CONFIG["cache_dir"] = str(Path(cache_dir).expanduser().resolve()) if cache_dir else None
+    _DIRECT_ASSET_CONFIG["cdse_s3_endpoint_url"] = str(cdse_s3_endpoint_url)
+    _DIRECT_ASSET_CONFIG["cdse_s3_region"] = str(cdse_s3_region)
+    if normalized_source == "cdse_s3_cache" and _DIRECT_ASSET_CONFIG["cache_dir"]:
+        Path(_DIRECT_ASSET_CONFIG["cache_dir"]).mkdir(parents=True, exist_ok=True)
+
+
+def _cdse_s3_client():
+    access_key, secret_key = require_cdse_s3_credentials()
+    endpoint_url = str(_DIRECT_ASSET_CONFIG.get("cdse_s3_endpoint_url") or DEFAULT_CDSE_S3_ENDPOINT_URL)
+    region_name = str(_DIRECT_ASSET_CONFIG.get("cdse_s3_region") or DEFAULT_CDSE_S3_REGION)
+    cache_key = (endpoint_url, region_name, access_key)
+    cached = _CDSE_S3_CLIENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        import boto3
+        from botocore.config import Config
+    except ImportError as exc:
+        raise RuntimeError(
+            "boto3 is required for direct_asset_source=cdse_s3_cache. Install boto3 to use CDSE S3 cached direct reads."
+        ) from exc
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region_name,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "standard"},
+            s3={"addressing_style": "path"},
+        ),
+    )
+    _CDSE_S3_CLIENT_CACHE[cache_key] = client
+    return client
+
+
+def parse_cdse_s3_location(asset_href: str) -> tuple[str, str] | None:
+    text = str(asset_href).strip()
+    if not text:
+        return None
+    if text.startswith("s3://"):
+        parsed = urlparse(text)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        return (bucket, key) if bucket and key else None
+
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    host = (parsed.netloc or "").lower()
+    if host != "eodata.dataspace.copernicus.eu":
+        return None
+    path = parsed.path.lstrip("/")
+    if not path:
+        return None
+    parts = path.split("/", 1)
+    if len(parts) != 2:
+        return None
+    bucket, key = parts
+    if not bucket or not key:
+        return None
+    return bucket, key
+
+
+def _local_cache_path_for_s3_object(bucket: str, key: str) -> Path:
+    cache_dir = _DIRECT_ASSET_CONFIG.get("cache_dir")
+    if not cache_dir:
+        raise RuntimeError(
+            "direct_asset_source=cdse_s3_cache requires a local cache dir. Configure local_asset_cache_dir before materialization."
+        )
+    cache_root = Path(str(cache_dir))
+    return cache_root / bucket / Path(key)
+
+
+def _download_cdse_s3_object(bucket: str, key: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return destination
+
+    client = _cdse_s3_client()
+    tmp_path = destination.with_name(f"{destination.name}.part.{os.getpid()}.{int(time.time() * 1000)}")
+    try:
+        client.download_file(bucket, key, str(tmp_path))
+        tmp_path.replace(destination)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    return destination
+
+
+def resolve_direct_asset_href(asset_href: str) -> str:
+    source = str(_DIRECT_ASSET_CONFIG.get("source") or DEFAULT_DIRECT_ASSET_SOURCE).strip().lower()
+    if source != "cdse_s3_cache":
+        return str(asset_href)
+
+    parsed = parse_cdse_s3_location(asset_href)
+    if parsed is None:
+        return str(asset_href)
+    bucket, key = parsed
+    local_path = _local_cache_path_for_s3_object(bucket, key)
+    cached_path = _download_cdse_s3_object(bucket, key, local_path)
+    return str(cached_path)
 
 
 def require_cdse_client_credentials() -> tuple[str, str]:
@@ -504,12 +706,12 @@ def reference_window_and_transform(
     chip_size: int,
 ) -> tuple[Any, Window, Affine]:
     with rasterio.Env(AWS_NO_SIGN_REQUEST="YES"):
-        with rasterio.open(asset_href) as ds:
-            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
-            x, y = transformer.transform(float(lon), float(lat))
-            row, col = ds.index(x, y)
-            window = Window(col - (chip_size // 2), row - (chip_size // 2), chip_size, chip_size)
-            return ds.crs, window, ds.window_transform(window)
+        ds = _get_open_raster(asset_href)
+        transformer = _cached_transformer("EPSG:4326", ds.crs)
+        x, y = transformer.transform(float(lon), float(lat))
+        row, col = ds.index(x, y)
+        window = Window(col - (chip_size // 2), row - (chip_size // 2), chip_size, chip_size)
+        return ds.crs, window, ds.window_transform(window)
 
 
 def reproject_asset_to_grid(
@@ -524,18 +726,18 @@ def reproject_asset_to_grid(
 ) -> np.ndarray:
     destination = np.full((height, width), dst_nodata, dtype=np.float32)
     with rasterio.Env(AWS_NO_SIGN_REQUEST="YES"):
-        with rasterio.open(asset_href) as src:
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=destination,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                src_nodata=src.nodata,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs,
-                dst_nodata=dst_nodata,
-                resampling=resampling,
-            )
+        src = _get_open_raster(asset_href)
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=destination,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=src.nodata,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            dst_nodata=dst_nodata,
+            resampling=resampling,
+        )
     return destination
 
 
@@ -559,16 +761,18 @@ def read_s2_frame(
     band_assets: list[str],
     scl_asset: str | None,
     invalid_scl_values: list[int],
+    dst_crs: Any | None = None,
+    dst_transform: Affine | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any], Any, Affine]:
-    reference_asset = band_assets[0]
-    reference = resolve_asset(item, reference_asset)
-
-    dst_crs, _window, dst_transform = reference_window_and_transform(
-        reference.href,
-        lon=lon,
-        lat=lat,
-        chip_size=chip_size,
-    )
+    if dst_crs is None or dst_transform is None:
+        reference_asset = band_assets[0]
+        reference = resolve_asset(item, reference_asset)
+        dst_crs, _window, dst_transform = reference_window_and_transform(
+            reference.href,
+            lon=lon,
+            lat=lat,
+            chip_size=chip_size,
+        )
 
     valid_mask: np.ndarray
     clear_fraction: float | None = None
@@ -610,6 +814,57 @@ def read_s2_frame(
         "clear_fraction": clear_fraction,
     }
     return np.stack(bands, axis=0), valid_mask.astype(bool), metadata, dst_crs, dst_transform
+
+
+def evaluate_s2_chip_quality(
+    item: Item,
+    *,
+    lon: float,
+    lat: float,
+    chip_size: int,
+    scl_asset: str | None,
+    invalid_scl_values: list[int],
+    dst_crs: Any | None = None,
+    dst_transform: Affine | None = None,
+    reference_asset_key: str = "B02",
+) -> tuple[np.ndarray, dict[str, Any], Any, Affine]:
+    if dst_crs is None or dst_transform is None:
+        reference = resolve_asset(item, reference_asset_key)
+        dst_crs, _window, dst_transform = reference_window_and_transform(
+            reference.href,
+            lon=lon,
+            lat=lat,
+            chip_size=chip_size,
+        )
+
+    if scl_asset:
+        scl = resolve_asset(item, scl_asset)
+        scl = reproject_asset_to_grid(
+            scl.href,
+            dst_crs=dst_crs,
+            dst_transform=dst_transform,
+            width=chip_size,
+            height=chip_size,
+            resampling=Resampling.nearest,
+        )
+        scl_int = np.where(np.isfinite(scl), np.rint(scl), -9999).astype(np.int16)
+        footprint_mask = np.isfinite(scl) & ~np.isin(scl_int, [0, 1])
+        valid_mask = footprint_mask & ~np.isin(scl_int, invalid_scl_values)
+    else:
+        footprint_mask = np.ones((chip_size, chip_size), dtype=bool)
+        valid_mask = np.ones((chip_size, chip_size), dtype=bool)
+
+    footprint_count = int(footprint_mask.sum())
+    clear_fraction = float(valid_mask.sum() / footprint_count) if footprint_count > 0 else 0.0
+    metadata = {
+        "item_id": item.id,
+        "datetime": item.datetime.isoformat() if item.datetime is not None else None,
+        "cloud_cover": item.properties.get("eo:cloud_cover"),
+        "clear_fraction": clear_fraction,
+        "valid_fraction": float(valid_mask.mean()) if valid_mask.size > 0 else 0.0,
+        "footprint_fraction": float(footprint_mask.mean()) if footprint_mask.size > 0 else 0.0,
+    }
+    return valid_mask.astype(bool), metadata, dst_crs, dst_transform
 
 
 def read_s2_frame_process(
