@@ -1,20 +1,21 @@
 runtime:
   backend: ${EWM_BACKEND:-cuda}
   seed: 42
-  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_dense_temporal_gpu/checkpoints/dense_temporal_index_vjepa21_stagec_cuda}
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_prelim_400_gpu/checkpoints/dense_temporal_index_pilot400_vjepa21_stagec_conv2d_1024_cuda}
   autocast_dtype: float16
 
 data:
   kind: dense_temporal_index
-  index_path: ${EWM_DENSE_INDEX_PATH:-/tmp/ewm_dense_temporal/data/train/dense_temporal_index.parquet}
+  index_path: ${EWM_YEARLY_TRAIN_INDEX_PATH:-/mnt/ewm-data-disk/ewm_prelim_400_v1/yearly_400/train/dense_temporal_index.parquet}
   patch_size: 256
-  max_samples: 0
+  max_samples: ${EWM_YEARLY_TRAIN_MAX_SAMPLES:-400}
   min_paired_frames: 4
   min_paired_fraction: 0.0
   sample_offset: 0
   crop_mode: random
   repeat_factor: 1
-  num_workers: 4
+  num_workers: ${EWM_NUM_WORKERS:-8}
+  prefetch_factor: ${EWM_PREFETCH_FACTOR:-2}
   temporal_subclip_mode: random
   temporal_subclip_schedule:
     - start_epoch: 0
@@ -27,25 +28,26 @@ data:
 model:
   input_mode: s2s1
   tokenizer_type: conv2d
-  embed_dim: 384
+  embed_dim: 1024
   patch_px: 16
   temporal_depth: 6
   predictor_depth: 3
-  num_heads: 8
+  num_heads: 16
   hierarchical_layers: [1, 3, 5]
   token_mode: dense
   spatial_fusion: cross_attend
-  fusion_num_heads: 4
+  fusion_num_heads: 8
   use_modality_embeddings: true
   use_patch_positional_encoding: true
   use_missing_modality_embeddings: true
   temporal_block_type: factorized_rope
   use_rope_temporal_attention: true
   rope_base: 10000.0
+  use_activation_checkpointing: true
   enable_latent_dynamics: true
 
 training:
-  batch_size: 16
+  batch_size: 4
   epochs: 3
   lr_schedule: warmup_hold_cosine
   warmup_fraction: 0.05
@@ -68,7 +70,7 @@ training:
       aspect_ratio: [0.75, 1.5]
   ema_momentum_start: 0.996
   ema_momentum_end: 0.999
-  log_every_steps: 20
+  log_every_steps: 10
   save_every_epochs: 1
   max_steps_per_epoch: 0
   predict_visible_context: true
@@ -81,17 +83,18 @@ training:
 eval:
   enabled: true
   every_epochs: 1
-  batch_size: 16
+  batch_size: 4
   max_batches: 0
   mask_mode: random
   data:
-    index_path: ${EWM_DENSE_EVAL_INDEX_PATH:-/tmp/ewm_dense_temporal/data/val/dense_temporal_index.parquet}
-    max_samples: 0
+    index_path: ${EWM_YEARLY_VAL_INDEX_PATH:-/mnt/ewm-data-disk/ewm_prelim_400_v1/yearly_400/val/dense_temporal_index.parquet}
+    max_samples: ${EWM_YEARLY_VAL_MAX_SAMPLES:-32}
     min_paired_frames: 4
     min_paired_fraction: 0.0
     sample_offset: 0
     crop_mode: center
     repeat_factor: 1
-    num_workers: 4
+    num_workers: ${EWM_EVAL_NUM_WORKERS:-8}
+    prefetch_factor: ${EWM_EVAL_PREFETCH_FACTOR:-2}
     temporal_subclip_length: 52
     temporal_subclip_mode: center

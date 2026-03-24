@@ -366,3 +366,90 @@ experiments:
       blocked_by:
         - multi-corpus sampler
         - mixed-source batch accounting
+
+  - id: dense_yearly400_stagec_conv2d_width1024_v1
+    status: runnable_after_prelim400_dataset_prep
+    kind: pretrain
+    description: Preliminary yearly dense run on 400 weekly sequences using the EWM-2D conv2d tokenizer at width 1024.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/dense_temporal_index_pilot400_vjepa21_stagec_conv2d_1024_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: prelim400_yearly
+      source_family:
+        - EarthEngine-weekly-yearly
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 400
+      sample_budget_eval: 32
+      cadence: 52 weekly timestamps
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      embed_dim: 1024
+      num_heads: 16
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does the corrected EWM-2D design learn on a small dense yearly corpus before scale-up?
+
+  - id: dense_yearly400_staged_rope_conv3d_width1024_v1
+    status: runnable_after_prelim400_dataset_prep
+    kind: pretrain
+    description: Preliminary yearly dense run on 400 weekly sequences using the EWM-3D tubelet tokenizer at width 1024.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/dense_temporal_index_pilot400_vjepa21_staged_rope_conv3d_1024_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: prelim400_yearly
+      source_family:
+        - EarthEngine-weekly-yearly
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 400
+      sample_budget_eval: 32
+      cadence: 52 weekly timestamps
+      continuation: none
+      recipe: stage_d_rope
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: stage_d_rope
+      embed_dim: 1024
+      num_heads: 16
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: Does the corrected EWM-3D tubelet design outperform EWM-2D on the same 400-sample yearly corpus?
+
+  - id: ssl4eo400_stagec_conv2d_width1024_v1
+    status: runnable_after_prelim400_dataset_prep
+    kind: pretrain
+    description: Preliminary SSL4EO breadth run on 400 samples using the corrected conv2d dense-token stage C recipe at width 1024.
+    launcher:
+      kind: phase2_gpu_vm
+      script_path: earth_world_model/scripts/run_phase2_gpu_vm.sh
+    config_path: earth_world_model/configs/ssl4eo_zarr_trainval_400_vjepa21_stagec_dense_conv2d_1024_cuda_gpu_vm.yaml
+    paper:
+      comparison_group: prelim400_ssl4eo
+      source_family:
+        - SSL4EO-S12-v1.1-Zarr
+      sensors:
+        - S2
+        - S1
+      sample_budget_train: 400
+      sample_budget_eval: 128
+      cadence: 4 seasonal timestamps
+      continuation: none
+      recipe: stage_c_dense
+      token_mode: dense
+      spatial_fusion: late_concat
+      temporal_block_type: standard
+      embed_dim: 1024
+      num_heads: 16
+      epochs: 3
+      lr_schedule: warmup_hold_cosine
+      main_question: On the same 1024-width pilot budget, how does sparse SSL4EO breadth compare to dense yearly temporal training?

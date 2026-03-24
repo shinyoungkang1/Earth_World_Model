@@ -274,6 +274,9 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
             sample_offset=data_cfg.get("sample_offset", 0),
             crop_mode=data_cfg.get("crop_mode", "center"),
             repeat_factor=data_cfg.get("repeat_factor", 1),
+            temporal_subclip_length=data_cfg.get("temporal_subclip_length", 0),
+            temporal_subclip_mode=data_cfg.get("temporal_subclip_mode", "random"),
+            temporal_subclip_schedule=data_cfg.get("temporal_subclip_schedule"),
             force_single_process_io=force_single_process_io,
         )
     if kind == "dense_temporal_zarr_index":
@@ -287,6 +290,9 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
             crop_mode=data_cfg.get("crop_mode", "center"),
             repeat_factor=data_cfg.get("repeat_factor", 1),
             max_open_shards=data_cfg.get("max_open_shards", 16),
+            temporal_subclip_length=data_cfg.get("temporal_subclip_length", 0),
+            temporal_subclip_mode=data_cfg.get("temporal_subclip_mode", "random"),
+            temporal_subclip_schedule=data_cfg.get("temporal_subclip_schedule"),
             force_single_process_io=force_single_process_io,
         )
     raise ValueError(f"Unsupported data.kind: {kind}")
@@ -400,6 +406,7 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         hierarchical_layers=model_cfg.get("hierarchical_layers"),
         token_mode=model_cfg.get("token_mode", "pooled"),
         spatial_fusion=model_cfg.get("spatial_fusion", "early_mean"),
+        fusion_num_heads=model_cfg.get("fusion_num_heads", max(1, int(model_cfg["num_heads"]) // 2)),
         use_modality_embeddings=model_cfg.get("use_modality_embeddings", False),
         use_patch_positional_encoding=model_cfg.get("use_patch_positional_encoding", False),
         use_missing_modality_embeddings=model_cfg.get("use_missing_modality_embeddings", False),
@@ -407,6 +414,10 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         use_rope_temporal_attention=model_cfg.get("use_rope_temporal_attention", False),
         rope_base=model_cfg.get("rope_base", 10000.0),
         use_activation_checkpointing=model_cfg.get("use_activation_checkpointing", False),
+        tokenizer_type=model_cfg.get("tokenizer_type", "linear"),
+        tubelet_size=model_cfg.get("tubelet_size", 2),
+        enable_latent_dynamics=model_cfg.get("enable_latent_dynamics", True),
+        dynamics_hidden_dim=model_cfg.get("dynamics_hidden_dim"),
     )
     return model.to(device)
 
@@ -422,16 +433,16 @@ class StudentStepModule(torch.nn.Module):
         self,
         batch: dict[str, torch.Tensor],
         teacher_embeddings: torch.Tensor,
-        visible_idx: torch.Tensor,
-        masked_idx: torch.Tensor,
+        teacher_state_sequence: torch.Tensor | None,
+        mask_spec: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         device = next(self.student.parameters()).device
         return compute_prediction_losses(
             self.student,
             teacher_embeddings,
+            teacher_state_sequence,
             batch,
-            visible_idx,
-            masked_idx,
+            mask_spec,
             self.backend,
             device,
             self.config,
@@ -550,6 +561,9 @@ def reduce_scalar_max(value: float, device: torch.device, distributed: Distribut
 
 
 def set_loader_epoch(loader: DataLoader, epoch: int) -> None:
+    dataset = getattr(loader, "dataset", None)
+    if dataset is not None and hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
     batch_sampler = getattr(loader, "batch_sampler", None)
     if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
         batch_sampler.set_epoch(epoch)
@@ -845,6 +859,155 @@ def all_temporal_mask_indices(timesteps: int, mask_ratio: float, device: torch.d
     return pairs
 
 
+def _dense_token_layout(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+) -> tuple[int, int, int, int, int, int]:
+    source = batch.get("hls")
+    if source is None:
+        source = batch.get("s2")
+    if source is None:
+        raise ValueError("Dense block masking requires s2 or hls inputs")
+    height = int(source.shape[-2])
+    width = int(source.shape[-1])
+    return model.spatial.dense_layout(
+        height=height,
+        width=width,
+        timesteps=int(batch["dates"].shape[1]),
+    )
+
+
+def _dense_token_position_ids(dates: torch.Tensor, tokens_per_timestep: int) -> torch.Tensor:
+    return dates.to(dtype=torch.long).unsqueeze(-1).expand(-1, -1, tokens_per_timestep).reshape(dates.shape[0], -1)
+
+
+def _sample_block_extent(
+    *,
+    timesteps: int,
+    grid_h: int,
+    grid_w: int,
+    spatial_scale: tuple[float, float],
+    temporal_scale: tuple[float, float],
+    aspect_ratio: tuple[float, float],
+) -> tuple[int, int, int]:
+    temporal_ratio = float(torch.empty(1).uniform_(float(temporal_scale[0]), float(temporal_scale[1])).item())
+    time_extent = max(1, int(round(timesteps * temporal_ratio)))
+
+    spatial_ratio = float(torch.empty(1).uniform_(float(spatial_scale[0]), float(spatial_scale[1])).item())
+    spatial_keep = max(1, int(round(grid_h * grid_w * spatial_ratio)))
+
+    aspect = float(torch.empty(1).uniform_(float(aspect_ratio[0]), float(aspect_ratio[1])).item())
+    height_extent = max(1, int(round(math.sqrt(spatial_keep * aspect))))
+    width_extent = max(1, int(round(math.sqrt(spatial_keep / max(aspect, 1.0e-6)))))
+    height_extent = min(height_extent, grid_h)
+    width_extent = min(width_extent, grid_w)
+    return time_extent, height_extent, width_extent
+
+
+def dense_block_mask_spec(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> dict[str, Any]:
+    if model.token_mode != "dense":
+        raise ValueError("dense_block_mask_spec requires dense token mode")
+    dates = batch["dates"]
+    grouped_dates = model.spatial.aggregate_temporal_dates(dates)
+    timesteps = int(grouped_dates.shape[1])
+    device = dates.device
+    _group_count, tokens_per_timestep, patch_count, token_multiplier, grid_h, grid_w = _dense_token_layout(model, batch)
+    total_tokens = timesteps * tokens_per_timestep
+    visible_mask = torch.ones(total_tokens, dtype=torch.bool)
+
+    training_cfg = config["training"]
+    block_cfgs = training_cfg.get("block_mask_cfgs") or training_cfg.get("block_masks") or [
+        {
+            "num_blocks": 8,
+            "spatial_scale": [0.10, 0.20],
+            "temporal_scale": [0.125, 0.25],
+            "aspect_ratio": [0.75, 1.5],
+        },
+        {
+            "num_blocks": 2,
+            "spatial_scale": [0.50, 0.70],
+            "temporal_scale": [0.25, 0.50],
+            "aspect_ratio": [0.75, 1.5],
+        },
+    ]
+
+    for family in block_cfgs:
+        num_blocks = max(0, int(family.get("num_blocks", 0)))
+        if num_blocks == 0:
+            continue
+        spatial_scale = tuple(float(v) for v in family.get("spatial_scale", [0.15, 0.15]))
+        temporal_scale = tuple(float(v) for v in family.get("temporal_scale", [1.0, 1.0]))
+        aspect_ratio = tuple(float(v) for v in family.get("aspect_ratio", [0.75, 1.5]))
+        for _ in range(num_blocks):
+            time_extent, height_extent, width_extent = _sample_block_extent(
+                timesteps=timesteps,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                spatial_scale=spatial_scale,
+                temporal_scale=temporal_scale,
+                aspect_ratio=aspect_ratio,
+            )
+            t0 = int(torch.randint(0, timesteps - time_extent + 1, (1,)).item())
+            y0 = int(torch.randint(0, grid_h - height_extent + 1, (1,)).item())
+            x0 = int(torch.randint(0, grid_w - width_extent + 1, (1,)).item())
+            for step in range(t0, t0 + time_extent):
+                step_offset = step * tokens_per_timestep
+                for yy in range(y0, y0 + height_extent):
+                    patch_row_offset = yy * grid_w
+                    for xx in range(x0, x0 + width_extent):
+                        patch_index = patch_row_offset + xx
+                        for token_group in range(token_multiplier):
+                            token_index = step_offset + (token_group * patch_count) + patch_index
+                            visible_mask[token_index] = False
+
+    masked_idx = torch.nonzero(~visible_mask, as_tuple=False).squeeze(1)
+    visible_idx = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
+    if masked_idx.numel() == 0 or visible_idx.numel() == 0:
+        visible_idx, masked_idx = temporal_mask_indices(timesteps, float(training_cfg.get("mask_ratio", 0.5)), device)
+        return {
+            "mode": "temporal",
+            "visible_idx": visible_idx,
+            "masked_idx": masked_idx,
+        }
+
+    position_ids = _dense_token_position_ids(grouped_dates, tokens_per_timestep)
+    return {
+        "mode": "dense_block3d",
+        "visible_idx": visible_idx.to(device=device),
+        "masked_idx": masked_idx.to(device=device),
+        "visible_position_ids": position_ids[:, visible_idx].to(device=device),
+        "masked_position_ids": position_ids[:, masked_idx].to(device=device),
+        "masked_local_token_indices": (masked_idx % tokens_per_timestep).to(device=device),
+    }
+
+
+def sample_mask_spec(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> dict[str, Any]:
+    training_cfg = config["training"]
+    masking_mode = str(training_cfg.get("masking_mode", "temporal_random")).lower()
+    if model.token_mode == "dense" and masking_mode in {"dense_block3d", "block3d"}:
+        return dense_block_mask_spec(model, batch, config)
+    if model.spatial.tokenizer_type == "conv3d":
+        raise ValueError("Conv3d tubelet tokenizers require training.masking_mode=dense_block3d")
+    visible_idx, masked_idx = temporal_mask_indices(
+        batch["dates"].shape[1],
+        float(training_cfg.get("mask_ratio", 0.5)),
+        batch["dates"].device,
+    )
+    return {
+        "mode": "temporal",
+        "visible_idx": visible_idx,
+        "masked_idx": masked_idx,
+    }
+
+
 def student_visible_embeddings(
     student: EarthWorldModel,
     batch: dict[str, torch.Tensor],
@@ -884,12 +1047,31 @@ def compute_teacher_embeddings(
     )
 
 
+def compute_teacher_state_sequence(
+    teacher: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> torch.Tensor | None:
+    dynamics_loss_weight = float(config["training"].get("dynamics_loss_weight", 0.0))
+    if dynamics_loss_weight <= 0.0 or teacher.latent_rollout_head is None:
+        return None
+    return teacher.encode_state_sequence(
+        batch.get("s2"),
+        batch.get("s1"),
+        batch["dates"],
+        batch["mask"],
+        hls=batch.get("hls"),
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
+    )[0]
+
+
 def compute_masked_prediction_loss(
     student: EarthWorldModel,
     teacher_embeddings: torch.Tensor,
+    teacher_state_sequence: torch.Tensor | None,
     batch: dict[str, torch.Tensor],
-    visible_idx: torch.Tensor,
-    masked_idx: torch.Tensor,
+    mask_spec: dict[str, Any],
     backend: str,
     device: torch.device,
     config: dict,
@@ -897,9 +1079,9 @@ def compute_masked_prediction_loss(
     loss_terms = compute_prediction_losses(
         student,
         teacher_embeddings,
+        teacher_state_sequence,
         batch,
-        visible_idx,
-        masked_idx,
+        mask_spec,
         backend,
         device,
         config,
@@ -926,6 +1108,28 @@ def temporal_context_weights(
     return 1.0 / distances
 
 
+def dense_token_temporal_context_weights(
+    visible_position_ids: torch.Tensor,
+    masked_position_ids: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    sqrt_distance: bool = False,
+) -> torch.Tensor:
+    if visible_position_ids.numel() == 0 or masked_position_ids.numel() == 0:
+        return torch.ones(
+            (visible_position_ids.shape[0], max(1, visible_position_ids.shape[1])),
+            device=device,
+            dtype=dtype,
+        )
+    visible = visible_position_ids.to(device=device, dtype=dtype).unsqueeze(-1)
+    masked = masked_position_ids.to(device=device, dtype=dtype).unsqueeze(-1)
+    distances = torch.cdist(visible, masked, p=1).amin(dim=-1).clamp_min(1.0)
+    if sqrt_distance:
+        distances = distances.sqrt()
+    return 1.0 / distances
+
+
 def expand_context_weights_for_tokens(weights: torch.Tensor | None, tokens_per_timestep: int) -> torch.Tensor | None:
     if weights is None or tokens_per_timestep <= 1:
         return weights
@@ -935,8 +1139,15 @@ def expand_context_weights_for_tokens(weights: torch.Tensor | None, tokens_per_t
 def select_teacher_targets(
     teacher: EarthWorldModel,
     teacher_embeddings: torch.Tensor,
-    step_idx: torch.Tensor,
+    step_idx: torch.Tensor | None = None,
+    token_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if token_idx is not None:
+        if teacher.token_mode != "dense":
+            raise ValueError("token_idx selection is only supported for dense token mode")
+        return teacher_embeddings[:, token_idx, :]
+    if step_idx is None:
+        raise ValueError("Either step_idx or token_idx must be provided")
     if teacher.token_mode != "dense":
         return teacher_embeddings[:, step_idx, :]
     tokens_per_timestep = teacher.last_tokens_per_timestep
@@ -979,57 +1190,80 @@ def _combine_loss_weights(
     return base_weights * extra
 
 
+def _dense_all_token_target_weights(
+    teacher: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+) -> torch.Tensor | None:
+    patch_px = int(teacher.spatial.patch_px)
+    fusion_mode = str(teacher.spatial.fusion_mode)
+    input_mode = str(teacher.input_mode)
+    tokens_per_timestep = int(teacher.last_tokens_per_timestep)
+    grouped_dates = teacher.spatial.aggregate_temporal_dates(batch["dates"])
+    grouped_steps = int(grouped_dates.shape[1])
+
+    s2_valid_mask = teacher.spatial.aggregate_temporal_valid_mask(batch.get("s2_valid_mask"))
+    s1_valid_mask = teacher.spatial.aggregate_temporal_valid_mask(batch.get("s1_valid_mask"))
+    s2_present = teacher.spatial.aggregate_temporal_presence(batch.get("s2_present"))
+    s1_present = teacher.spatial.aggregate_temporal_presence(batch.get("s1_present"))
+
+    if input_mode == "s2s1" and fusion_mode == "late_concat":
+        token_pieces: list[torch.Tensor] = []
+        patch_count = tokens_per_timestep // 2
+        if s2_valid_mask is not None:
+            token_pieces.append(_pool_patch_validity(s2_valid_mask, patch_px))
+        elif s2_present is not None:
+            token_pieces.append(
+                s2_present.to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
+            )
+        if s1_valid_mask is not None:
+            token_pieces.append(_pool_patch_validity(s1_valid_mask, patch_px))
+        elif s1_present is not None:
+            token_pieces.append(
+                s1_present.to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
+            )
+        if not token_pieces:
+            return None
+        return torch.cat(token_pieces, dim=-1).reshape(batch["dates"].shape[0], grouped_steps * tokens_per_timestep)
+
+    if s2_valid_mask is not None:
+        return _pool_patch_validity(s2_valid_mask, patch_px).reshape(batch["dates"].shape[0], grouped_steps * tokens_per_timestep)
+
+    mask = teacher.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    if mask is None:
+        return None
+    repeated = mask.to(dtype=torch.float32)
+    if tokens_per_timestep > 1:
+        repeated = repeated.unsqueeze(-1).expand(-1, -1, tokens_per_timestep).reshape(batch["dates"].shape[0], -1)
+    return repeated
+
+
 def select_teacher_target_weights(
     teacher: EarthWorldModel,
     batch: dict[str, torch.Tensor],
-    step_idx: torch.Tensor,
+    step_idx: torch.Tensor | None = None,
+    token_idx: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
+    if token_idx is not None:
+        if teacher.token_mode != "dense":
+            raise ValueError("token_idx selection is only supported for dense token mode")
+        weights = _dense_all_token_target_weights(teacher, batch)
+        if weights is None:
+            return None
+        return weights[:, token_idx]
+    if step_idx is None:
+        raise ValueError("Either step_idx or token_idx must be provided")
     if teacher.token_mode != "dense":
         mask = batch.get("mask")
         if mask is None:
             return None
         return mask[:, step_idx].to(dtype=torch.float32)
-
-    patch_px = int(teacher.spatial.patch_px)
-    fusion_mode = str(teacher.spatial.fusion_mode)
-    input_mode = str(teacher.input_mode)
     tokens_per_timestep = int(teacher.last_tokens_per_timestep)
-
-    s2_valid_mask = batch.get("s2_valid_mask")
-    s1_valid_mask = batch.get("s1_valid_mask")
-    s2_present = batch.get("s2_present")
-    s1_present = batch.get("s1_present")
-
-    if input_mode == "s2s1" and fusion_mode == "late_concat":
-        token_pieces: list[torch.Tensor] = []
-        if s2_valid_mask is not None:
-            token_pieces.append(_pool_patch_validity(s2_valid_mask[:, step_idx], patch_px))
-        elif s2_present is not None:
-            patch_count = tokens_per_timestep // 2
-            token_pieces.append(
-                s2_present[:, step_idx].to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
-            )
-        if s1_valid_mask is not None:
-            token_pieces.append(_pool_patch_validity(s1_valid_mask[:, step_idx], patch_px))
-        elif s1_present is not None:
-            patch_count = tokens_per_timestep // 2
-            token_pieces.append(
-                s1_present[:, step_idx].to(dtype=torch.float32).unsqueeze(-1).expand(-1, -1, patch_count)
-            )
-        if not token_pieces:
-            return None
-        return torch.cat(token_pieces, dim=-1).reshape(batch["dates"].shape[0], -1)
-
-    if s2_valid_mask is not None:
-        return _pool_patch_validity(s2_valid_mask[:, step_idx], patch_px).reshape(batch["dates"].shape[0], -1)
-
-    mask = batch.get("mask")
-    if mask is None:
+    weights = _dense_all_token_target_weights(teacher, batch)
+    if weights is None:
         return None
-    repeated = mask[:, step_idx].to(dtype=torch.float32)
-    if tokens_per_timestep > 1:
-        repeated = repeated.unsqueeze(-1).expand(-1, -1, tokens_per_timestep).reshape(batch["dates"].shape[0], -1)
-    return repeated
+    grouped_dates = teacher.spatial.aggregate_temporal_dates(batch["dates"])
+    reshaped = weights.reshape(batch["dates"].shape[0], grouped_dates.shape[1], tokens_per_timestep)
+    return reshaped[:, step_idx].reshape(batch["dates"].shape[0], -1)
 
 
 def weighted_embedding_mse(
@@ -1056,12 +1290,55 @@ def weighted_embedding_mse(
     return weighted_errors.sum() / normalizer
 
 
+def compute_dynamics_rollout_loss(
+    student: EarthWorldModel,
+    teacher_state_sequence: torch.Tensor | None,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> torch.Tensor | None:
+    if teacher_state_sequence is None or student.latent_rollout_head is None:
+        return None
+    horizon = int(config["training"].get("dynamics_rollout_horizon", 4))
+    if horizon <= 0:
+        return None
+    student_states, grouped_dates = student.encode_state_sequence(
+        batch.get("s2"),
+        batch.get("s1"),
+        batch["dates"],
+        batch["mask"],
+        hls=batch.get("hls"),
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
+    )
+    rollout_horizon = min(int(horizon), student_states.shape[1] - 1)
+    if rollout_horizon <= 0:
+        return None
+    predicted = student.rollout_state_predictions(student_states, grouped_dates, horizon=rollout_horizon)
+    start_count = student_states.shape[1] - rollout_horizon
+    target = torch.stack(
+        [teacher_state_sequence[:, step + 1 : step + 1 + start_count, :] for step in range(rollout_horizon)],
+        dim=2,
+    ).detach()
+    target_weights = None
+    grouped_mask = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    if grouped_mask is not None:
+        target_weights = torch.stack(
+            [grouped_mask[:, step + 1 : step + 1 + start_count].to(torch.float32) for step in range(rollout_horizon)],
+            dim=2,
+        )
+    return weighted_embedding_mse(
+        predicted.reshape(predicted.shape[0], -1, predicted.shape[-1]),
+        target.reshape(target.shape[0], -1, target.shape[-1]),
+        weights=None if target_weights is None else target_weights.reshape(target_weights.shape[0], -1),
+    )
+
+
 def compute_prediction_losses(
     student: EarthWorldModel,
     teacher_embeddings: torch.Tensor,
+    teacher_state_sequence: torch.Tensor | None,
     batch: dict[str, torch.Tensor],
-    visible_idx: torch.Tensor,
-    masked_idx: torch.Tensor,
+    mask_spec: dict[str, Any],
     backend: str,
     device: torch.device,
     config: dict,
@@ -1072,42 +1349,119 @@ def compute_prediction_losses(
     context_loss_weight = float(training_cfg.get("context_loss_weight", 0.0))
     context_loss_distance_weighted = bool(training_cfg.get("context_loss_distance_weighted", False))
     context_loss_sqrt_distance = bool(training_cfg.get("context_loss_sqrt_distance", True))
+    dynamics_loss_weight = float(training_cfg.get("dynamics_loss_weight", 0.0))
+    mask_mode = str(mask_spec.get("mode", "temporal")).lower()
 
     with maybe_autocast(backend, device, config):
-        visible_embeddings = student_visible_embeddings(student, batch, visible_idx)
-        predicted_visible, predicted_masked = student.predict_with_context(
-            visible_embeddings,
-            dates[:, visible_idx],
-            dates[:, masked_idx],
-        )
-        masked_target = select_teacher_targets(student, teacher_embeddings, masked_idx).detach()
-        masked_weights = select_teacher_target_weights(student, batch, masked_idx)
-        masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
+        if mask_mode == "dense_block3d":
+            visible_token_idx = mask_spec["visible_idx"]
+            masked_token_idx = mask_spec["masked_idx"]
+            visible_position_ids = mask_spec["visible_position_ids"]
+            masked_position_ids = mask_spec["masked_position_ids"]
+            masked_local_token_indices = mask_spec["masked_local_token_indices"]
+            visible_embeddings = student.encode_timeline(
+                batch.get("s2"),
+                batch.get("s1"),
+                dates,
+                batch["mask"],
+                hls=batch.get("hls"),
+                s2_present=batch.get("s2_present"),
+                s1_present=batch.get("s1_present"),
+                token_indices=visible_token_idx,
+            )
+            predicted_visible, predicted_masked = student.predict_with_context_tokens(
+                visible_embeddings,
+                visible_position_ids,
+                masked_position_ids,
+                masked_local_token_indices,
+                visible_token_indices=visible_token_idx,
+                masked_token_indices=masked_token_idx,
+            )
+            masked_target = select_teacher_targets(
+                student,
+                teacher_embeddings,
+                token_idx=masked_token_idx,
+            ).detach()
+            masked_weights = select_teacher_target_weights(
+                student,
+                batch,
+                token_idx=masked_token_idx,
+            )
+            masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
 
-        context_loss = torch.zeros_like(masked_loss)
-        if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
-            context_target = select_teacher_targets(student, teacher_embeddings, visible_idx).detach()
-            context_weights = None
-            if context_loss_distance_weighted:
-                context_weights = temporal_context_weights(
-                    visible_idx,
-                    masked_idx,
-                    device=predicted_visible.device,
-                    dtype=predicted_visible.dtype,
-                    sqrt_distance=context_loss_sqrt_distance,
+            context_loss = torch.zeros_like(masked_loss)
+            if predict_visible_context and visible_token_idx.numel() > 0 and context_loss_weight > 0.0:
+                context_target = select_teacher_targets(
+                    student,
+                    teacher_embeddings,
+                    token_idx=visible_token_idx,
+                ).detach()
+                context_weights = None
+                if context_loss_distance_weighted:
+                    context_weights = dense_token_temporal_context_weights(
+                        visible_position_ids,
+                        masked_position_ids,
+                        device=predicted_visible.device,
+                        dtype=predicted_visible.dtype,
+                        sqrt_distance=context_loss_sqrt_distance,
+                    )
+                context_target_weights = select_teacher_target_weights(
+                    student,
+                    batch,
+                    token_idx=visible_token_idx,
                 )
-                context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
-            context_target_weights = select_teacher_target_weights(student, batch, visible_idx)
-            context_weights = _combine_loss_weights(context_target_weights, context_weights)
-            context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
+                context_weights = _combine_loss_weights(context_target_weights, context_weights)
+                context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
+        else:
+            visible_idx = mask_spec["visible_idx"]
+            masked_idx = mask_spec["masked_idx"]
+            visible_embeddings = student_visible_embeddings(student, batch, visible_idx)
+            predicted_visible, predicted_masked = student.predict_with_context(
+                visible_embeddings,
+                dates[:, visible_idx],
+                dates[:, masked_idx],
+            )
+            masked_target = select_teacher_targets(student, teacher_embeddings, step_idx=masked_idx).detach()
+            masked_weights = select_teacher_target_weights(student, batch, step_idx=masked_idx)
+            masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
 
-        total_loss = masked_loss + (context_loss_weight * context_loss)
+            context_loss = torch.zeros_like(masked_loss)
+            if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
+                context_target = select_teacher_targets(student, teacher_embeddings, step_idx=visible_idx).detach()
+                context_weights = None
+                if context_loss_distance_weighted:
+                    context_weights = temporal_context_weights(
+                        visible_idx,
+                        masked_idx,
+                        device=predicted_visible.device,
+                        dtype=predicted_visible.dtype,
+                        sqrt_distance=context_loss_sqrt_distance,
+                    )
+                    context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
+                context_target_weights = select_teacher_target_weights(student, batch, step_idx=visible_idx)
+                context_weights = _combine_loss_weights(context_target_weights, context_weights)
+                context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
+
+        dynamics_loss = torch.zeros_like(masked_loss)
+        if dynamics_loss_weight > 0.0:
+            maybe_dynamics_loss = compute_dynamics_rollout_loss(
+                student,
+                teacher_state_sequence,
+                batch,
+                config,
+            )
+            if maybe_dynamics_loss is not None:
+                dynamics_loss = maybe_dynamics_loss
+
+        total_loss = masked_loss + (context_loss_weight * context_loss) + (dynamics_loss_weight * dynamics_loss)
 
     return {
         "total_loss": total_loss,
         "masked_loss": masked_loss.detach(),
         "context_loss": context_loss.detach(),
+        "dynamics_loss": dynamics_loss.detach(),
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "dynamics_loss_weight": torch.tensor(dynamics_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "predict_visible_context": torch.tensor(1 if predict_visible_context else 0, device=total_loss.device),
     }
 
@@ -1116,16 +1470,16 @@ def compute_student_loss_terms(
     student: EarthWorldModel,
     student_stepper: torch.nn.Module | None,
     teacher_embeddings: torch.Tensor,
+    teacher_state_sequence: torch.Tensor | None,
     batch: dict[str, torch.Tensor],
-    visible_idx: torch.Tensor,
-    masked_idx: torch.Tensor,
+    mask_spec: dict[str, Any],
     backend: str,
     device: torch.device,
     config: dict,
 ) -> dict[str, torch.Tensor]:
     if student_stepper is not None:
-        return student_stepper(batch, teacher_embeddings, visible_idx, masked_idx)
-    return compute_prediction_losses(student, teacher_embeddings, batch, visible_idx, masked_idx, backend, device, config)
+        return student_stepper(batch, teacher_embeddings, teacher_state_sequence, mask_spec)
+    return compute_prediction_losses(student, teacher_embeddings, teacher_state_sequence, batch, mask_spec, backend, device, config)
 
 
 def resolve_eval_config(config: dict) -> dict | None:
@@ -1155,7 +1509,6 @@ def evaluate(
     eval_cfg: dict,
     distributed: DistributedContext,
 ) -> dict:
-    mask_ratio = float(config["training"]["mask_ratio"])
     mask_mode = eval_cfg["mask_mode"]
     max_batches = int(eval_cfg.get("max_batches", 0))
     student.eval()
@@ -1166,6 +1519,7 @@ def evaluate(
     loss_total = 0.0
     masked_loss_total = 0.0
     context_loss_total = 0.0
+    dynamics_loss_total = 0.0
     step_count = 0
     started_at = time.time()
 
@@ -1173,11 +1527,22 @@ def evaluate(
         for step, batch in enumerate(loader, start=1):
             batch = move_batch(batch, device, backend)
             teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
+            teacher_state_sequence = compute_teacher_state_sequence(teacher, batch, config)
 
             if mask_mode == "all":
-                mask_pairs = all_temporal_mask_indices(batch["dates"].shape[1], mask_ratio, batch["dates"].device)
+                masking_mode = str(config["training"].get("masking_mode", "temporal_random")).lower()
+                if student.token_mode == "dense" and masking_mode in {"dense_block3d", "block3d"}:
+                    raise ValueError("eval.mask_mode=all is not supported with dense_block3d masking; use eval.mask_mode=random")
+                mask_specs = [
+                    {"mode": "temporal", "visible_idx": visible_idx, "masked_idx": masked_idx}
+                    for visible_idx, masked_idx in all_temporal_mask_indices(
+                        batch["dates"].shape[1],
+                        float(config["training"]["mask_ratio"]),
+                        batch["dates"].device,
+                    )
+                ]
             elif mask_mode == "random":
-                mask_pairs = [temporal_mask_indices(batch["dates"].shape[1], mask_ratio, batch["dates"].device)]
+                mask_specs = [sample_mask_spec(student, batch, config)]
             else:
                 raise ValueError(f"Unsupported eval.mask_mode: {mask_mode}")
 
@@ -1186,21 +1551,23 @@ def evaluate(
                     student,
                     student_stepper,
                     teacher_embeddings,
+                    teacher_state_sequence,
                     batch,
-                    visible_idx,
-                    masked_idx,
+                    mask_spec,
                     backend,
                     device,
                     config,
                 )
-                for visible_idx, masked_idx in mask_pairs
+                for mask_spec in mask_specs
             ]
             batch_loss = torch.stack([loss_terms["total_loss"] for loss_terms in batch_losses]).mean()
             batch_masked_loss = torch.stack([loss_terms["masked_loss"] for loss_terms in batch_losses]).mean()
             batch_context_loss = torch.stack([loss_terms["context_loss"] for loss_terms in batch_losses]).mean()
+            batch_dynamics_loss = torch.stack([loss_terms["dynamics_loss"] for loss_terms in batch_losses]).mean()
             loss_total += float(batch_loss.cpu().item())
             masked_loss_total += float(batch_masked_loss.cpu().item())
             context_loss_total += float(batch_context_loss.cpu().item())
+            dynamics_loss_total += float(batch_dynamics_loss.cpu().item())
             step_count += 1
 
             if max_batches > 0 and step >= max_batches:
@@ -1210,12 +1577,14 @@ def evaluate(
         loss_total = reduce_scalar_sum(loss_total, device, distributed)
         masked_loss_total = reduce_scalar_sum(masked_loss_total, device, distributed)
         context_loss_total = reduce_scalar_sum(context_loss_total, device, distributed)
+        dynamics_loss_total = reduce_scalar_sum(dynamics_loss_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
 
     return {
         "mean_loss": loss_total / max(step_count, 1),
         "mean_masked_loss": masked_loss_total / max(step_count, 1),
         "mean_context_loss": context_loss_total / max(step_count, 1),
+        "mean_dynamics_loss": dynamics_loss_total / max(step_count, 1),
         "step_count": step_count,
         "duration_sec": time.time() - started_at,
         "mask_mode": mask_mode,
@@ -1290,7 +1659,6 @@ def main() -> None:
         log_every = int(config["training"].get("log_every_steps", 10))
         save_every = int(config["training"].get("save_every_epochs", 1))
         max_steps_per_epoch = int(config["training"].get("max_steps_per_epoch", 0))
-        mask_ratio = float(config["training"]["mask_ratio"])
         ema_start = float(config["training"].get("ema_momentum_start", 0.996))
         ema_end = float(config["training"].get("ema_momentum_end", 0.999))
         steps_per_epoch = len(loader)
@@ -1426,16 +1794,17 @@ def main() -> None:
             running_loss = None
             running_masked_loss = None
             running_context_loss = None
+            running_dynamics_loss = None
             epoch_loss_total = 0.0
             epoch_masked_loss_total = 0.0
             epoch_context_loss_total = 0.0
+            epoch_dynamics_loss_total = 0.0
             epoch_step_count = 0
             epoch_started_at = time.time()
 
             for step, batch in enumerate(loader, start=1):
                 batch = move_batch(batch, device, backend)
-                dates = batch["dates"]
-                visible_idx, masked_idx = temporal_mask_indices(dates.shape[1], mask_ratio, dates.device)
+                mask_spec = sample_mask_spec(student, batch, config)
                 current_lr, current_wd = apply_training_schedules(
                     optimizer,
                     global_step=global_step,
@@ -1445,14 +1814,15 @@ def main() -> None:
 
                 with torch.no_grad():
                     teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
+                    teacher_state_sequence = compute_teacher_state_sequence(teacher, batch, config)
 
                 loss_terms = compute_student_loss_terms(
                     student,
                     student_stepper,
                     teacher_embeddings,
+                    teacher_state_sequence,
                     batch,
-                    visible_idx,
-                    masked_idx,
+                    mask_spec,
                     backend,
                     device,
                     config,
@@ -1486,6 +1856,7 @@ def main() -> None:
                 detached_loss = loss.detach()
                 detached_masked_loss = loss_terms["masked_loss"]
                 detached_context_loss = loss_terms["context_loss"]
+                detached_dynamics_loss = loss_terms["dynamics_loss"]
                 running_loss = detached_loss if running_loss is None else running_loss + detached_loss
                 running_masked_loss = (
                     detached_masked_loss
@@ -1497,9 +1868,15 @@ def main() -> None:
                     if running_context_loss is None
                     else running_context_loss + detached_context_loss
                 )
+                running_dynamics_loss = (
+                    detached_dynamics_loss
+                    if running_dynamics_loss is None
+                    else running_dynamics_loss + detached_dynamics_loss
+                )
                 epoch_loss_total += float(detached_loss.cpu().item())
                 epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
                 epoch_context_loss_total += float(detached_context_loss.cpu().item())
+                epoch_dynamics_loss_total += float(detached_dynamics_loss.cpu().item())
                 epoch_step_count += 1
                 global_step += 1
 
@@ -1515,6 +1892,11 @@ def main() -> None:
                         distributed=distributed,
                         device=device,
                     )
+                    mean_dynamics_loss = reduce_scalar_mean(
+                        running_dynamics_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
                     if distributed.is_main_process:
                         train_step_metrics = {
                             "event": "train_step",
@@ -1527,6 +1909,7 @@ def main() -> None:
                             "loss": float(mean_loss.cpu().item()),
                             "masked_loss": float(mean_masked_loss.cpu().item()),
                             "context_loss": float(mean_context_loss.cpu().item()),
+                            "dynamics_loss": float(mean_dynamics_loss.cpu().item()),
                             "lr": float(current_lr),
                             "weight_decay": float(current_wd),
                             "momentum": float(momentum),
@@ -1539,6 +1922,7 @@ def main() -> None:
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
+                                f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f} "
                                 f"momentum={momentum:.6f}"
                             )
@@ -1548,6 +1932,7 @@ def main() -> None:
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
+                                f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f} "
                                 f"momentum={momentum:.6f}"
                             )
@@ -1555,6 +1940,7 @@ def main() -> None:
                     running_loss = None
                     running_masked_loss = None
                     running_context_loss = None
+                    running_dynamics_loss = None
 
                 if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
                     break
@@ -1563,6 +1949,7 @@ def main() -> None:
             epoch_loss_total = reduce_scalar_sum(epoch_loss_total, device, distributed)
             epoch_masked_loss_total = reduce_scalar_sum(epoch_masked_loss_total, device, distributed)
             epoch_context_loss_total = reduce_scalar_sum(epoch_context_loss_total, device, distributed)
+            epoch_dynamics_loss_total = reduce_scalar_sum(epoch_dynamics_loss_total, device, distributed)
             epoch_step_count = int(round(reduce_scalar_sum(epoch_step_count, device, distributed)))
             epoch_mean_loss = epoch_loss_total / max(epoch_step_count, 1)
             epoch_summary = {
@@ -1574,6 +1961,7 @@ def main() -> None:
                 "mean_loss": epoch_mean_loss,
                 "mean_masked_loss": epoch_masked_loss_total / max(epoch_step_count, 1),
                 "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
+                "mean_dynamics_loss": epoch_dynamics_loss_total / max(epoch_step_count, 1),
                 "duration_sec": epoch_duration_sec,
             }
             if backend == "cuda":
@@ -1595,12 +1983,14 @@ def main() -> None:
                 epoch_summary["validation_mean_loss"] = eval_summary["mean_loss"]
                 epoch_summary["validation_mean_masked_loss"] = eval_summary["mean_masked_loss"]
                 epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
+                epoch_summary["validation_mean_dynamics_loss"] = eval_summary["mean_dynamics_loss"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
                 if distributed.is_main_process:
                     print(
                         f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
                         f"validation_masked_loss={eval_summary['mean_masked_loss']:.6f} "
                         f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
+                        f"validation_dynamics_loss={eval_summary['mean_dynamics_loss']:.6f} "
                         f"validation_steps={eval_summary['step_count']}"
                     )
                 validation_mean_loss = float(eval_summary["mean_loss"])

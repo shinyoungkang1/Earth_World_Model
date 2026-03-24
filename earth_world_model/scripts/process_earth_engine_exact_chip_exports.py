@@ -85,17 +85,63 @@ def parse_week_start_and_count(path: Path, band_count: int) -> tuple[int, int]:
     return week_start, inferred_count
 
 
-def center_crop_hw(array: np.ndarray, target_size: int) -> np.ndarray:
+def center_crop_hw(array: np.ndarray, target_size: int) -> tuple[np.ndarray, dict[str, Any]]:
     if array.ndim != 3:
         raise ValueError(f"Expected 3D array [bands,height,width], got shape={array.shape}")
     _bands, height, width = array.shape
+    original_height = int(height)
+    original_width = int(width)
+    pad_top = 0
+    pad_bottom = 0
+    pad_left = 0
+    pad_right = 0
     if height < target_size or width < target_size:
-        raise ValueError(f"Cannot center crop shape={array.shape} to target_size={target_size}")
+        pad_y = max(0, target_size - height)
+        pad_x = max(0, target_size - width)
+        pad_top = int(pad_y // 2)
+        pad_bottom = int(pad_y - pad_top)
+        pad_left = int(pad_x // 2)
+        pad_right = int(pad_x - pad_left)
+        array = np.pad(
+            array,
+            ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+            mode="constant",
+            constant_values=np.nan,
+        )
+        _bands, height, width = array.shape
+    crop_y0 = 0
+    crop_x0 = 0
     if height == target_size and width == target_size:
-        return array
-    y0 = max(0, (height - target_size) // 2)
-    x0 = max(0, (width - target_size) // 2)
-    return array[:, y0 : y0 + target_size, x0 : x0 + target_size]
+        cropped = array
+    else:
+        crop_y0 = int(max(0, (height - target_size) // 2))
+        crop_x0 = int(max(0, (width - target_size) // 2))
+        cropped = array[:, crop_y0 : crop_y0 + target_size, crop_x0 : crop_x0 + target_size]
+    info = {
+        "original_height": original_height,
+        "original_width": original_width,
+        "post_pad_height": int(height),
+        "post_pad_width": int(width),
+        "final_height": int(cropped.shape[1]),
+        "final_width": int(cropped.shape[2]),
+        "pad_top": pad_top,
+        "pad_bottom": pad_bottom,
+        "pad_left": pad_left,
+        "pad_right": pad_right,
+        "crop_y0": crop_y0,
+        "crop_x0": crop_x0,
+        "was_padded": bool(pad_top or pad_bottom or pad_left or pad_right),
+        "was_cropped": bool(crop_y0 or crop_x0 or height != target_size or width != target_size),
+    }
+    if info["was_padded"] and info["was_cropped"]:
+        info["normalization"] = "padded_and_cropped"
+    elif info["was_padded"]:
+        info["normalization"] = "padded"
+    elif info["was_cropped"]:
+        info["normalization"] = "cropped"
+    else:
+        info["normalization"] = "none"
+    return cropped, info
 
 
 def load_locations(path: Path | None) -> dict[str, dict[str, float]]:
@@ -253,6 +299,7 @@ def read_ee_tif_records(
 ) -> dict[str, Any]:
     week_records: list[dict[str, Any]] = []
     failed_chunks: list[dict[str, Any]] = []
+    normalization_events: list[dict[str, Any]] = []
     tif_groups: dict[str, list[Path]] = {}
     for tif_path in sorted(tif_paths):
         tif_groups.setdefault(tiled_export_group_key(tif_path), []).append(tif_path)
@@ -272,8 +319,19 @@ def read_ee_tif_records(
                 }
             )
             continue
-        cropped = center_crop_hw(array, chip_size)
+        cropped, crop_info = center_crop_hw(array, chip_size)
         band_count = cropped.shape[0]
+        if crop_info["normalization"] != "none":
+            normalization_events.append(
+                {
+                    "sample_id": sample_id,
+                    "source_tif": str(tif_path),
+                    "source_tif_group": json.dumps([str(path) for path in grouped_paths]),
+                    "band_count": int(array.shape[0]),
+                    "target_size": int(chip_size),
+                    **crop_info,
+                }
+            )
         if band_count % EE_BANDS_PER_WEEK != 0:
             raise ValueError(f"Unexpected EE band count={band_count} in {tif_path}")
         week_start, week_count = parse_week_start_and_count(tif_path, band_count)
@@ -363,6 +421,7 @@ def read_ee_tif_records(
         "bin_index": np.asarray([entry["week_index"] for entry in week_records], dtype=np.int16),
         "frame_metadata": [entry["frame_meta"] for entry in week_records],
         "failed_chunks": failed_chunks,
+        "normalization_events": normalization_events,
     }
 
 
@@ -461,6 +520,7 @@ def main() -> int:
         "frame_count_total": int(sum(int(record["frame_count"]) for record in records)),
         "paired_frame_count_total": int(sum(int(record["paired_frame_count"]) for record in records)),
         "failed_chunk_count": int(sum(len(record.get("failed_chunks", [])) for record in records)),
+        "normalization_event_count": int(sum(len(record.get("normalization_events", [])) for record in records)),
         "output_format": str(args.output_format),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -471,6 +531,13 @@ def main() -> int:
     ]
     if failure_rows:
         pd.DataFrame(failure_rows).to_parquet(output_dir / "failed_chunks.parquet", index=False)
+    normalization_rows = [
+        event
+        for record in records
+        for event in record.get("normalization_events", [])
+    ]
+    if normalization_rows:
+        pd.DataFrame(normalization_rows).to_parquet(output_dir / "normalization_events.parquet", index=False)
     print(json.dumps(summary, indent=2))
     return 0
 

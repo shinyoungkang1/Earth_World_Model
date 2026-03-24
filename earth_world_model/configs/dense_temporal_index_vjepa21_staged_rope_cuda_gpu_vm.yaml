@@ -15,24 +15,36 @@ data:
   crop_mode: random
   repeat_factor: 1
   num_workers: 4
+  temporal_subclip_mode: random
+  temporal_subclip_schedule:
+    - start_epoch: 0
+      length: 16
+    - start_epoch: 1
+      length: 32
+    - start_epoch: 2
+      length: 52
 
 model:
   input_mode: s2s1
+  tokenizer_type: conv3d
+  tubelet_size: 2
   embed_dim: 384
-  patch_px: 8
+  patch_px: 16
   temporal_depth: 6
   predictor_depth: 3
   num_heads: 8
   hierarchical_layers: [1, 3, 5]
   token_mode: dense
-  spatial_fusion: late_concat
+  spatial_fusion: cross_attend
+  fusion_num_heads: 4
   use_modality_embeddings: true
   use_patch_positional_encoding: true
   use_missing_modality_embeddings: true
-  temporal_block_type: stage_d_rope
+  temporal_block_type: factorized_rope
   use_rope_temporal_attention: true
   rope_base: 10000.0
   use_activation_checkpointing: true
+  enable_latent_dynamics: true
 
 training:
   batch_size: 16
@@ -46,6 +58,16 @@ training:
   weight_decay: 0.05
   final_weight_decay: 0.04
   mask_ratio: 0.5
+  masking_mode: dense_block3d
+  block_mask_cfgs:
+    - num_blocks: 8
+      spatial_scale: [0.10, 0.20]
+      temporal_scale: [0.125, 0.25]
+      aspect_ratio: [0.75, 1.5]
+    - num_blocks: 2
+      spatial_scale: [0.50, 0.70]
+      temporal_scale: [0.25, 0.50]
+      aspect_ratio: [0.75, 1.5]
   ema_momentum_start: 0.996
   ema_momentum_end: 0.999
   log_every_steps: 20
@@ -55,13 +77,15 @@ training:
   context_loss_weight: 0.5
   context_loss_distance_weighted: true
   context_loss_sqrt_distance: true
+  dynamics_loss_weight: 0.1
+  dynamics_rollout_horizon: 4
 
 eval:
   enabled: true
   every_epochs: 1
   batch_size: 16
   max_batches: 0
-  mask_mode: all
+  mask_mode: random
   data:
     index_path: ${EWM_DENSE_EVAL_INDEX_PATH:-/tmp/ewm_dense_temporal/data/val/dense_temporal_index.parquet}
     max_samples: 0
@@ -71,3 +95,5 @@ eval:
     crop_mode: center
     repeat_factor: 1
     num_workers: 4
+    temporal_subclip_length: 52
+    temporal_subclip_mode: center

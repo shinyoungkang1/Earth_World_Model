@@ -38,6 +38,56 @@ SSL4EO_S1GRD_MEAN = torch.tensor([-12.577, -20.265], dtype=torch.float32).view(2
 SSL4EO_S1GRD_STD = torch.tensor([5.179, 5.872], dtype=torch.float32).view(2, 1, 1)
 
 
+def _normalize_temporal_subclip_schedule(raw_schedule: Any) -> list[dict[str, int]]:
+    if raw_schedule is None or raw_schedule is False:
+        return []
+    if not isinstance(raw_schedule, (list, tuple)):
+        raise ValueError("temporal_subclip_schedule must be a list of {start_epoch, length} mappings")
+    normalized: list[dict[str, int]] = []
+    for entry in raw_schedule:
+        if not isinstance(entry, dict):
+            raise ValueError("temporal_subclip_schedule entries must be dicts")
+        start_epoch = int(entry.get("start_epoch", 0))
+        length = int(entry.get("length", 0))
+        if length <= 0:
+            continue
+        normalized.append({"start_epoch": max(0, start_epoch), "length": length})
+    normalized.sort(key=lambda item: item["start_epoch"])
+    return normalized
+
+
+def _resolve_temporal_subclip_length(
+    *,
+    fixed_length: int,
+    schedule: list[dict[str, int]],
+    epoch: int,
+) -> int:
+    resolved = max(0, int(fixed_length))
+    for item in schedule:
+        if int(epoch) >= int(item["start_epoch"]):
+            resolved = max(0, int(item["length"]))
+        else:
+            break
+    return resolved
+
+
+def _slice_temporal_tensor(value: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
+    if value is None:
+        return None
+    return value[start:end]
+
+
+def _temporal_subclip_start(total_steps: int, clip_length: int, mode: str) -> int:
+    if clip_length <= 0 or total_steps <= clip_length:
+        return 0
+    mode = str(mode).lower()
+    if mode == "center":
+        return (total_steps - clip_length) // 2
+    if mode == "random":
+        return int(torch.randint(0, total_steps - clip_length + 1, (1,)).item())
+    raise ValueError(f"Unsupported temporal_subclip_mode: {mode}")
+
+
 def _load_manifest(manifest_path: str | Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in _read_text(manifest_path).splitlines():
@@ -543,6 +593,9 @@ class DenseTemporalNPZDataset(Dataset):
         sample_offset: int = 0,
         crop_mode: str = "center",
         repeat_factor: int = 1,
+        temporal_subclip_length: int = 0,
+        temporal_subclip_mode: str = "random",
+        temporal_subclip_schedule: list[dict[str, int]] | None = None,
         force_single_process_io: bool = False,
     ):
         if _is_gcs_path(index_path):
@@ -554,6 +607,10 @@ class DenseTemporalNPZDataset(Dataset):
         self.crop_mode = str(crop_mode).lower()
         self.repeat_factor = max(1, int(repeat_factor))
         self.sample_offset = max(0, int(sample_offset))
+        self.temporal_subclip_length = max(0, int(temporal_subclip_length))
+        self.temporal_subclip_mode = str(temporal_subclip_mode).lower()
+        self.temporal_subclip_schedule = _normalize_temporal_subclip_schedule(temporal_subclip_schedule)
+        self.current_epoch = 0
 
         frame = pd.read_parquet(self.index_path)
         required_columns = {"sequence_path", "paired_frame_count", "frame_count"}
@@ -574,6 +631,16 @@ class DenseTemporalNPZDataset(Dataset):
 
     def __len__(self) -> int:
         return self.base_row_count * self.repeat_factor
+
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = max(0, int(epoch))
+
+    def _current_temporal_subclip_length(self) -> int:
+        return _resolve_temporal_subclip_length(
+            fixed_length=self.temporal_subclip_length,
+            schedule=self.temporal_subclip_schedule,
+            epoch=self.current_epoch,
+        )
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.rows.iloc[index % self.base_row_count]
@@ -611,6 +678,18 @@ class DenseTemporalNPZDataset(Dataset):
                 if "s1_frame_mask" in sample.files
                 else s1_valid_mask.reshape(s1_valid_mask.shape[0], -1).any(dim=1)
             )
+        clip_length = self._current_temporal_subclip_length()
+        if clip_length > 0 and s2.shape[0] > clip_length:
+            start = _temporal_subclip_start(s2.shape[0], clip_length, self.temporal_subclip_mode)
+            end = start + clip_length
+            s2 = _slice_temporal_tensor(s2, start, end)
+            s1 = _slice_temporal_tensor(s1, start, end)
+            frame_mask = _slice_temporal_tensor(frame_mask, start, end)
+            dates = _slice_temporal_tensor(dates, start, end)
+            s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
+            s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
+            s2_frame_mask = _slice_temporal_tensor(s2_frame_mask, start, end)
+            s1_frame_mask = _slice_temporal_tensor(s1_frame_mask, start, end)
         return _prepare_dense_temporal_sample(
             s2=s2,
             s1=s1,
@@ -639,6 +718,9 @@ class DenseTemporalZarrDataset(Dataset):
         crop_mode: str = "center",
         repeat_factor: int = 1,
         max_open_shards: int = 16,
+        temporal_subclip_length: int = 0,
+        temporal_subclip_mode: str = "random",
+        temporal_subclip_schedule: list[dict[str, int]] | None = None,
         force_single_process_io: bool = False,
     ):
         if _is_gcs_path(index_path):
@@ -651,6 +733,10 @@ class DenseTemporalZarrDataset(Dataset):
         self.repeat_factor = max(1, int(repeat_factor))
         self.sample_offset = max(0, int(sample_offset))
         self.max_open_shards = max(1, int(max_open_shards))
+        self.temporal_subclip_length = max(0, int(temporal_subclip_length))
+        self.temporal_subclip_mode = str(temporal_subclip_mode).lower()
+        self.temporal_subclip_schedule = _normalize_temporal_subclip_schedule(temporal_subclip_schedule)
+        self.current_epoch = 0
         self._cache: OrderedDict[str, Any] = OrderedDict()
 
         frame = pd.read_parquet(self.index_path)
@@ -696,6 +782,16 @@ class DenseTemporalZarrDataset(Dataset):
     def __len__(self) -> int:
         return self.base_row_count * self.repeat_factor
 
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = max(0, int(epoch))
+
+    def _current_temporal_subclip_length(self) -> int:
+        return _resolve_temporal_subclip_length(
+            fixed_length=self.temporal_subclip_length,
+            schedule=self.temporal_subclip_schedule,
+            epoch=self.current_epoch,
+        )
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.rows.iloc[index % self.base_row_count]
         group = self._open_group(str(row["zarr_shard_path"]))
@@ -710,6 +806,18 @@ class DenseTemporalZarrDataset(Dataset):
         dates = torch.from_numpy(np.asarray(group["day_of_year"][row_idx, :frame_count])).to(torch.int32)
         s2_valid_mask = torch.from_numpy(np.asarray(group["s2_valid_mask"][row_idx, :frame_count])).to(torch.bool)
         s1_valid_mask = torch.from_numpy(np.asarray(group["s1_valid_mask"][row_idx, :frame_count])).to(torch.bool)
+        clip_length = self._current_temporal_subclip_length()
+        if clip_length > 0 and s2.shape[0] > clip_length:
+            start = _temporal_subclip_start(s2.shape[0], clip_length, self.temporal_subclip_mode)
+            end = start + clip_length
+            s2 = _slice_temporal_tensor(s2, start, end)
+            s1 = _slice_temporal_tensor(s1, start, end)
+            frame_mask = _slice_temporal_tensor(frame_mask, start, end)
+            s2_frame_mask = _slice_temporal_tensor(s2_frame_mask, start, end)
+            s1_frame_mask = _slice_temporal_tensor(s1_frame_mask, start, end)
+            dates = _slice_temporal_tensor(dates, start, end)
+            s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
+            s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
 
         return _prepare_dense_temporal_sample(
             s2=s2,
