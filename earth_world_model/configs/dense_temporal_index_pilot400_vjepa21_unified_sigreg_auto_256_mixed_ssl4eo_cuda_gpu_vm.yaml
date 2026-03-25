@@ -42,7 +42,7 @@ auxiliary_data:
   assume_single_sample_per_shard: false
   max_open_shards: 16
   batch_sampler: auto
-  batch_size: 4
+  batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
 
 model:
   input_mode: s2s1
