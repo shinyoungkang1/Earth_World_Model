@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PROJECT_ID="${PROJECT_ID:-omois-483220}"
-ZONE="${ZONE:-us-central1-f}"
-A100_VM_NAME="${A100_VM_NAME:-ewm-phase2-a100}"
+ZONE="${ZONE:-us-central1-c}"
+A100_VM_NAME="${A100_VM_NAME:-ewm-phase2-a100-80}"
 REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT:-~/workspace/Mineral_Gas_Locator}"
 DATA_DISK_DEVICE="${DATA_DISK_DEVICE:-/dev/disk/by-id/google-ewm-training-data}"
 DATA_DISK_MOUNT_POINT="${DATA_DISK_MOUNT_POINT:-/mnt/ewm-data-disk}"
