@@ -30,7 +30,7 @@ auxiliary_data:
 model:
   input_mode: s2s1
   tokenizer_type: conv3d
-  tubelet_size: 2
+  tubelet_size: ${EWM_TUBELET_SIZE:-1}
   embed_dim: 64
   patch_px: 16
   temporal_depth: 2
@@ -53,8 +53,8 @@ model:
   enable_latent_dynamics: false
 
 training:
-  batch_size: 2
-  auxiliary_batch_size: 2
+  batch_size: ${EWM_BATCH_SIZE:-2}
+  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-2}
   epochs: 2
   mixed_stage_epochs: 1
   mixed_stage_auxiliary_fraction: 0.5

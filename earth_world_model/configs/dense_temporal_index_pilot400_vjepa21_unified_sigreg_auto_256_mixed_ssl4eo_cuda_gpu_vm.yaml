@@ -49,7 +49,7 @@ model:
   tokenizer_type: ${EWM_TOKENIZER_TYPE:-conv2d}
   tokenizer_mode: ${EWM_TOKENIZER_MODE:-auto}
   auto_2d_max_timesteps: ${EWM_AUTO_2D_MAX_TIMESTEPS:-4}
-  tubelet_size: 2
+  tubelet_size: ${EWM_TUBELET_SIZE:-1}
   embed_dim: ${EWM_EMBED_DIM:-256}
   patch_px: 16
   temporal_depth: ${EWM_TEMPORAL_DEPTH:-6}
@@ -72,10 +72,10 @@ model:
   enable_latent_dynamics: ${EWM_ENABLE_LATENT_DYNAMICS:-false}
 
 training:
-  batch_size: 4
-  auxiliary_batch_size: 4
-  epochs: ${EWM_EPOCHS:-3}
-  mixed_stage_epochs: ${EWM_MIXED_STAGE_EPOCHS:-1}
+  batch_size: ${EWM_BATCH_SIZE:-8}
+  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
+  epochs: ${EWM_EPOCHS:-30}
+  mixed_stage_epochs: ${EWM_MIXED_STAGE_EPOCHS:-10}
   mixed_stage_auxiliary_fraction: ${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}
   lr_schedule: ${EWM_LR_SCHEDULE:-warmup_hold_cosine}
   warmup_fraction: ${EWM_WARMUP_FRACTION:-0.05}
@@ -134,7 +134,7 @@ regularization:
 eval:
   enabled: true
   every_epochs: 1
-  batch_size: 4
+  batch_size: ${EWM_EVAL_BATCH_SIZE:-8}
   max_batches: 0
   mask_mode: random
   data:
