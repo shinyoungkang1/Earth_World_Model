@@ -1,0 +1,84 @@
+runtime:
+  backend: cpu
+  seed: 42
+  checkpoint_dir: /tmp/ewm_fake_mixed_curriculum_conv3d_cpu_smoke
+
+data:
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 52
+  num_workers: 0
+  temporal_subclip_mode: random
+  temporal_subclip_schedule:
+    - start_epoch: 0
+      length: 16
+    - start_epoch: 1
+      length: 32
+    - start_epoch: 2
+      length: 52
+
+auxiliary_data:
+  enabled: true
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 4
+  num_workers: 0
+  batch_size: 2
+
+model:
+  input_mode: s2s1
+  tokenizer_type: conv3d
+  tubelet_size: 2
+  embed_dim: 96
+  patch_px: 16
+  temporal_depth: 2
+  predictor_depth: 1
+  num_heads: 4
+  token_mode: dense
+  spatial_fusion: cross_attend
+  fusion_num_heads: 2
+  separate_sensor_encoders: true
+  use_modality_embeddings: true
+  use_patch_positional_encoding: true
+  use_missing_modality_embeddings: true
+  use_time_gap_features: true
+  temporal_block_type: factorized_rope
+  use_rope_temporal_attention: true
+  rope_base: 10000.0
+  use_activation_checkpointing: false
+  enable_latent_dynamics: true
+
+training:
+  batch_size: 2
+  auxiliary_batch_size: 2
+  epochs: 3
+  mixed_stage_epochs: 1
+  mixed_stage_auxiliary_fraction: 0.5
+  lr_schedule: fixed
+  lr: 3.0e-4
+  weight_decay: 0.05
+  final_weight_decay: 0.05
+  mask_ratio: 0.5
+  masking_mode: dense_block3d
+  block_mask_cfgs:
+    - num_blocks: 2
+      spatial_scale: [0.10, 0.20]
+      temporal_scale: [0.125, 0.25]
+      aspect_ratio: [0.75, 1.5]
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 1
+  save_every_epochs: 1
+  max_steps_per_epoch: 2
+  predict_visible_context: true
+  context_loss_weight: 0.5
+  context_loss_distance_weighted: true
+  context_loss_sqrt_distance: true
+  cross_sensor_loss_weight: 0.1
+  dynamics_loss_weight: 0.1
+  dynamics_rollout_horizon: 2
+
+eval:
+  enabled: false

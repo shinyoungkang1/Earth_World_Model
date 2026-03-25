@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import importlib.util
 import json
+import random
 import re
 import shutil
 import time
@@ -15,9 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from ee_stage_utils import initialize_ee, load_location_rows, require_ee
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUTPUT_DIR = Path("/tmp/ee_exact_chip_interactive_benchmark")
+DEFAULT_OUTPUT_DIR = Path.home() / "ee_interactive_scratch" / "ee_exact_chip_interactive_benchmark"
 EE_REQUEST_SIZE_LIMIT_PATTERN = re.compile(
     r"Total request size \((?P<requested>\d+) bytes\) must be less than or equal to (?P<limit>\d+) bytes"
 )
@@ -41,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout-sec", type=float, default=180.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--retry-backoff-sec", type=float, default=5.0)
+    parser.add_argument("--ee-max-retries", type=int, default=6)
+    parser.add_argument("--ee-retry-backoff-sec", type=float, default=10.0)
     parser.add_argument("--authenticate", action="store_true")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--gcs-bucket", default="", help="Optional GCS bucket for per-sample uploads.")
@@ -57,15 +61,6 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-def require_ee() -> Any:
-    try:
-        import ee  # type: ignore
-    except ImportError as exc:  # pragma: no cover
-        raise SystemExit("earthengine-api is not installed. Install requirements first.") from exc
-    return ee
-
-
 def load_export_module() -> Any:
     script_path = REPO_ROOT / "earth_world_model" / "scripts" / "run_earth_engine_shard_export.py"
     spec = importlib.util.spec_from_file_location("ee_shard_export", script_path)
@@ -77,14 +72,7 @@ def load_export_module() -> Any:
 
 
 def load_locations(path: Path, *, sample_offset: int, sample_limit: int) -> list[dict[str, Any]]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    rows = rows[sample_offset:]
-    if sample_limit > 0:
-        rows = rows[:sample_limit]
-    if not rows:
-        raise SystemExit(f"No rows selected from {path}")
-    return rows
+    return load_location_rows(path, sample_offset=sample_offset, sample_limit=sample_limit)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -207,6 +195,34 @@ def parse_request_size_limit_error(exc: Exception) -> dict[str, int] | None:
     }
 
 
+def is_retryable_ee_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    retryable_tokens = (
+        "too many requests",
+        "rate or concurrency limit",
+        "concurrency limit was exceeded",
+        "request rate",
+        "internal error",
+        "service unavailable",
+        "temporarily unavailable",
+        "deadline exceeded",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "503",
+        "500",
+    )
+    return any(token in message for token in retryable_tokens)
+
+
+def retry_sleep(base_sec: float, attempt: int) -> None:
+    backoff = max(0.0, float(base_sec)) * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0.0, max(0.5, float(base_sec)))
+    time.sleep(backoff + jitter)
+
+
 def download_week_range(
     *,
     ee: Any,
@@ -221,70 +237,83 @@ def download_week_range(
     split_parent: tuple[int, int] | None = None,
 ) -> list[dict[str, Any]]:
     week_count = int(week_end - week_start)
-    image, weekly_manifest = export_module._build_export_image(
-        ee=ee,
-        region=region,
-        year=int(args.year),
-        week_start_index=int(week_start),
-        week_count=week_count,
-    )
-    image = image.toFloat()
     params = {
         "region": region,
         "scale": float(args.resolution_meters),
         "format": "GEO_TIFF",
     }
-    url_started = time.time()
-    try:
-        url = image.getDownloadURL(params)
-    except Exception as exc:
-        size_error = parse_request_size_limit_error(exc)
-        if size_error is not None and week_count > 1:
-            mid = int(week_start + max(1, week_count // 2))
-            left = download_week_range(
+    weekly_manifest: list[dict[str, Any]] = []
+    url = None
+    url_elapsed = None
+    ee_attempt_count = 0
+    for ee_attempt in range(1, max(1, int(args.ee_max_retries)) + 1):
+        ee_attempt_count = ee_attempt
+        url_started = time.time()
+        try:
+            image, weekly_manifest = export_module._build_export_image(
                 ee=ee,
-                export_module=export_module,
                 region=region,
-                sample_id=sample_id,
-                args=args,
-                sample_dir=sample_dir,
-                week_start=week_start,
-                week_end=mid,
-                split_depth=split_depth + 1,
-                split_parent=(week_start, week_end),
+                year=int(args.year),
+                week_start_index=int(week_start),
+                week_count=week_count,
             )
-            right = download_week_range(
-                ee=ee,
-                export_module=export_module,
-                region=region,
-                sample_id=sample_id,
-                args=args,
-                sample_dir=sample_dir,
-                week_start=mid,
-                week_end=week_end,
-                split_depth=split_depth + 1,
-                split_parent=(week_start, week_end),
-            )
-            return left + right
-        return [
-            {
-                "sample_id": sample_id,
-                "week_start_index": int(week_start),
-                "week_end_index": int(week_end),
-                "output_path": str(sample_dir / f"w{week_start:02d}_{week_end:02d}.tif"),
-                "url_elapsed_sec": round(time.time() - url_started, 2),
-                "weekly_manifest": weekly_manifest,
-                "status_code": None,
-                "bytes": 0,
-                "elapsed_sec": round(time.time() - url_started, 2),
-                "attempt": 0,
-                "error": str(exc),
-                "split_depth": int(split_depth),
-                "split_parent": list(split_parent) if split_parent is not None else None,
-                "request_size_error": size_error,
-            }
-        ]
-    url_elapsed = round(time.time() - url_started, 2)
+            image = image.toFloat()
+            url = image.getDownloadURL(params)
+            url_elapsed = round(time.time() - url_started, 2)
+            break
+        except Exception as exc:
+            size_error = parse_request_size_limit_error(exc)
+            if size_error is not None and week_count > 1:
+                mid = int(week_start + max(1, week_count // 2))
+                left = download_week_range(
+                    ee=ee,
+                    export_module=export_module,
+                    region=region,
+                    sample_id=sample_id,
+                    args=args,
+                    sample_dir=sample_dir,
+                    week_start=week_start,
+                    week_end=mid,
+                    split_depth=split_depth + 1,
+                    split_parent=(week_start, week_end),
+                )
+                right = download_week_range(
+                    ee=ee,
+                    export_module=export_module,
+                    region=region,
+                    sample_id=sample_id,
+                    args=args,
+                    sample_dir=sample_dir,
+                    week_start=mid,
+                    week_end=week_end,
+                    split_depth=split_depth + 1,
+                    split_parent=(week_start, week_end),
+                )
+                return left + right
+            if ee_attempt >= max(1, int(args.ee_max_retries)) or not is_retryable_ee_error(exc):
+                return [
+                    {
+                        "sample_id": sample_id,
+                        "week_start_index": int(week_start),
+                        "week_end_index": int(week_end),
+                        "output_path": str(sample_dir / f"w{week_start:02d}_{week_end:02d}.tif"),
+                        "url_elapsed_sec": round(time.time() - url_started, 2),
+                        "weekly_manifest": weekly_manifest,
+                        "status_code": None,
+                        "bytes": 0,
+                        "elapsed_sec": round(time.time() - url_started, 2),
+                        "attempt": 0,
+                        "ee_attempt": ee_attempt,
+                        "error": str(exc),
+                        "split_depth": int(split_depth),
+                        "split_parent": list(split_parent) if split_parent is not None else None,
+                        "request_size_error": size_error,
+                    }
+                ]
+            retry_sleep(float(args.ee_retry_backoff_sec), ee_attempt)
+
+    if url is None:
+        raise AssertionError("unreachable")
 
     output_path = sample_dir / f"w{week_start:02d}_{week_end:02d}.tif"
     download_meta = download_with_retries(
@@ -304,6 +333,7 @@ def download_week_range(
             "weekly_manifest": weekly_manifest,
             "split_depth": int(split_depth),
             "split_parent": list(split_parent) if split_parent is not None else None,
+            "ee_attempt": int(ee_attempt_count),
             **download_meta,
         }
     ]
@@ -326,34 +356,57 @@ def process_sample(
     if sample_payload_is_complete(existing_payload):
         payload = dict(existing_payload)
         payload["reused_local_complete_sample"] = True
+        if args.upload_completed_samples_to_gcs and not payload.get("gcs_upload"):
+            try:
+                upload_meta = upload_sample_dir_to_gcs(
+                    sample_dir=sample_dir,
+                    bucket=str(args.gcs_bucket),
+                    prefix=str(args.gcs_prefix),
+                    sample_id=sample_id,
+                )
+                payload["gcs_upload"] = upload_meta
+                if args.delete_local_after_gcs_upload:
+                    shutil.rmtree(sample_dir)
+                    payload["deleted_local_after_gcs_upload"] = True
+            except Exception as exc:
+                payload["gcs_upload_error"] = str(exc)
+            else:
+                if sample_dir.exists():
+                    write_json(sample_dir / f"{sample_id}.json", payload)
         return payload
 
-    region, resolved_points, region_info = export_module._build_region(
-        ee,
-        lat=lat,
-        lon=lon,
-        region_side_meters=float(args.region_side_meters),
-        chip_size=int(args.chip_size),
-        resolution_meters=float(args.resolution_meters),
-        region_padding_meters=0.0,
-        points=None,
-    )
-
+    resolved_points: list[dict[str, Any]] = []
+    region_info: dict[str, Any] = {}
+    region = None
     chunk_results: list[dict[str, Any]] = []
     sample_started = time.time()
-    for week_start, week_end in chunk_ranges(int(args.total_weeks), int(args.week_step)):
-        chunk_results.extend(
-            download_week_range(
-                ee=ee,
-                export_module=export_module,
-                region=region,
-                sample_id=sample_id,
-                args=args,
-                sample_dir=sample_dir,
-                week_start=int(week_start),
-                week_end=int(week_end),
-            )
+    sample_error = None
+    try:
+        region, resolved_points, region_info = export_module._build_region(
+            ee,
+            lat=lat,
+            lon=lon,
+            region_side_meters=float(args.region_side_meters),
+            chip_size=int(args.chip_size),
+            resolution_meters=float(args.resolution_meters),
+            region_padding_meters=0.0,
+            points=None,
         )
+        for week_start, week_end in chunk_ranges(int(args.total_weeks), int(args.week_step)):
+            chunk_results.extend(
+                download_week_range(
+                    ee=ee,
+                    export_module=export_module,
+                    region=region,
+                    sample_id=sample_id,
+                    args=args,
+                    sample_dir=sample_dir,
+                    week_start=int(week_start),
+                    week_end=int(week_end),
+                )
+            )
+    except Exception as exc:
+        sample_error = str(exc)
 
     sample_payload = {
         "sample_id": sample_id,
@@ -364,6 +417,8 @@ def process_sample(
         "chunk_results": chunk_results,
         "sample_wall_sec": round(time.time() - sample_started, 2),
     }
+    if sample_error is not None:
+        sample_payload["fatal_error"] = sample_error
     write_json(sample_dir / f"{sample_id}.json", sample_payload)
 
     if args.upload_completed_samples_to_gcs and sample_payload_is_complete(sample_payload):
@@ -389,9 +444,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ee = require_ee()
-    if args.authenticate:  # pragma: no cover
-        ee.Authenticate()
-    ee.Initialize(project=args.project)
+    initialize_ee(ee, project=args.project, authenticate=bool(args.authenticate))
     export_module = load_export_module()
 
     rows = load_locations(
@@ -415,12 +468,28 @@ def main() -> int:
             for row in rows
         }
         for future in as_completed(future_map):
-            sample_payloads.append(future.result())
+            row = future_map[future]
+            try:
+                sample_payloads.append(future.result())
+            except Exception as exc:
+                sample_payloads.append(
+                    {
+                        "sample_id": str(row["sample_id"]),
+                        "lat": float(row["latitude"]),
+                        "lon": float(row["longitude"]),
+                        "points": [],
+                        "region_info": {},
+                        "chunk_results": [],
+                        "sample_wall_sec": 0.0,
+                        "fatal_error": str(exc),
+                    }
+                )
 
     sample_payloads.sort(key=lambda item: str(item["sample_id"]))
     chunk_rows = [chunk for payload in sample_payloads for chunk in payload["chunk_results"]]
     status_ok = [row for row in chunk_rows if row.get("status_code") == 200]
     status_fail = [row for row in chunk_rows if row.get("status_code") != 200]
+    failed_samples = [payload for payload in sample_payloads if payload.get("fatal_error")]
     summary = {
         "project": args.project,
         "locations_path": str(args.locations_path),
@@ -433,6 +502,7 @@ def main() -> int:
         "chunk_count": int(len(chunk_rows)),
         "successful_chunk_count": int(len(status_ok)),
         "failed_chunk_count": int(len(status_fail)),
+        "failed_sample_count": int(len(failed_samples)),
         "wall_elapsed_sec": round(time.time() - start, 2),
         "avg_request_total_sec": round(
             sum(float(row.get("elapsed_sec") or 0.0) for row in chunk_rows) / max(1, len(chunk_rows)),
@@ -449,6 +519,7 @@ def main() -> int:
         "total_downloaded_bytes": int(sum(int(row.get("bytes") or 0) for row in status_ok)),
         "samples": sample_payloads,
         "failed_chunks": status_fail,
+        "failed_samples": failed_samples,
     }
     write_json(output_dir / "summary.json", summary)
     print(

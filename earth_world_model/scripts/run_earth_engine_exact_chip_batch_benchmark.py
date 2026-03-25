@@ -4,17 +4,18 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import importlib.util
 import json
 import time
 from pathlib import Path
 from typing import Any
 
+from ee_stage_utils import initialize_ee, load_location_rows, require_ee
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCATIONS_PATH = REPO_ROOT / "data" / "raw" / "dense_temporal_seed_locations_pilot10.csv"
-DEFAULT_OUTPUT_DIR = Path("/tmp/ee_exact_chip_batch_benchmark")
+DEFAULT_OUTPUT_DIR = Path.home() / "ee_interactive_scratch" / "ee_exact_chip_batch_benchmark"
 FINAL_TASK_STATES = {"COMPLETED", "FAILED", "CANCELLED"}
 ACTIVE_TASK_STATES = {"READY", "RUNNING"}
 
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", required=True, help="Google Cloud project for Earth Engine.")
     parser.add_argument("--bucket", required=True, help="Target GCS bucket.")
     parser.add_argument("--locations-path", default=str(DEFAULT_LOCATIONS_PATH))
+    parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--sample-limit", type=int, default=10)
     parser.add_argument("--year", type=int, default=2020)
     parser.add_argument("--week-start-index", type=int, default=0)
@@ -45,19 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument(
         "--interactive-reference-path",
-        default="/tmp/ee_interactive_parallel5_full_year_4w/summary.json",
+        default=str(Path.home() / "ee_interactive_scratch" / "ee_interactive_parallel5_full_year_4w" / "summary.json"),
         help="Optional existing interactive benchmark summary to include for comparison.",
     )
     return parser.parse_args()
-
-
-def require_ee() -> Any:
-    try:
-        import ee  # type: ignore
-    except ImportError as exc:  # pragma: no cover - environment-dependent
-        raise SystemExit("earthengine-api is not installed. Install requirements first.") from exc
-    return ee
-
 
 def load_export_module() -> Any:
     script_path = REPO_ROOT / "earth_world_model" / "scripts" / "run_earth_engine_shard_export.py"
@@ -69,14 +62,8 @@ def load_export_module() -> Any:
     return module
 
 
-def load_locations(path: Path, sample_limit: int) -> list[dict[str, Any]]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    if sample_limit > 0:
-        rows = rows[:sample_limit]
-    if not rows:
-        raise SystemExit(f"No sample rows found in {path}")
-    return rows
+def load_locations(path: Path, sample_offset: int, sample_limit: int) -> list[dict[str, Any]]:
+    return load_location_rows(path, sample_offset=sample_offset, sample_limit=sample_limit)
 
 
 def cancel_active_tasks(ee: Any) -> list[dict[str, Any]]:
@@ -216,16 +203,14 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ee = require_ee()
-    if args.authenticate:  # pragma: no cover - interactive auth
-        ee.Authenticate()
-    ee.Initialize(project=args.project)
+    initialize_ee(ee, project=args.project, authenticate=bool(args.authenticate))
     export_module = load_export_module()
 
     cancel_actions: list[dict[str, Any]] = []
     if args.cancel_active_first:
         cancel_actions = cancel_active_tasks(ee)
 
-    locations = load_locations(Path(args.locations_path), int(args.sample_limit))
+    locations = load_locations(Path(args.locations_path), int(args.sample_offset), int(args.sample_limit))
     launches: list[dict[str, Any]] = []
     launch_start = time.time()
     for row in locations:

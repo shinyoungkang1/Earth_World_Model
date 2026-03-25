@@ -425,13 +425,35 @@ def _prepare_dense_temporal_sample(
 class FakeTemporalDataset(Dataset):
     """Small fake dataset for Phase 0 sanity checks."""
 
-    def __init__(self, num_samples: int = 1024, timesteps: int = 4, patch_size: int = 128):
+    def __init__(
+        self,
+        num_samples: int = 1024,
+        timesteps: int = 4,
+        patch_size: int = 128,
+        temporal_subclip_length: int = 0,
+        temporal_subclip_mode: str = "random",
+        temporal_subclip_schedule: list[dict[str, int]] | None = None,
+    ):
         self.num_samples = int(num_samples)
         self.timesteps = int(timesteps)
         self.patch_size = int(patch_size)
+        self.temporal_subclip_length = max(0, int(temporal_subclip_length))
+        self.temporal_subclip_mode = str(temporal_subclip_mode).lower()
+        self.temporal_subclip_schedule = _normalize_temporal_subclip_schedule(temporal_subclip_schedule)
+        self.current_epoch = 0
 
     def __len__(self) -> int:
         return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = max(0, int(epoch))
+
+    def _current_temporal_subclip_length(self) -> int:
+        return _resolve_temporal_subclip_length(
+            fixed_length=self.temporal_subclip_length,
+            schedule=self.temporal_subclip_schedule,
+            epoch=self.current_epoch,
+        )
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         generator = torch.Generator().manual_seed(index)
@@ -445,9 +467,19 @@ class FakeTemporalDataset(Dataset):
         )
         s1 = torch.randn(self.timesteps, 2, self.patch_size, self.patch_size, generator=generator)
         mask = torch.ones(self.timesteps, dtype=torch.bool)
-        dates = DEFAULT_DATES[: self.timesteps].clone()
+        dates = torch.linspace(1.0, 365.0, steps=self.timesteps, dtype=torch.float32).round().to(torch.int32)
         s2_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
         s1_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
+        clip_length = self._current_temporal_subclip_length()
+        if clip_length > 0 and self.timesteps > clip_length:
+            start = _temporal_subclip_start(self.timesteps, clip_length, self.temporal_subclip_mode)
+            end = start + clip_length
+            s2 = _slice_temporal_tensor(s2, start, end)
+            s1 = _slice_temporal_tensor(s1, start, end)
+            mask = _slice_temporal_tensor(mask, start, end)
+            dates = _slice_temporal_tensor(dates, start, end)
+            s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
+            s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
         return {
             "s2": s2.float(),
             "s1": s1.float(),

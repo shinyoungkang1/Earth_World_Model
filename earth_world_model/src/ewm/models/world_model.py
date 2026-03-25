@@ -17,9 +17,10 @@ from ewm.models.transformer_blocks import FactorizedRopeBlock, RopeTransformerBl
 class TemporalMetadataEncoding(nn.Module):
     """Encode EO acquisition timing with cyclic and interval-aware features."""
 
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int, *, use_time_gap_features: bool = True):
         super().__init__()
         self.embed_dim = int(embed_dim)
+        self.use_time_gap_features = bool(use_time_gap_features)
         self.proj = nn.Sequential(
             nn.Linear(8, embed_dim),
             nn.GELU(),
@@ -43,12 +44,17 @@ class TemporalMetadataEncoding(nn.Module):
             delta_next[:, :-1] = dates[:, 1:] - dates[:, :-1]
             delta_prev[:, 0] = delta_prev[:, 1]
             delta_next[:, -1] = delta_next[:, -2]
+        if not self.use_time_gap_features:
+            delta_prev.zero_()
+            delta_next.zero_()
         progress = torch.linspace(0.0, 1.0, timesteps, device=dates.device, dtype=torch.float32).unsqueeze(0)
         progress = progress.expand(batch, -1)
         if span_days is None:
             span_days = torch.zeros_like(dates)
         else:
             span_days = span_days.to(device=dates.device, dtype=torch.float32)
+        if not self.use_time_gap_features:
+            span_days = torch.zeros_like(dates)
         if valid_fraction is None:
             valid_fraction = torch.ones_like(dates)
         else:
@@ -133,6 +139,8 @@ class EarthWorldModel(nn.Module):
         use_activation_checkpointing: bool = False,
         tokenizer_type: str = "linear",
         tubelet_size: int = 2,
+        separate_sensor_encoders: bool = True,
+        use_time_gap_features: bool = True,
         enable_latent_dynamics: bool = True,
         dynamics_hidden_dim: int | None = None,
     ):
@@ -146,6 +154,7 @@ class EarthWorldModel(nn.Module):
         self.use_rope_temporal_attention = bool(use_rope_temporal_attention)
         self.rope_base = float(rope_base)
         self.use_activation_checkpointing = bool(use_activation_checkpointing)
+        self.use_time_gap_features = bool(use_time_gap_features)
         self.token_mode = str(token_mode)
         if self.token_mode not in {"pooled", "dense"}:
             raise ValueError(f"Unsupported token_mode: {self.token_mode}")
@@ -161,8 +170,9 @@ class EarthWorldModel(nn.Module):
             use_missing_modality_embeddings=use_missing_modality_embeddings,
             tokenizer_type=tokenizer_type,
             tubelet_size=tubelet_size,
+            separate_sensor_encoders=separate_sensor_encoders,
         )
-        self.temporal_pos = TemporalMetadataEncoding(embed_dim)
+        self.temporal_pos = TemporalMetadataEncoding(embed_dim, use_time_gap_features=use_time_gap_features)
         self._last_tokens_per_timestep = 1
 
         normalized_hierarchical = self._normalize_layer_indices(hierarchical_layers, self.temporal_depth)
@@ -493,6 +503,7 @@ class EarthWorldModel(nn.Module):
         token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_rope_positions = self.temporal_block_type == "stage_d_rope" and self.use_rope_temporal_attention
+        temporal_metadata = self._temporal_metadata_embeddings(dates, mask=mask)
         if self.spatial.tokenizer_type == "conv3d":
             if hls is not None:
                 timeline = self.spatial.encode_sequence_tokens(hls=hls)
@@ -510,7 +521,7 @@ class EarthWorldModel(nn.Module):
             if self.token_mode == "dense":
                 self._last_tokens_per_timestep = int(timeline.shape[2])
                 if not use_rope_positions:
-                    timeline = timeline + self.temporal_pos(encoded_dates).unsqueeze(2)
+                    timeline = timeline + temporal_metadata.unsqueeze(2)
                 if encoded_mask is not None:
                     timeline = timeline * encoded_mask.unsqueeze(-1).unsqueeze(-1).float()
                 position_ids = self._timeline_position_ids(encoded_dates, tokens_per_timestep=self._last_tokens_per_timestep)
@@ -523,7 +534,7 @@ class EarthWorldModel(nn.Module):
             self._last_tokens_per_timestep = 1
             timeline = timeline.mean(dim=2)
             if not use_rope_positions:
-                timeline = timeline + self.temporal_pos(encoded_dates)
+                timeline = timeline + temporal_metadata
             if encoded_mask is not None:
                 timeline = timeline * encoded_mask.unsqueeze(-1).float()
             position_ids = self._timeline_position_ids(encoded_dates, tokens_per_timestep=1)
@@ -549,7 +560,7 @@ class EarthWorldModel(nn.Module):
                 if use_rope_positions:
                     step_tokens = spatial_tokens
                 else:
-                    temporal = self.temporal_pos(dates[:, timestep : timestep + 1]).unsqueeze(1)
+                    temporal = temporal_metadata[:, timestep : timestep + 1].unsqueeze(1)
                     step_tokens = spatial_tokens + temporal.squeeze(2)
                 step_embeddings.append(step_tokens)
             else:
@@ -571,7 +582,7 @@ class EarthWorldModel(nn.Module):
         self._last_tokens_per_timestep = 1
         timeline = torch.stack(step_embeddings, dim=1)
         if not use_rope_positions:
-            timeline = timeline + self.temporal_pos(dates)
+            timeline = timeline + temporal_metadata
         if mask is not None:
             timeline = timeline * mask.unsqueeze(-1).float()
         position_ids = self._timeline_position_ids(dates, tokens_per_timestep=1)

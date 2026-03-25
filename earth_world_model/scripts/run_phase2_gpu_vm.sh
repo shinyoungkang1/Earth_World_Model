@@ -106,6 +106,10 @@ configure_nccl_env_for_gpu() {
 }
 
 storage_rsync() {
+  if command -v gsutil >/dev/null 2>&1; then
+    gsutil -m rsync -r "$1" "$2"
+    return 0
+  fi
   if gcloud storage rsync --help >/dev/null 2>&1; then
     gcloud storage rsync --recursive "$1" "$2"
     return 0
@@ -114,21 +118,17 @@ storage_rsync() {
     gcloud storage cp --recursive "$1" "$2"
     return 0
   fi
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil -m rsync -r "$1" "$2"
-    return 0
-  fi
   echo "Missing directory sync support: need 'gcloud storage rsync', 'gcloud storage cp --recursive', or 'gsutil'" >&2
   exit 1
 }
 
 storage_cp() {
-  if gcloud storage cp --help >/dev/null 2>&1; then
-    gcloud storage cp "$1" "$2"
-    return 0
-  fi
   if command -v gsutil >/dev/null 2>&1; then
     gsutil cp "$1" "$2"
+    return 0
+  fi
+  if gcloud storage cp --help >/dev/null 2>&1; then
+    gcloud storage cp "$1" "$2"
     return 0
   fi
   echo "Missing file copy support: need 'gcloud storage cp' or 'gsutil'" >&2

@@ -191,6 +191,23 @@ def resolve_bool_config(value: Any, *, default: bool = False) -> bool:
     return bool(value)
 
 
+def resolve_int_config(value: Any, *, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        return int(stripped)
+    return int(value)
+
+
 def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
     kind = data_cfg["kind"]
     force_single_process_io = resolve_bool_config(
@@ -199,29 +216,32 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
     )
     if kind == "fake":
         return FakeTemporalDataset(
-            num_samples=data_cfg.get("num_samples", 1024),
-            timesteps=data_cfg.get("max_timestamps", 4),
-            patch_size=data_cfg.get("patch_size", 128),
+            num_samples=resolve_int_config(data_cfg.get("num_samples"), default=1024),
+            timesteps=resolve_int_config(data_cfg.get("max_timestamps"), default=4),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+            temporal_subclip_length=resolve_int_config(data_cfg.get("temporal_subclip_length"), default=0),
+            temporal_subclip_mode=data_cfg.get("temporal_subclip_mode", "random"),
+            temporal_subclip_schedule=data_cfg.get("temporal_subclip_schedule"),
         )
     if kind == "manifest":
         return ManifestTemporalDataset(
             manifest_path=data_cfg["manifest_path"],
-            patch_size=data_cfg.get("patch_size", 128),
-            max_samples=data_cfg.get("max_samples"),
-            sample_offset=data_cfg.get("sample_offset", 0),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+            max_samples=resolve_int_config(data_cfg.get("max_samples")),
+            sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
             crop_mode=data_cfg.get("crop_mode", "center"),
-            repeat_factor=data_cfg.get("repeat_factor", 1),
+            repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
             force_single_process_io=force_single_process_io,
         )
     if kind == "hls_chip_index":
         return HLSChipTemporalDataset(
             index_path=data_cfg["index_path"],
-            patch_size=data_cfg.get("patch_size", 224),
-            max_samples=data_cfg.get("max_samples"),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=224),
+            max_samples=resolve_int_config(data_cfg.get("max_samples")),
             min_valid_fraction=data_cfg.get("min_valid_fraction", 0.0),
-            sample_offset=data_cfg.get("sample_offset", 0),
+            sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
             crop_mode=data_cfg.get("crop_mode", "center"),
-            repeat_factor=data_cfg.get("repeat_factor", 1),
+            repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
             force_single_process_io=force_single_process_io,
         )
     if kind == "ssl4eo_zarr":
@@ -232,19 +252,21 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
                 return SSL4EOZarrDatafluxDataset(
                     root_dir=root_dir,
                     split=data_cfg.get("split", "val"),
-                    patch_size=data_cfg.get("patch_size", 128),
-                    max_shards=data_cfg.get("max_shards"),
-                    max_samples=data_cfg.get("max_samples"),
+                    patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+                    max_shards=resolve_int_config(data_cfg.get("max_shards")),
+                    max_samples=resolve_int_config(data_cfg.get("max_samples")),
                     min_clear_fraction=data_cfg.get("min_clear_fraction", 0.8),
-                    sample_offset=data_cfg.get("sample_offset", 0),
+                    sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
                     crop_mode=data_cfg.get("crop_mode", "center"),
-                    repeat_factor=data_cfg.get("repeat_factor", 1),
+                    repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
                     assume_single_sample_per_shard=data_cfg.get("assume_single_sample_per_shard", False),
-                    max_open_shards=data_cfg.get("max_open_shards", 16),
+                    max_open_shards=resolve_int_config(data_cfg.get("max_open_shards"), default=16),
                     force_single_process_io=force_single_process_io,
                     project_name=data_cfg.get("project_name") or os.environ.get("EWM_GCP_PROJECT"),
-                    dataflux_threads_per_process=data_cfg.get("dataflux_threads_per_process", 1),
-                    dataflux_num_processes=data_cfg.get("dataflux_num_processes"),
+                    dataflux_threads_per_process=resolve_int_config(
+                        data_cfg.get("dataflux_threads_per_process"), default=1
+                    ),
+                    dataflux_num_processes=resolve_int_config(data_cfg.get("dataflux_num_processes")),
                     dataflux_disable_compose=resolve_bool_config(data_cfg.get("dataflux_disable_compose"), default=False),
                 )
             except ImportError:
@@ -253,28 +275,28 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
         return SSL4EOZarrDataset(
             root_dir=root_dir,
             split=data_cfg.get("split", "val"),
-            patch_size=data_cfg.get("patch_size", 128),
-            max_shards=data_cfg.get("max_shards"),
-            max_samples=data_cfg.get("max_samples"),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+            max_shards=resolve_int_config(data_cfg.get("max_shards")),
+            max_samples=resolve_int_config(data_cfg.get("max_samples")),
             min_clear_fraction=data_cfg.get("min_clear_fraction", 0.8),
-            sample_offset=data_cfg.get("sample_offset", 0),
+            sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
             crop_mode=data_cfg.get("crop_mode", "center"),
-            repeat_factor=data_cfg.get("repeat_factor", 1),
+            repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
             assume_single_sample_per_shard=data_cfg.get("assume_single_sample_per_shard", False),
-            max_open_shards=data_cfg.get("max_open_shards", 16),
+            max_open_shards=resolve_int_config(data_cfg.get("max_open_shards"), default=16),
             force_single_process_io=force_single_process_io,
         )
     if kind == "dense_temporal_index":
         return DenseTemporalNPZDataset(
             index_path=data_cfg["index_path"],
-            patch_size=data_cfg.get("patch_size", 128),
-            max_samples=data_cfg.get("max_samples"),
-            min_paired_frames=data_cfg.get("min_paired_frames", 1),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+            max_samples=resolve_int_config(data_cfg.get("max_samples")),
+            min_paired_frames=resolve_int_config(data_cfg.get("min_paired_frames"), default=1),
             min_paired_fraction=data_cfg.get("min_paired_fraction", 0.0),
-            sample_offset=data_cfg.get("sample_offset", 0),
+            sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
             crop_mode=data_cfg.get("crop_mode", "center"),
-            repeat_factor=data_cfg.get("repeat_factor", 1),
-            temporal_subclip_length=data_cfg.get("temporal_subclip_length", 0),
+            repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
+            temporal_subclip_length=resolve_int_config(data_cfg.get("temporal_subclip_length"), default=0),
             temporal_subclip_mode=data_cfg.get("temporal_subclip_mode", "random"),
             temporal_subclip_schedule=data_cfg.get("temporal_subclip_schedule"),
             force_single_process_io=force_single_process_io,
@@ -282,15 +304,15 @@ def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
     if kind == "dense_temporal_zarr_index":
         return DenseTemporalZarrDataset(
             index_path=data_cfg["index_path"],
-            patch_size=data_cfg.get("patch_size", 128),
-            max_samples=data_cfg.get("max_samples"),
-            min_paired_frames=data_cfg.get("min_paired_frames", 1),
+            patch_size=resolve_int_config(data_cfg.get("patch_size"), default=128),
+            max_samples=resolve_int_config(data_cfg.get("max_samples")),
+            min_paired_frames=resolve_int_config(data_cfg.get("min_paired_frames"), default=1),
             min_paired_fraction=data_cfg.get("min_paired_fraction", 0.0),
-            sample_offset=data_cfg.get("sample_offset", 0),
+            sample_offset=resolve_int_config(data_cfg.get("sample_offset"), default=0),
             crop_mode=data_cfg.get("crop_mode", "center"),
-            repeat_factor=data_cfg.get("repeat_factor", 1),
-            max_open_shards=data_cfg.get("max_open_shards", 16),
-            temporal_subclip_length=data_cfg.get("temporal_subclip_length", 0),
+            repeat_factor=resolve_int_config(data_cfg.get("repeat_factor"), default=1),
+            max_open_shards=resolve_int_config(data_cfg.get("max_open_shards"), default=16),
+            temporal_subclip_length=resolve_int_config(data_cfg.get("temporal_subclip_length"), default=0),
             temporal_subclip_mode=data_cfg.get("temporal_subclip_mode", "random"),
             temporal_subclip_schedule=data_cfg.get("temporal_subclip_schedule"),
             force_single_process_io=force_single_process_io,
@@ -416,6 +438,8 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         use_activation_checkpointing=model_cfg.get("use_activation_checkpointing", False),
         tokenizer_type=model_cfg.get("tokenizer_type", "linear"),
         tubelet_size=model_cfg.get("tubelet_size", 2),
+        separate_sensor_encoders=model_cfg.get("separate_sensor_encoders", True),
+        use_time_gap_features=model_cfg.get("use_time_gap_features", True),
         enable_latent_dynamics=model_cfg.get("enable_latent_dynamics", True),
         dynamics_hidden_dim=model_cfg.get("dynamics_hidden_dim"),
     )
@@ -572,6 +596,75 @@ def set_loader_epoch(loader: DataLoader, epoch: int) -> None:
         sampler.set_epoch(epoch)
 
 
+def resolve_auxiliary_data_config(config: dict) -> dict | None:
+    raw_aux_cfg = config.get("auxiliary_data")
+    if not raw_aux_cfg:
+        return None
+    aux_cfg = deepcopy(raw_aux_cfg)
+    if not resolve_bool_config(aux_cfg.get("enabled", True), default=True):
+        return None
+    aux_cfg.pop("enabled", None)
+    return aux_cfg
+
+
+def _mixed_stage_steps_per_epoch(primary_loader: DataLoader, auxiliary_loader: DataLoader | None, training_cfg: dict, epoch: int) -> int:
+    max_steps_per_epoch = max(0, int(training_cfg.get("max_steps_per_epoch", 0)))
+    if auxiliary_loader is None:
+        base_steps = len(primary_loader)
+        return min(base_steps, max_steps_per_epoch) if max_steps_per_epoch > 0 else base_steps
+    mixed_stage_epochs = max(0, int(training_cfg.get("mixed_stage_epochs", 0)))
+    if epoch >= mixed_stage_epochs:
+        base_steps = len(primary_loader)
+        return min(base_steps, max_steps_per_epoch) if max_steps_per_epoch > 0 else base_steps
+    configured = int(training_cfg.get("mixed_stage_steps_per_epoch", 0))
+    base_steps = configured if configured > 0 else len(primary_loader)
+    return min(base_steps, max_steps_per_epoch) if max_steps_per_epoch > 0 else base_steps
+
+
+def training_steps_schedule(primary_loader: DataLoader, auxiliary_loader: DataLoader | None, training_cfg: dict, epochs: int) -> list[int]:
+    return [
+        _mixed_stage_steps_per_epoch(primary_loader, auxiliary_loader, training_cfg, epoch)
+        for epoch in range(max(0, int(epochs)))
+    ]
+
+
+def iter_training_batches(
+    primary_loader: DataLoader,
+    auxiliary_loader: DataLoader | None,
+    *,
+    epoch: int,
+    training_cfg: dict,
+    seed: int,
+):
+    mixed_stage_epochs = max(0, int(training_cfg.get("mixed_stage_epochs", 0)))
+    auxiliary_fraction = float(training_cfg.get("mixed_stage_auxiliary_fraction", 0.5))
+    auxiliary_fraction = min(max(auxiliary_fraction, 0.0), 1.0)
+    steps_per_epoch = _mixed_stage_steps_per_epoch(primary_loader, auxiliary_loader, training_cfg, epoch)
+    if auxiliary_loader is None or epoch >= mixed_stage_epochs or auxiliary_fraction <= 0.0:
+        for batch in primary_loader:
+            yield "primary", batch
+        return
+
+    rng = random.Random(int(seed) + int(epoch))
+    primary_iter = iter(primary_loader)
+    auxiliary_iter = iter(auxiliary_loader)
+    for _step in range(steps_per_epoch):
+        use_auxiliary = rng.random() < auxiliary_fraction
+        source = "auxiliary" if use_auxiliary else "primary"
+        active_loader = auxiliary_loader if use_auxiliary else primary_loader
+        active_iter = auxiliary_iter if use_auxiliary else primary_iter
+        try:
+            batch = next(active_iter)
+        except StopIteration:
+            active_iter = iter(active_loader)
+            batch = next(active_iter)
+        if use_auxiliary:
+            auxiliary_iter = active_iter
+        else:
+            primary_iter = active_iter
+        yield source, batch
+
+
 def try_git_commit(cwd: Path) -> str | None:
     try:
         completed = subprocess.run(
@@ -596,9 +689,11 @@ def collect_run_manifest(
     distributed: DistributedContext,
     checkpoint_dir: Path,
     dataset: torch.utils.data.Dataset,
+    auxiliary_dataset: torch.utils.data.Dataset | None,
     eval_dataset: torch.utils.data.Dataset | None,
     metrics_path: Path,
     loader: DataLoader,
+    auxiliary_loader: DataLoader | None,
     eval_loader: DataLoader | None,
 ) -> dict[str, Any]:
     interesting_env_prefixes = ("EWM_",)
@@ -657,10 +752,38 @@ def collect_run_manifest(
             "root_dir": getattr(dataset, "root_dir", None),
             "split": getattr(dataset, "split", None),
         },
+        "auxiliary_dataset": {
+            "class_name": auxiliary_dataset.__class__.__name__ if auxiliary_dataset is not None else None,
+            "row_count": len(auxiliary_dataset) if auxiliary_dataset is not None else 0,
+            "base_row_count": getattr(auxiliary_dataset, "base_row_count", len(auxiliary_dataset))
+            if auxiliary_dataset is not None
+            else 0,
+            "requires_single_process_io": bool(getattr(auxiliary_dataset, "requires_single_process_io", False))
+            if auxiliary_dataset is not None
+            else False,
+            "root_dir": getattr(auxiliary_dataset, "root_dir", None) if auxiliary_dataset is not None else None,
+            "split": getattr(auxiliary_dataset, "split", None) if auxiliary_dataset is not None else None,
+        },
         "eval_dataset": {
             "class_name": eval_dataset.__class__.__name__ if eval_dataset is not None else None,
             "row_count": len(eval_dataset) if eval_dataset is not None else 0,
             "base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset)) if eval_dataset is not None else 0,
+        },
+        "auxiliary_loader": {
+            "class_name": auxiliary_loader.__class__.__name__ if auxiliary_loader is not None else None,
+            "num_workers": int(getattr(auxiliary_loader, "num_workers", 0)) if auxiliary_loader is not None else 0,
+            "batch_size": getattr(auxiliary_loader, "batch_size", None) if auxiliary_loader is not None else None,
+            "prefetch_factor": getattr(auxiliary_loader, "prefetch_factor", None) if auxiliary_loader is not None else None,
+            "pin_memory": bool(getattr(auxiliary_loader, "pin_memory", False)) if auxiliary_loader is not None else False,
+            "persistent_workers": bool(getattr(auxiliary_loader, "persistent_workers", False))
+            if auxiliary_loader is not None
+            else False,
+            "batch_sampler": auxiliary_loader.batch_sampler.__class__.__name__
+            if auxiliary_loader is not None and getattr(auxiliary_loader, "batch_sampler", None)
+            else None,
+            "sampler": auxiliary_loader.sampler.__class__.__name__
+            if auxiliary_loader is not None and getattr(auxiliary_loader, "sampler", None)
+            else None,
         },
         "eval_loader": {
             "class_name": eval_loader.__class__.__name__ if eval_loader is not None else None,
@@ -1333,6 +1456,50 @@ def compute_dynamics_rollout_loss(
     )
 
 
+def compute_cross_sensor_alignment_loss(
+    student: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> torch.Tensor | None:
+    if str(student.input_mode) != "s2s1":
+        return None
+    s2 = batch.get("s2")
+    s1 = batch.get("s1")
+    if s2 is None or s1 is None:
+        return None
+    s2_present = batch.get("s2_present")
+    s1_present = batch.get("s1_present")
+    paired_weights = None
+    grouped_s2_present = student.spatial.aggregate_temporal_presence(s2_present)
+    grouped_s1_present = student.spatial.aggregate_temporal_presence(s1_present)
+    if grouped_s2_present is not None and grouped_s1_present is not None:
+        paired_weights = (grouped_s2_present & grouped_s1_present).to(torch.float32)
+    else:
+        grouped_mask = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+        if grouped_mask is not None:
+            paired_weights = grouped_mask.to(torch.float32)
+    if paired_weights is None or float(paired_weights.sum().detach().cpu().item()) <= 0.0:
+        return None
+
+    s2_only_states, _ = student.encode_state_sequence(
+        s2,
+        torch.zeros_like(s1),
+        batch["dates"],
+        batch["mask"],
+        s2_present=s2_present,
+        s1_present=None if s1_present is None else torch.zeros_like(s1_present, dtype=torch.bool),
+    )
+    s1_only_states, _ = student.encode_state_sequence(
+        torch.zeros_like(s2),
+        s1,
+        batch["dates"],
+        batch["mask"],
+        s2_present=None if s2_present is None else torch.zeros_like(s2_present, dtype=torch.bool),
+        s1_present=s1_present,
+    )
+    return weighted_embedding_mse(s2_only_states, s1_only_states, weights=paired_weights)
+
+
 def compute_prediction_losses(
     student: EarthWorldModel,
     teacher_embeddings: torch.Tensor,
@@ -1350,6 +1517,7 @@ def compute_prediction_losses(
     context_loss_distance_weighted = bool(training_cfg.get("context_loss_distance_weighted", False))
     context_loss_sqrt_distance = bool(training_cfg.get("context_loss_sqrt_distance", True))
     dynamics_loss_weight = float(training_cfg.get("dynamics_loss_weight", 0.0))
+    cross_sensor_loss_weight = float(training_cfg.get("cross_sensor_loss_weight", 0.0))
     mask_mode = str(mask_spec.get("mode", "temporal")).lower()
 
     with maybe_autocast(backend, device, config):
@@ -1453,15 +1621,32 @@ def compute_prediction_losses(
             if maybe_dynamics_loss is not None:
                 dynamics_loss = maybe_dynamics_loss
 
-        total_loss = masked_loss + (context_loss_weight * context_loss) + (dynamics_loss_weight * dynamics_loss)
+        cross_sensor_loss = torch.zeros_like(masked_loss)
+        if cross_sensor_loss_weight > 0.0:
+            maybe_cross_sensor_loss = compute_cross_sensor_alignment_loss(student, batch, config)
+            if maybe_cross_sensor_loss is not None:
+                cross_sensor_loss = maybe_cross_sensor_loss
+
+        total_loss = (
+            masked_loss
+            + (context_loss_weight * context_loss)
+            + (dynamics_loss_weight * dynamics_loss)
+            + (cross_sensor_loss_weight * cross_sensor_loss)
+        )
 
     return {
         "total_loss": total_loss,
         "masked_loss": masked_loss.detach(),
         "context_loss": context_loss.detach(),
         "dynamics_loss": dynamics_loss.detach(),
+        "cross_sensor_loss": cross_sensor_loss.detach(),
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "dynamics_loss_weight": torch.tensor(dynamics_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "cross_sensor_loss_weight": torch.tensor(
+            cross_sensor_loss_weight,
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        ),
         "predict_visible_context": torch.tensor(1 if predict_visible_context else 0, device=total_loss.device),
     }
 
@@ -1520,6 +1705,7 @@ def evaluate(
     masked_loss_total = 0.0
     context_loss_total = 0.0
     dynamics_loss_total = 0.0
+    cross_sensor_loss_total = 0.0
     step_count = 0
     started_at = time.time()
 
@@ -1564,10 +1750,12 @@ def evaluate(
             batch_masked_loss = torch.stack([loss_terms["masked_loss"] for loss_terms in batch_losses]).mean()
             batch_context_loss = torch.stack([loss_terms["context_loss"] for loss_terms in batch_losses]).mean()
             batch_dynamics_loss = torch.stack([loss_terms["dynamics_loss"] for loss_terms in batch_losses]).mean()
+            batch_cross_sensor_loss = torch.stack([loss_terms["cross_sensor_loss"] for loss_terms in batch_losses]).mean()
             loss_total += float(batch_loss.cpu().item())
             masked_loss_total += float(batch_masked_loss.cpu().item())
             context_loss_total += float(batch_context_loss.cpu().item())
             dynamics_loss_total += float(batch_dynamics_loss.cpu().item())
+            cross_sensor_loss_total += float(batch_cross_sensor_loss.cpu().item())
             step_count += 1
 
             if max_batches > 0 and step >= max_batches:
@@ -1578,6 +1766,7 @@ def evaluate(
         masked_loss_total = reduce_scalar_sum(masked_loss_total, device, distributed)
         context_loss_total = reduce_scalar_sum(context_loss_total, device, distributed)
         dynamics_loss_total = reduce_scalar_sum(dynamics_loss_total, device, distributed)
+        cross_sensor_loss_total = reduce_scalar_sum(cross_sensor_loss_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
 
     return {
@@ -1585,6 +1774,7 @@ def evaluate(
         "mean_masked_loss": masked_loss_total / max(step_count, 1),
         "mean_context_loss": context_loss_total / max(step_count, 1),
         "mean_dynamics_loss": dynamics_loss_total / max(step_count, 1),
+        "mean_cross_sensor_loss": cross_sensor_loss_total / max(step_count, 1),
         "step_count": step_count,
         "duration_sec": time.time() - started_at,
         "mask_mode": mask_mode,
@@ -1610,6 +1800,27 @@ def main() -> None:
         dataset = build_dataset(config, section="data")
         loader = make_loader(dataset, config, section="data", distributed=distributed, shuffle=True, drop_last=True)
         loader = maybe_wrap_loader(loader, device, backend)
+        auxiliary_cfg = resolve_auxiliary_data_config(config)
+        auxiliary_dataset = None
+        auxiliary_loader = None
+        if auxiliary_cfg is not None:
+            auxiliary_dataset = build_dataset_from_cfg(auxiliary_cfg)
+            auxiliary_loader_config = deepcopy(config)
+            auxiliary_loader_config["data"] = auxiliary_cfg
+            auxiliary_batch_size = resolve_int_config(
+                auxiliary_cfg.get("batch_size", config["training"].get("auxiliary_batch_size", config["training"]["batch_size"])),
+                default=int(config["training"]["batch_size"]),
+            )
+            auxiliary_loader = make_loader(
+                auxiliary_dataset,
+                auxiliary_loader_config,
+                section="data",
+                distributed=distributed,
+                batch_size=auxiliary_batch_size,
+                shuffle=True,
+                drop_last=True,
+            )
+            auxiliary_loader = maybe_wrap_loader(auxiliary_loader, device, backend)
         eval_cfg = resolve_eval_config(config)
         eval_dataset = None
         eval_loader = None
@@ -1661,8 +1872,9 @@ def main() -> None:
         max_steps_per_epoch = int(config["training"].get("max_steps_per_epoch", 0))
         ema_start = float(config["training"].get("ema_momentum_start", 0.996))
         ema_end = float(config["training"].get("ema_momentum_end", 0.999))
+        steps_schedule = training_steps_schedule(loader, auxiliary_loader, config["training"], epochs)
         steps_per_epoch = len(loader)
-        total_steps = max(1, epochs * max(steps_per_epoch, 1))
+        total_steps = max(1, sum(max(1, int(step_count)) for step_count in steps_schedule))
         start_epoch = 0
         global_step = 0
         epoch_summaries: list[dict] = []
@@ -1734,9 +1946,11 @@ def main() -> None:
                     distributed=distributed,
                     checkpoint_dir=checkpoint_dir,
                     dataset=dataset,
+                    auxiliary_dataset=auxiliary_dataset,
                     eval_dataset=eval_dataset,
                     metrics_path=metrics_path,
                     loader=loader,
+                    auxiliary_loader=auxiliary_loader,
                     eval_loader=eval_loader,
                 ),
             )
@@ -1750,10 +1964,15 @@ def main() -> None:
                     "rows": len(dataset),
                     "base_rows": getattr(dataset, "base_row_count", len(dataset)),
                     "steps_per_epoch": steps_per_epoch,
+                    "steps_schedule": steps_schedule,
                     "checkpoint_dir": str(checkpoint_dir),
                     "eval_rows": len(eval_dataset) if eval_dataset is not None else 0,
                     "eval_base_rows": getattr(eval_dataset, "base_row_count", len(eval_dataset))
                     if eval_dataset is not None
+                    else 0,
+                    "auxiliary_rows": len(auxiliary_dataset) if auxiliary_dataset is not None else 0,
+                    "auxiliary_base_rows": getattr(auxiliary_dataset, "base_row_count", len(auxiliary_dataset))
+                    if auxiliary_dataset is not None
                     else 0,
                     "start_epoch": start_epoch + 1,
                     "manifest_path": str(manifest_path),
@@ -1775,7 +1994,12 @@ def main() -> None:
                     "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset))
                     if eval_dataset is not None
                     else 0,
+                    "auxiliary_row_count": len(auxiliary_dataset) if auxiliary_dataset is not None else 0,
+                    "auxiliary_base_row_count": getattr(auxiliary_dataset, "base_row_count", len(auxiliary_dataset))
+                    if auxiliary_dataset is not None
+                    else 0,
                     "steps_per_epoch": steps_per_epoch,
+                    "steps_schedule": steps_schedule,
                     "epochs": epochs,
                     "start_epoch": start_epoch + 1,
                     "resume_from_checkpoint": resumed_from_checkpoint,
@@ -1786,6 +2010,8 @@ def main() -> None:
 
         for epoch in range(start_epoch, epochs):
             set_loader_epoch(loader, epoch)
+            if auxiliary_loader is not None:
+                set_loader_epoch(auxiliary_loader, epoch)
             if eval_loader is not None:
                 set_loader_epoch(eval_loader, epoch)
             student.train()
@@ -1795,15 +2021,33 @@ def main() -> None:
             running_masked_loss = None
             running_context_loss = None
             running_dynamics_loss = None
+            running_cross_sensor_loss = None
             epoch_loss_total = 0.0
             epoch_masked_loss_total = 0.0
             epoch_context_loss_total = 0.0
             epoch_dynamics_loss_total = 0.0
+            epoch_cross_sensor_loss_total = 0.0
+            epoch_primary_batch_count = 0
+            epoch_auxiliary_batch_count = 0
             epoch_step_count = 0
             epoch_started_at = time.time()
+            epoch_target_steps = steps_schedule[epoch] if epoch < len(steps_schedule) else len(loader)
 
-            for step, batch in enumerate(loader, start=1):
+            for step, (data_source, batch) in enumerate(
+                iter_training_batches(
+                    loader,
+                    auxiliary_loader,
+                    epoch=epoch,
+                    training_cfg=config["training"],
+                    seed=int(config["runtime"].get("seed", 42)),
+                ),
+                start=1,
+            ):
                 batch = move_batch(batch, device, backend)
+                if data_source == "auxiliary":
+                    epoch_auxiliary_batch_count += 1
+                else:
+                    epoch_primary_batch_count += 1
                 mask_spec = sample_mask_spec(student, batch, config)
                 current_lr, current_wd = apply_training_schedules(
                     optimizer,
@@ -1857,6 +2101,7 @@ def main() -> None:
                 detached_masked_loss = loss_terms["masked_loss"]
                 detached_context_loss = loss_terms["context_loss"]
                 detached_dynamics_loss = loss_terms["dynamics_loss"]
+                detached_cross_sensor_loss = loss_terms["cross_sensor_loss"]
                 running_loss = detached_loss if running_loss is None else running_loss + detached_loss
                 running_masked_loss = (
                     detached_masked_loss
@@ -1873,10 +2118,16 @@ def main() -> None:
                     if running_dynamics_loss is None
                     else running_dynamics_loss + detached_dynamics_loss
                 )
+                running_cross_sensor_loss = (
+                    detached_cross_sensor_loss
+                    if running_cross_sensor_loss is None
+                    else running_cross_sensor_loss + detached_cross_sensor_loss
+                )
                 epoch_loss_total += float(detached_loss.cpu().item())
                 epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
                 epoch_context_loss_total += float(detached_context_loss.cpu().item())
                 epoch_dynamics_loss_total += float(detached_dynamics_loss.cpu().item())
+                epoch_cross_sensor_loss_total += float(detached_cross_sensor_loss.cpu().item())
                 epoch_step_count += 1
                 global_step += 1
 
@@ -1897,6 +2148,11 @@ def main() -> None:
                         distributed=distributed,
                         device=device,
                     )
+                    mean_cross_sensor_loss = reduce_scalar_mean(
+                        running_cross_sensor_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
                     if distributed.is_main_process:
                         train_step_metrics = {
                             "event": "train_step",
@@ -1910,6 +2166,7 @@ def main() -> None:
                             "masked_loss": float(mean_masked_loss.cpu().item()),
                             "context_loss": float(mean_context_loss.cpu().item()),
                             "dynamics_loss": float(mean_dynamics_loss.cpu().item()),
+                            "cross_sensor_loss": float(mean_cross_sensor_loss.cpu().item()),
                             "lr": float(current_lr),
                             "weight_decay": float(current_wd),
                             "momentum": float(momentum),
@@ -1918,21 +2175,23 @@ def main() -> None:
                             import torch_xla.core.xla_model as xm
 
                             xm.master_print(
-                                f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
+                                f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
+                                f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f} "
                                 f"momentum={momentum:.6f}"
                             )
                         else:
                             print(
-                                f"epoch={epoch + 1} step={step}/{steps_per_epoch} "
+                                f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
+                                f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f} "
                                 f"momentum={momentum:.6f}"
                             )
@@ -1941,6 +2200,7 @@ def main() -> None:
                     running_masked_loss = None
                     running_context_loss = None
                     running_dynamics_loss = None
+                    running_cross_sensor_loss = None
 
                 if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
                     break
@@ -1950,6 +2210,9 @@ def main() -> None:
             epoch_masked_loss_total = reduce_scalar_sum(epoch_masked_loss_total, device, distributed)
             epoch_context_loss_total = reduce_scalar_sum(epoch_context_loss_total, device, distributed)
             epoch_dynamics_loss_total = reduce_scalar_sum(epoch_dynamics_loss_total, device, distributed)
+            epoch_cross_sensor_loss_total = reduce_scalar_sum(epoch_cross_sensor_loss_total, device, distributed)
+            epoch_primary_batch_count = int(round(reduce_scalar_sum(epoch_primary_batch_count, device, distributed)))
+            epoch_auxiliary_batch_count = int(round(reduce_scalar_sum(epoch_auxiliary_batch_count, device, distributed)))
             epoch_step_count = int(round(reduce_scalar_sum(epoch_step_count, device, distributed)))
             epoch_mean_loss = epoch_loss_total / max(epoch_step_count, 1)
             epoch_summary = {
@@ -1957,11 +2220,16 @@ def main() -> None:
                 "timestamp": time.time(),
                 "elapsed_sec": time.time() - train_started_at,
                 "epoch": epoch + 1,
+                "target_steps": epoch_target_steps,
                 "step_count": epoch_step_count,
                 "mean_loss": epoch_mean_loss,
                 "mean_masked_loss": epoch_masked_loss_total / max(epoch_step_count, 1),
                 "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
                 "mean_dynamics_loss": epoch_dynamics_loss_total / max(epoch_step_count, 1),
+                "mean_cross_sensor_loss": epoch_cross_sensor_loss_total / max(epoch_step_count, 1),
+                "primary_batch_count": epoch_primary_batch_count,
+                "auxiliary_batch_count": epoch_auxiliary_batch_count,
+                "mixed_stage_active": bool(auxiliary_loader is not None and epoch < int(config["training"].get("mixed_stage_epochs", 0))),
                 "duration_sec": epoch_duration_sec,
             }
             if backend == "cuda":
@@ -1984,6 +2252,7 @@ def main() -> None:
                 epoch_summary["validation_mean_masked_loss"] = eval_summary["mean_masked_loss"]
                 epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
                 epoch_summary["validation_mean_dynamics_loss"] = eval_summary["mean_dynamics_loss"]
+                epoch_summary["validation_mean_cross_sensor_loss"] = eval_summary["mean_cross_sensor_loss"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
                 if distributed.is_main_process:
                     print(
@@ -1991,6 +2260,7 @@ def main() -> None:
                         f"validation_masked_loss={eval_summary['mean_masked_loss']:.6f} "
                         f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
                         f"validation_dynamics_loss={eval_summary['mean_dynamics_loss']:.6f} "
+                        f"validation_cross_sensor_loss={eval_summary['mean_cross_sensor_loss']:.6f} "
                         f"validation_steps={eval_summary['step_count']}"
                     )
                 validation_mean_loss = float(eval_summary["mean_loss"])
@@ -2044,11 +2314,16 @@ def main() -> None:
                 },
                 "row_count": len(dataset),
                 "base_row_count": getattr(dataset, "base_row_count", len(dataset)),
+                "auxiliary_row_count": len(auxiliary_dataset) if auxiliary_dataset is not None else 0,
+                "auxiliary_base_row_count": getattr(auxiliary_dataset, "base_row_count", len(auxiliary_dataset))
+                if auxiliary_dataset is not None
+                else 0,
                 "eval_row_count": len(eval_dataset) if eval_dataset is not None else 0,
                 "eval_base_row_count": getattr(eval_dataset, "base_row_count", len(eval_dataset))
                 if eval_dataset is not None
                 else 0,
                 "steps_per_epoch": steps_per_epoch,
+                "steps_schedule": steps_schedule,
                 "epochs": epochs,
                 "global_steps_completed": global_step,
                 "training_duration_sec": time.time() - train_started_at,

@@ -2,7 +2,11 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/workspace/Mineral_Gas_Locator}"
-SCRATCH_ROOT="${SCRATCH_ROOT:-/tmp/ee_interactive_vm_run}"
+DEFAULT_SCRATCH_BASE="$HOME/ee_interactive_scratch"
+if [[ -d /mnt/ewm-data-disk && -w /mnt/ewm-data-disk ]]; then
+  DEFAULT_SCRATCH_BASE="/mnt/ewm-data-disk/ee_interactive_scratch"
+fi
+SCRATCH_ROOT="${SCRATCH_ROOT:-$DEFAULT_SCRATCH_BASE/ee_interactive_vm_run}"
 RAW_DIR="${RAW_DIR:-$SCRATCH_ROOT/raw}"
 PROCESSED_DIR="${PROCESSED_DIR:-$SCRATCH_ROOT/processed}"
 LOG_DIR="${LOG_DIR:-$HOME/bench_logs}"

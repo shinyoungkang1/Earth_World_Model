@@ -21,7 +21,11 @@ require_cmd gcloud
 
 tar -C "$(dirname "$REPO_ROOT")" -czf "$LOCAL_BUNDLE_PATH" \
   --exclude='Mineral_Gas_Locator/.git' \
+  --exclude='Mineral_Gas_Locator/data' \
+  --exclude='Mineral_Gas_Locator/checkpoints' \
   --exclude='Mineral_Gas_Locator/earth_world_model/checkpoints' \
+  --exclude='Mineral_Gas_Locator/results' \
+  --exclude='Mineral_Gas_Locator/models' \
   --exclude='Mineral_Gas_Locator/.venv' \
   "$(basename "$REPO_ROOT")"
 

@@ -83,6 +83,7 @@ class SpatialEncoder(nn.Module):
         use_missing_modality_embeddings: bool = False,
         tokenizer_type: str = "linear",
         tubelet_size: int = 2,
+        separate_sensor_encoders: bool = True,
     ):
         super().__init__()
         self.patch_px = int(patch_px)
@@ -94,34 +95,44 @@ class SpatialEncoder(nn.Module):
         self.use_missing_modality_embeddings = bool(use_missing_modality_embeddings)
         self.tokenizer_type = str(tokenizer_type).lower()
         self.tubelet_size = max(1, int(tubelet_size))
+        self.separate_sensor_encoders = bool(separate_sensor_encoders)
         if self.fusion_mode not in {"early_mean", "late_concat", "cross_attend"}:
             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
         if self.tokenizer_type not in {"linear", "conv2d", "conv3d"}:
             raise ValueError(f"Unsupported tokenizer_type: {self.tokenizer_type}")
 
         self.embed_dim = int(embed_dim)
+        self.s2_proj: nn.Module | None = None
+        self.s1_proj: nn.Module | None = None
+        self.hls_proj: nn.Module | None = None
+        self.joint_proj: nn.Module | None = None
         if self.tokenizer_type == "linear":
             self.s2_proj = SensorProjector(12 * self.patch_px * self.patch_px, embed_dim)
             self.s1_proj = SensorProjector(2 * self.patch_px * self.patch_px, embed_dim)
+            self.joint_proj = SensorProjector(14 * self.patch_px * self.patch_px, embed_dim)
             self.hls_proj = SensorProjector(6 * self.patch_px * self.patch_px, embed_dim)
         elif self.tokenizer_type == "conv2d":
             self.s2_proj = ConvPatchEmbed2D(12, embed_dim, self.patch_px)
             self.s1_proj = ConvPatchEmbed2D(2, embed_dim, self.patch_px)
+            self.joint_proj = ConvPatchEmbed2D(14, embed_dim, self.patch_px)
             self.hls_proj = ConvPatchEmbed2D(6, embed_dim, self.patch_px)
         else:
             self.s2_proj = ConvPatchEmbed3D(12, embed_dim, self.patch_px, self.tubelet_size)
             self.s1_proj = ConvPatchEmbed3D(2, embed_dim, self.patch_px, self.tubelet_size)
+            self.joint_proj = ConvPatchEmbed3D(14, embed_dim, self.patch_px, self.tubelet_size)
             self.hls_proj = ConvPatchEmbed3D(6, embed_dim, self.patch_px, self.tubelet_size)
 
         self.norm = nn.LayerNorm(embed_dim)
         self.s2_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.s1_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.joint_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.hls_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.s2_missing_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.s1_missing_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if self.use_modality_embeddings:
             nn.init.normal_(self.s2_mod_embed, std=1.0e-6)
             nn.init.normal_(self.s1_mod_embed, std=1.0e-6)
+            nn.init.normal_(self.joint_mod_embed, std=1.0e-6)
             nn.init.normal_(self.hls_mod_embed, std=1.0e-6)
         if self.use_missing_modality_embeddings:
             nn.init.normal_(self.s2_missing_embed, std=1.0e-6)
@@ -170,6 +181,8 @@ class SpatialEncoder(nn.Module):
                 mod_embed = self.s1_mod_embed
             elif modality == "hls":
                 mod_embed = self.hls_mod_embed
+            elif modality == "joint":
+                mod_embed = self.joint_mod_embed
             else:
                 raise ValueError(f"Unsupported modality {modality!r}")
             mod_embed = mod_embed.to(device=result.device, dtype=result.dtype)
@@ -196,6 +209,8 @@ class SpatialEncoder(nn.Module):
                 tokens = self.s2_proj(self.patchify(inputs))
             elif modality == "s1":
                 tokens = self.s1_proj(self.patchify(inputs))
+            elif modality == "joint":
+                tokens = self.joint_proj(self.patchify(inputs))
             elif modality == "hls":
                 tokens = self.hls_proj(self.patchify(inputs))
             else:
@@ -205,6 +220,8 @@ class SpatialEncoder(nn.Module):
                 tokens = self.s2_proj(inputs)
             elif modality == "s1":
                 tokens = self.s1_proj(inputs)
+            elif modality == "joint":
+                tokens = self.joint_proj(inputs)
             elif modality == "hls":
                 tokens = self.hls_proj(inputs)
             else:
@@ -221,11 +238,27 @@ class SpatialEncoder(nn.Module):
             tokens = self.s2_proj(inputs)
         elif modality == "s1":
             tokens = self.s1_proj(inputs)
+        elif modality == "joint":
+            tokens = self.joint_proj(inputs)
         elif modality == "hls":
             tokens = self.hls_proj(inputs)
         else:
             raise ValueError(f"Unsupported modality {modality!r}")
         return self._apply_token_enrichments(tokens, modality=modality)
+
+    @staticmethod
+    def _apply_presence_mask_step(inputs: torch.Tensor, present: torch.Tensor | None) -> torch.Tensor:
+        if present is None:
+            return inputs
+        present_mask = present.to(dtype=inputs.dtype, device=inputs.device).view(-1, 1, 1, 1)
+        return inputs * present_mask
+
+    @staticmethod
+    def _apply_presence_mask_sequence(inputs: torch.Tensor, present: torch.Tensor | None) -> torch.Tensor:
+        if present is None:
+            return inputs
+        present_mask = present.to(dtype=inputs.dtype, device=inputs.device).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return inputs * present_mask
 
     def _group_count(self, timesteps: int) -> int:
         timesteps = int(timesteps)
@@ -266,7 +299,7 @@ class SpatialEncoder(nn.Module):
         grid_w = width // self.patch_px
         patch_count = grid_h * grid_w
         token_multiplier = 1
-        if self.input_mode == "s2s1" and self.fusion_mode == "late_concat":
+        if self.input_mode == "s2s1" and self.separate_sensor_encoders and self.fusion_mode == "late_concat":
             token_multiplier = 2
         tokens_per_timestep = patch_count * token_multiplier
         temporal_groups = self._group_count(timesteps)
@@ -319,6 +352,16 @@ class SpatialEncoder(nn.Module):
 
         if s2 is None or s1 is None:
             raise ValueError("s2 and s1 are required when hls is not provided")
+        if not self.separate_sensor_encoders:
+            joint_inputs = torch.cat(
+                [
+                    self._apply_presence_mask_step(s2, s2_present),
+                    self._apply_presence_mask_step(s1, s1_present),
+                ],
+                dim=1,
+            )
+            pieces.append(self._project_step_tokens(joint_inputs, modality="joint"))
+            return pieces
         s2_tokens = self._project_step_tokens(s2, modality="s2")
         s1_tokens = self._project_step_tokens(s1, modality="s1")
         if self.use_missing_modality_embeddings and s2_present is not None:
@@ -348,6 +391,16 @@ class SpatialEncoder(nn.Module):
 
         if s2 is None or s1 is None:
             raise ValueError("s2 and s1 are required when hls is not provided")
+        if not self.separate_sensor_encoders:
+            joint_inputs = torch.cat(
+                [
+                    self._apply_presence_mask_sequence(s2, s2_present),
+                    self._apply_presence_mask_sequence(s1, s1_present),
+                ],
+                dim=2,
+            )
+            pieces.append(self._project_sequence_tokens(joint_inputs, modality="joint"))
+            return pieces
         s2_tokens = self._project_sequence_tokens(s2, modality="s2")
         s1_tokens = self._project_sequence_tokens(s1, modality="s1")
         grouped_s2_present = self.aggregate_temporal_presence(s2_present)
@@ -363,7 +416,7 @@ class SpatialEncoder(nn.Module):
         return pieces
 
     def step_token_template(self, tokens_per_step: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if self.fusion_mode == "late_concat" and self.input_mode == "s2s1":
+        if self.fusion_mode == "late_concat" and self.input_mode == "s2s1" and self.separate_sensor_encoders:
             if tokens_per_step % 2 != 0:
                 raise ValueError(f"Expected even tokens_per_step for s2s1 late_concat, got {tokens_per_step}")
             patch_count = tokens_per_step // 2
@@ -379,6 +432,8 @@ class SpatialEncoder(nn.Module):
         if self.use_modality_embeddings:
             if self.input_mode == "hls6":
                 base = base + self.hls_mod_embed.to(device=device, dtype=dtype)
+            elif self.input_mode == "s2s1" and not self.separate_sensor_encoders:
+                base = base + self.joint_mod_embed.to(device=device, dtype=dtype)
             else:
                 base = base + self.s2_mod_embed.to(device=device, dtype=dtype)
         return base
@@ -386,6 +441,8 @@ class SpatialEncoder(nn.Module):
     def fuse_tokens(self, pieces: list[torch.Tensor]) -> torch.Tensor:
         if not pieces:
             raise ValueError("No modality tokens were provided")
+        if len(pieces) == 1:
+            return pieces[0]
         reference = pieces[0]
         if reference.ndim == 3:
             cat_dim = 1

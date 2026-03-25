@@ -1,7 +1,7 @@
 runtime:
   backend: ${EWM_BACKEND:-cuda}
   seed: 42
-  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_prelim_400_gpu/checkpoints/ssl4eo_zarr_trainval_400_vjepa21_stagec_dense_conv2d_1024_cuda}
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_prelim_400_gpu/checkpoints/ssl4eo_zarr_trainval_400_vjepa21_staged_rope_dense_conv3d_1024_cuda}
   autocast_dtype: float16
 
 data:
@@ -23,7 +23,8 @@ data:
 
 model:
   input_mode: s2s1
-  tokenizer_type: conv2d
+  tokenizer_type: conv3d
+  tubelet_size: 2
   embed_dim: 1024
   patch_px: 16
   temporal_depth: 6

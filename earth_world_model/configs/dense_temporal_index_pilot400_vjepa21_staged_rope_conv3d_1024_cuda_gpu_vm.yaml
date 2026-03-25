@@ -38,9 +38,11 @@ model:
   token_mode: dense
   spatial_fusion: cross_attend
   fusion_num_heads: 8
+  separate_sensor_encoders: true
   use_modality_embeddings: true
   use_patch_positional_encoding: true
   use_missing_modality_embeddings: true
+  use_time_gap_features: true
   temporal_block_type: factorized_rope
   use_rope_temporal_attention: true
   rope_base: 10000.0
@@ -78,6 +80,7 @@ training:
   context_loss_weight: 0.5
   context_loss_distance_weighted: true
   context_loss_sqrt_distance: true
+  cross_sensor_loss_weight: 0.1
   dynamics_loss_weight: 0.1
   dynamics_rollout_horizon: 4
 

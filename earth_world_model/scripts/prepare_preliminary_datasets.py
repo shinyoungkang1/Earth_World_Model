@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,12 +44,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--yearly-train-count", type=int, default=400)
     parser.add_argument("--yearly-val-count", type=int, default=32)
+    parser.add_argument("--yearly-workers", type=int, default=max(1, min(4, (os.cpu_count() or 1))))
     parser.add_argument("--ssl4eo-repo-id", default=DEFAULT_SSL4EO_REPO_ID)
-    parser.add_argument("--ssl4eo-cache-dir", type=Path, default=Path("/tmp/ssl4eo_zarr_downloads"))
+    parser.add_argument("--ssl4eo-cache-dir", type=Path, default=None)
+    parser.add_argument("--ssl4eo-workers", type=int, default=max(1, min(4, (os.cpu_count() or 1))))
     parser.add_argument("--ssl4eo-train-count", type=int, default=400)
     parser.add_argument("--ssl4eo-val-count", type=int, default=128)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def load_converter_module():
+    spec = importlib.util.spec_from_file_location("ee_exact_chip_converter", CONVERTER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load converter module from {CONVERTER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+EE_CONVERTER = load_converter_module()
 
 
 def run_command(cmd: list[str], *, cwd: Path | None = None) -> None:
@@ -79,6 +96,43 @@ def ensure_empty_dir(path: Path, *, overwrite: bool) -> None:
             raise FileExistsError(f"Refusing to overwrite existing directory without --overwrite: {path}")
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def append_parquet_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    incoming = pd.DataFrame(rows)
+    if path.exists():
+        existing = pd.read_parquet(path)
+        combined = pd.concat([existing, incoming], ignore_index=True)
+    else:
+        combined = incoming
+    combined.to_parquet(path, index=False)
+
+
+def load_existing_sample_ids(index_path: Path, sequences_dir: Path) -> set[str]:
+    sample_ids: set[str] = set()
+    if index_path.exists():
+        df = pd.read_parquet(index_path, columns=["sample_id"])
+        sample_ids.update(str(value) for value in df["sample_id"].tolist())
+    if sequences_dir.exists():
+        for sequence_path in sequences_dir.glob("*.npz"):
+            stem = sequence_path.stem
+            if stem.startswith("ee__") and "__" in stem[4:]:
+                sample_part = stem[4:]
+                sample_id = sample_part.rsplit("__", 1)[0]
+                if sample_id:
+                    sample_ids.add(sample_id)
+    return sample_ids
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def load_sample_payload(path: Path) -> dict[str, Any] | None:
@@ -180,69 +234,222 @@ def discover_completed_yearly_samples(raw_roots: list[Path | str]) -> list[dict[
     return [discovered[key] for key in sorted(discovered)]
 
 
-def stage_yearly_split(
+def stage_yearly_record(
     *,
-    records: list[dict[str, Any]],
+    record: dict[str, Any],
     staging_dir: Path,
     overwrite: bool,
-) -> None:
-    ensure_empty_dir(staging_dir, overwrite=overwrite)
-    gcs_client: storage.Client | None = None
-    for record in records:
-        sample_id = str(record["sample_id"])
-        target_dir = staging_dir / sample_id
-        target_dir.mkdir(parents=True, exist_ok=True)
-        source_dir = str(record["source_dir"])
-        if is_gcs_uri(source_dir):
-            if gcs_client is None:
-                gcs_client = storage.Client()
-            bucket_name, prefix = parse_gcs_uri(source_dir)
-            bucket = gcs_client.bucket(bucket_name)
-            for blob in sorted(gcs_client.list_blobs(bucket_name, prefix=gcs_join(prefix, "")), key=lambda item: item.name):
-                if blob.name.endswith("/"):
-                    continue
-                filename = Path(blob.name).name
-                if not filename.endswith(".tif") and not filename.endswith(".json"):
-                    continue
-                blob.download_to_filename(str(target_dir / filename))
-            continue
+    gcs_client: storage.Client | None,
+) -> Path:
+    ensure_dir(staging_dir)
+    sample_id = str(record["sample_id"])
+    target_dir = staging_dir / sample_id
+    expected_tif_count = int(record.get("tif_count", 0))
 
-        source_path = Path(source_dir)
-        for tif_path in sorted(source_path.glob("*.tif")):
-            target_path = target_dir / tif_path.name
+    if target_dir.exists():
+        if overwrite:
+            shutil.rmtree(target_dir)
+        else:
+            tif_count = len(list(target_dir.glob("*.tif")))
+            json_ok = (target_dir / f"{sample_id}.json").exists() or not is_gcs_uri(str(record["source_dir"]))
+            if tif_count >= expected_tif_count and json_ok:
+                return target_dir
+            shutil.rmtree(target_dir)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = str(record["source_dir"])
+    if is_gcs_uri(source_dir):
+        if gcs_client is None:
+            raise RuntimeError("gcs_client is required for gs:// yearly sources")
+        bucket_name, prefix = parse_gcs_uri(source_dir)
+        for blob in sorted(gcs_client.list_blobs(bucket_name, prefix=gcs_join(prefix, "")), key=lambda item: item.name):
+            if blob.name.endswith("/"):
+                continue
+            filename = Path(blob.name).name
+            if not filename.endswith(".tif") and not filename.endswith(".json"):
+                continue
+            blob.download_to_filename(str(target_dir / filename))
+        return target_dir
+
+    source_path = Path(source_dir)
+    for tif_path in sorted(source_path.glob("*.tif")):
+        target_path = target_dir / tif_path.name
+        if not target_path.exists():
             target_path.symlink_to(tif_path)
-        json_path = source_path / f"{sample_id}.json"
-        if json_path.exists():
-            target_json = target_dir / json_path.name
-            if not target_json.exists():
-                target_json.symlink_to(json_path)
+    json_path = source_path / f"{sample_id}.json"
+    if json_path.exists():
+        target_json = target_dir / json_path.name
+        if not target_json.exists():
+            target_json.symlink_to(json_path)
+    return target_dir
 
 
-def convert_yearly_split(
+def process_yearly_record(
     *,
-    input_dir: Path,
+    record: dict[str, Any],
+    staging_dir: Path,
     output_dir: Path,
     year: int,
     chip_size: int,
     overwrite: bool,
-) -> None:
-    ensure_empty_dir(output_dir, overwrite=overwrite)
-    run_command(
-        [
-            sys.executable,
-            str(CONVERTER_PATH),
-            "--input-dir",
-            str(input_dir),
-            "--output-dir",
-            str(output_dir),
-            "--year",
-            str(year),
-            "--chip-size",
-            str(chip_size),
-            "--output-format",
-            "npz",
-        ]
+) -> dict[str, Any]:
+    source_dir = str(record["source_dir"])
+    gcs_client = storage.Client() if is_gcs_uri(source_dir) else None
+    staged_sample_dir = stage_yearly_record(
+        record=record,
+        staging_dir=staging_dir,
+        overwrite=overwrite,
+        gcs_client=gcs_client,
     )
+    sample_id = str(record["sample_id"])
+    tif_paths = sorted(staged_sample_dir.glob("*.tif"))
+    yearly_record = EE_CONVERTER.read_ee_tif_records(
+        sample_id=sample_id,
+        tif_paths=tif_paths,
+        manifests={},
+        locations={},
+        year=int(year),
+        chip_size=int(chip_size),
+    )
+    npz_rows = EE_CONVERTER.write_npz_records(output_dir, [yearly_record])
+    return {
+        "sample_id": sample_id,
+        "npz_rows": npz_rows,
+        "failed_rows": [failure for failure in yearly_record.get("failed_chunks", [])],
+        "normalization_rows": [event for event in yearly_record.get("normalization_events", [])],
+        "staged_sample_dir": str(staged_sample_dir),
+    }
+
+
+def write_yearly_progress(
+    *,
+    progress_path: Path,
+    split_name: str,
+    target_count: int,
+    completed_count: int,
+    sample_id: str | None,
+) -> None:
+    payload = {
+        "split": split_name,
+        "target_count": int(target_count),
+        "completed_count": int(completed_count),
+        "last_completed_sample_id": sample_id,
+    }
+    write_json(progress_path, payload)
+
+
+def convert_yearly_split_incremental(
+    *,
+    records: list[dict[str, Any]],
+    split_name: str,
+    staging_dir: Path,
+    output_dir: Path,
+    year: int,
+    chip_size: int,
+    yearly_workers: int,
+    overwrite: bool,
+) -> dict[str, Any]:
+    if overwrite and output_dir.exists():
+        shutil.rmtree(output_dir)
+    ensure_dir(output_dir)
+    ensure_dir(staging_dir)
+    sequences_dir = output_dir / "sequences"
+    ensure_dir(sequences_dir)
+
+    index_path = output_dir / "dense_temporal_index.parquet"
+    failed_path = output_dir / "failed_chunks.parquet"
+    normalization_path = output_dir / "normalization_events.parquet"
+    progress_path = output_dir / "progress.json"
+
+    completed_sample_ids = load_existing_sample_ids(index_path, sequences_dir)
+    processed = 0
+    skipped = 0
+    pending_records: list[dict[str, Any]] = []
+    for record in records:
+        sample_id = str(record["sample_id"])
+        if sample_id in completed_sample_ids:
+            skipped += 1
+            staged_existing = staging_dir / sample_id
+            if staged_existing.exists():
+                shutil.rmtree(staged_existing)
+            write_yearly_progress(
+                progress_path=progress_path,
+                split_name=split_name,
+                target_count=len(records),
+                completed_count=len(completed_sample_ids),
+                sample_id=sample_id,
+            )
+            continue
+        pending_records.append(record)
+
+    worker_count = max(1, int(yearly_workers))
+    if worker_count == 1:
+        for record in pending_records:
+            result = process_yearly_record(
+                record=record,
+                staging_dir=staging_dir,
+                output_dir=output_dir,
+                year=year,
+                chip_size=chip_size,
+                overwrite=overwrite,
+            )
+            append_parquet_rows(index_path, result["npz_rows"])
+            append_parquet_rows(failed_path, result["failed_rows"])
+            append_parquet_rows(normalization_path, result["normalization_rows"])
+            completed_sample_ids.add(str(result["sample_id"]))
+            processed += 1
+            shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
+            write_yearly_progress(
+                progress_path=progress_path,
+                split_name=split_name,
+                target_count=len(records),
+                completed_count=len(completed_sample_ids),
+                sample_id=str(result["sample_id"]),
+            )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_record = {
+                executor.submit(
+                    process_yearly_record,
+                    record=record,
+                    staging_dir=staging_dir,
+                    output_dir=output_dir,
+                    year=year,
+                    chip_size=chip_size,
+                    overwrite=overwrite,
+                ): record
+                for record in pending_records
+            }
+            for future in concurrent.futures.as_completed(future_to_record):
+                record = future_to_record[future]
+                sample_id = str(record["sample_id"])
+                result = future.result()
+                append_parquet_rows(index_path, result["npz_rows"])
+                append_parquet_rows(failed_path, result["failed_rows"])
+                append_parquet_rows(normalization_path, result["normalization_rows"])
+                completed_sample_ids.add(sample_id)
+                processed += 1
+                shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
+                write_yearly_progress(
+                    progress_path=progress_path,
+                    split_name=split_name,
+                    target_count=len(records),
+                    completed_count=len(completed_sample_ids),
+                    sample_id=sample_id,
+                )
+
+    summary = {
+        "split": split_name,
+        "target_count": int(len(records)),
+        "completed_count": int(len(completed_sample_ids)),
+        "processed_this_run": int(processed),
+        "skipped_existing": int(skipped),
+        "output_dir": str(output_dir),
+        "index_path": str(index_path),
+        "progress_path": str(progress_path),
+    }
+    write_json(output_dir / "summary.json", summary)
+    return summary
 
 
 def write_yearly_selection(selection_path: Path, rows: list[dict[str, Any]]) -> None:
@@ -262,6 +469,51 @@ def ssl4eo_shard_key(path: Path) -> str:
     if name.endswith(".zarr"):
         return name[: -len(".zarr")]
     return path.stem
+
+
+def ssl4eo_target_pair_paths(*, target_root: Path, split: str, filename: str) -> tuple[Path, Path]:
+    return (
+        target_root / split / "S2L2A" / filename,
+        target_root / split / "S1GRD" / filename,
+    )
+
+
+def ssl4eo_pair_exists(*, target_root: Path, split: str, filename: str) -> bool:
+    s2_path, s1_path = ssl4eo_target_pair_paths(target_root=target_root, split=split, filename=filename)
+    return s2_path.exists() and s1_path.exists()
+
+
+def load_ssl4eo_manifest(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    df = pd.read_parquet(path)
+    rows = df.to_dict(orient="records")
+    return {str(row["filename"]): dict(row) for row in rows}
+
+
+def write_ssl4eo_manifest(path: Path, rows: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = [rows[key] for key in sorted(rows)]
+    pd.DataFrame(ordered).to_parquet(path, index=False)
+
+
+def write_ssl4eo_progress(
+    *,
+    progress_path: Path,
+    split: str,
+    target_samples: int,
+    selected_shard_count: int,
+    cumulative_samples: int,
+    last_filename: str | None,
+) -> None:
+    payload = {
+        "split": split,
+        "target_samples": int(target_samples),
+        "selected_shard_count": int(selected_shard_count),
+        "cumulative_samples": int(cumulative_samples),
+        "last_filename": last_filename,
+    }
+    write_json(progress_path, payload)
 
 
 def open_ssl4eo_target(path: Path):
@@ -361,6 +613,33 @@ def download_ssl4eo_shard_pair(
     return paths["S2L2A"], paths["S1GRD"]
 
 
+def materialize_ssl4eo_shard_pair(
+    *,
+    repo_id: str,
+    split: str,
+    filename: str,
+    cache_dir: Path,
+    target_root: Path,
+) -> dict[str, Any]:
+    s2_target, s1_target = ssl4eo_target_pair_paths(target_root=target_root, split=split, filename=filename)
+    if not (s2_target.exists() and s1_target.exists()):
+        s2_target, s1_target = download_ssl4eo_shard_pair(
+            repo_id=repo_id,
+            split=split,
+            filename=filename,
+            cache_dir=cache_dir,
+            target_root=target_root,
+        )
+    stats = count_ssl4eo_samples_for_pair(s2_target, s1_target)
+    return {
+        "filename": filename,
+        "sample_count": int(stats["sample_count"]),
+        "shard_key": ssl4eo_shard_key(s2_target),
+        "s2_path": str(s2_target),
+        "s1_path": str(s1_target),
+    }
+
+
 def prepare_ssl4eo_split(
     *,
     repo_id: str,
@@ -368,6 +647,7 @@ def prepare_ssl4eo_split(
     target_samples: int,
     output_root: Path,
     cache_dir: Path,
+    ssl4eo_workers: int,
 ) -> dict[str, Any]:
     if target_samples <= 0:
         return {
@@ -377,28 +657,106 @@ def prepare_ssl4eo_split(
             "downloaded_shards": [],
         }
     filenames = load_ssl4eo_split_list(repo_id, split, cache_dir)
+    manifest_path = output_root / f"{split}_shards.parquet"
+    progress_path = output_root / f"{split}_progress.json"
+    manifest_rows = load_ssl4eo_manifest(manifest_path)
     downloaded_rows: list[dict[str, Any]] = []
     cumulative = 0
-    for filename in filenames:
-        s2_path, s1_path = download_ssl4eo_shard_pair(
-            repo_id=repo_id,
-            split=split,
-            filename=filename,
-            cache_dir=cache_dir,
-            target_root=output_root,
-        )
-        stats = count_ssl4eo_samples_for_pair(s2_path, s1_path)
-        cumulative += int(stats["sample_count"])
-        downloaded_rows.append(
-            {
-                "filename": filename,
-                "sample_count": int(stats["sample_count"]),
-                "cumulative_samples": int(cumulative),
-                "shard_key": ssl4eo_shard_key(s2_path),
+    worker_count = max(1, int(ssl4eo_workers))
+    idx = 0
+
+    while idx < len(filenames) and cumulative < target_samples:
+        batch: list[str] = []
+        while idx < len(filenames) and len(batch) < worker_count and cumulative < target_samples:
+            filename = filenames[idx]
+            idx += 1
+            existing = manifest_rows.get(filename)
+            if existing and ssl4eo_pair_exists(target_root=output_root, split=split, filename=filename):
+                cumulative += int(existing["sample_count"])
+                downloaded_rows.append(
+                    {
+                        "filename": filename,
+                        "sample_count": int(existing["sample_count"]),
+                        "cumulative_samples": int(cumulative),
+                        "shard_key": str(existing["shard_key"]),
+                    }
+                )
+                write_ssl4eo_progress(
+                    progress_path=progress_path,
+                    split=split,
+                    target_samples=target_samples,
+                    selected_shard_count=len(downloaded_rows),
+                    cumulative_samples=cumulative,
+                    last_filename=filename,
+                )
+            else:
+                batch.append(filename)
+
+        if not batch:
+            continue
+
+        if worker_count == 1:
+            batch_results = {
+                filename: materialize_ssl4eo_shard_pair(
+                    repo_id=repo_id,
+                    split=split,
+                    filename=filename,
+                    cache_dir=cache_dir,
+                    target_root=output_root,
+                )
+                for filename in batch
             }
-        )
-        if cumulative >= target_samples:
-            break
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_filename = {
+                    executor.submit(
+                        materialize_ssl4eo_shard_pair,
+                        repo_id=repo_id,
+                        split=split,
+                        filename=filename,
+                        cache_dir=cache_dir,
+                        target_root=output_root,
+                    ): filename
+                    for filename in batch
+                }
+                batch_results = {
+                    future_to_filename[future]: future.result()
+                    for future in concurrent.futures.as_completed(future_to_filename)
+                }
+
+        for filename in batch:
+            result = batch_results[filename]
+            manifest_rows[filename] = {
+                "filename": filename,
+                "sample_count": int(result["sample_count"]),
+                "shard_key": str(result["shard_key"]),
+                "s2_path": str(result["s2_path"]),
+                "s1_path": str(result["s1_path"]),
+            }
+        write_ssl4eo_manifest(manifest_path, manifest_rows)
+
+        for filename in batch:
+            result = batch_results[filename]
+            cumulative += int(result["sample_count"])
+            downloaded_rows.append(
+                {
+                    "filename": filename,
+                    "sample_count": int(result["sample_count"]),
+                    "cumulative_samples": int(cumulative),
+                    "shard_key": str(result["shard_key"]),
+                }
+            )
+            write_ssl4eo_progress(
+                progress_path=progress_path,
+                split=split,
+                target_samples=target_samples,
+                selected_shard_count=len(downloaded_rows),
+                cumulative_samples=cumulative,
+                last_filename=filename,
+            )
+            if cumulative >= target_samples:
+                break
+
     if cumulative < target_samples:
         raise RuntimeError(
             f"Unable to reach target_samples={target_samples} for split={split}; only collected {cumulative}"
@@ -408,6 +766,8 @@ def prepare_ssl4eo_split(
         "target_samples": int(target_samples),
         "sample_count_real": int(cumulative),
         "downloaded_shard_count": int(len(downloaded_rows)),
+        "manifest_path": str(manifest_path),
+        "progress_path": str(progress_path),
         "downloaded_shards": downloaded_rows,
     }
 
@@ -417,10 +777,15 @@ def main() -> int:
     raw_roots = args.yearly_raw_roots or [DEFAULT_YEARLY_RAW_ROOT]
     output_root = args.output_root.resolve()
     work_dir = args.work_dir.resolve()
+    ssl4eo_cache_dir = (
+        args.ssl4eo_cache_dir.resolve()
+        if args.ssl4eo_cache_dir is not None
+        else (work_dir / "ssl4eo_zarr_downloads").resolve()
+    )
     yearly_root = output_root / args.yearly_name
     ssl4eo_root = output_root / args.ssl4eo_name
     work_dir.mkdir(parents=True, exist_ok=True)
-    args.ssl4eo_cache_dir.mkdir(parents=True, exist_ok=True)
+    ssl4eo_cache_dir.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
 
     completed = discover_completed_yearly_samples(raw_roots)
@@ -435,39 +800,44 @@ def main() -> int:
     yearly_stage_root = work_dir / "yearly_staging"
     train_stage = yearly_stage_root / "train"
     val_stage = yearly_stage_root / "val"
-    stage_yearly_split(records=yearly_train, staging_dir=train_stage, overwrite=args.overwrite)
-    stage_yearly_split(records=yearly_val, staging_dir=val_stage, overwrite=args.overwrite)
-
-    convert_yearly_split(
-        input_dir=train_stage,
+    write_yearly_selection(yearly_root / "train_selection.json", yearly_train)
+    write_yearly_selection(yearly_root / "val_selection.json", yearly_val)
+    yearly_train_summary = convert_yearly_split_incremental(
+        records=yearly_train,
+        split_name="train",
+        staging_dir=train_stage,
         output_dir=yearly_root / "train",
         year=int(args.year),
         chip_size=int(args.chip_size),
+        yearly_workers=int(args.yearly_workers),
         overwrite=args.overwrite,
     )
-    convert_yearly_split(
-        input_dir=val_stage,
+    yearly_val_summary = convert_yearly_split_incremental(
+        records=yearly_val,
+        split_name="val",
+        staging_dir=val_stage,
         output_dir=yearly_root / "val",
         year=int(args.year),
         chip_size=int(args.chip_size),
+        yearly_workers=int(args.yearly_workers),
         overwrite=args.overwrite,
     )
-    write_yearly_selection(yearly_root / "train_selection.json", yearly_train)
-    write_yearly_selection(yearly_root / "val_selection.json", yearly_val)
 
     ssl4eo_train_summary = prepare_ssl4eo_split(
         repo_id=args.ssl4eo_repo_id,
         split="train",
         target_samples=int(args.ssl4eo_train_count),
         output_root=ssl4eo_root,
-        cache_dir=args.ssl4eo_cache_dir,
+        cache_dir=ssl4eo_cache_dir,
+        ssl4eo_workers=int(args.ssl4eo_workers),
     )
     ssl4eo_val_summary = prepare_ssl4eo_split(
         repo_id=args.ssl4eo_repo_id,
         split="val",
         target_samples=int(args.ssl4eo_val_count),
         output_root=ssl4eo_root,
-        cache_dir=args.ssl4eo_cache_dir,
+        cache_dir=ssl4eo_cache_dir,
+        ssl4eo_workers=int(args.ssl4eo_workers),
     )
 
     summary = {
@@ -483,10 +853,12 @@ def main() -> int:
             "val_count": int(len(yearly_val)),
             "train_output": str((yearly_root / "train").resolve()),
             "val_output": str((yearly_root / "val").resolve()),
+            "train_summary": yearly_train_summary,
+            "val_summary": yearly_val_summary,
         },
         "ssl4eo": {
             "repo_id": args.ssl4eo_repo_id,
-            "cache_dir": str(args.ssl4eo_cache_dir.resolve()),
+            "cache_dir": str(ssl4eo_cache_dir),
             "output_root": str(ssl4eo_root.resolve()),
             "train": ssl4eo_train_summary,
             "val": ssl4eo_val_summary,
