@@ -39,6 +39,12 @@ from ewm.data.dataset import (
     SSL4EOZarrDatafluxDataset,
     SSL4EOZarrDataset,
 )
+from ewm.losses import (
+    adaptive_lambda,
+    cramer_wold_sigreg,
+    cross_covariance_loss,
+    vicreg_regularization,
+)
 from ewm.models.world_model import EarthWorldModel
 
 
@@ -121,6 +127,12 @@ class DistributedContext:
     @property
     def is_main_process(self) -> bool:
         return self.rank == 0
+
+
+@dataclass(frozen=True)
+class EmbeddingMetadata:
+    token_mode: str
+    tokens_per_timestep: int
 
 
 def should_use_ssl4eo_shard_sampler(dataset: torch.utils.data.Dataset, data_cfg: dict[str, Any], batch_size: int) -> bool:
@@ -206,6 +218,27 @@ def resolve_int_config(value: Any, *, default: int | None = None) -> int | None:
             return default
         return int(stripped)
     return int(value)
+
+
+def resolve_target_mode(config: dict) -> str:
+    mode = str(config.get("training", {}).get("target_mode", "ema")).strip().lower()
+    if mode not in {"ema", "self"}:
+        raise ValueError(f"Unsupported training.target_mode: {mode}")
+    return mode
+
+
+def resolve_regularization_method(config: dict) -> str:
+    method = str(config.get("regularization", {}).get("method", "none")).strip().lower()
+    if method not in {"none", "sigreg", "vicreg"}:
+        raise ValueError(f"Unsupported regularization.method: {method}")
+    return method
+
+
+def current_embedding_metadata(model: EarthWorldModel) -> EmbeddingMetadata:
+    return EmbeddingMetadata(
+        token_mode=str(model.token_mode),
+        tokens_per_timestep=int(model.last_tokens_per_timestep),
+    )
 
 
 def build_dataset_from_cfg(data_cfg: dict) -> torch.utils.data.Dataset:
@@ -429,18 +462,21 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         token_mode=model_cfg.get("token_mode", "pooled"),
         spatial_fusion=model_cfg.get("spatial_fusion", "early_mean"),
         fusion_num_heads=model_cfg.get("fusion_num_heads", max(1, int(model_cfg["num_heads"]) // 2)),
-        use_modality_embeddings=model_cfg.get("use_modality_embeddings", False),
-        use_patch_positional_encoding=model_cfg.get("use_patch_positional_encoding", False),
-        use_missing_modality_embeddings=model_cfg.get("use_missing_modality_embeddings", False),
+        use_modality_embeddings=resolve_bool_config(model_cfg.get("use_modality_embeddings", False), default=False),
+        use_patch_positional_encoding=resolve_bool_config(model_cfg.get("use_patch_positional_encoding", False), default=False),
+        use_missing_modality_embeddings=resolve_bool_config(model_cfg.get("use_missing_modality_embeddings", False), default=False),
         temporal_block_type=model_cfg.get("temporal_block_type", "standard"),
-        use_rope_temporal_attention=model_cfg.get("use_rope_temporal_attention", False),
+        use_rope_temporal_attention=resolve_bool_config(model_cfg.get("use_rope_temporal_attention", False), default=False),
         rope_base=model_cfg.get("rope_base", 10000.0),
-        use_activation_checkpointing=model_cfg.get("use_activation_checkpointing", False),
+        use_activation_checkpointing=resolve_bool_config(model_cfg.get("use_activation_checkpointing", False), default=False),
         tokenizer_type=model_cfg.get("tokenizer_type", "linear"),
+        tokenizer_mode=model_cfg.get("tokenizer_mode"),
+        auto_2d_max_timesteps=model_cfg.get("auto_2d_max_timesteps", 4),
         tubelet_size=model_cfg.get("tubelet_size", 2),
-        separate_sensor_encoders=model_cfg.get("separate_sensor_encoders", True),
-        use_time_gap_features=model_cfg.get("use_time_gap_features", True),
-        enable_latent_dynamics=model_cfg.get("enable_latent_dynamics", True),
+        separate_sensor_encoders=resolve_bool_config(model_cfg.get("separate_sensor_encoders", True), default=True),
+        use_time_gap_features=resolve_bool_config(model_cfg.get("use_time_gap_features", True), default=True),
+        use_sensor_timing_features=resolve_bool_config(model_cfg.get("use_sensor_timing_features", False), default=False),
+        enable_latent_dynamics=resolve_bool_config(model_cfg.get("enable_latent_dynamics", True), default=True),
         dynamics_hidden_dim=model_cfg.get("dynamics_hidden_dim"),
     )
     return model.to(device)
@@ -456,15 +492,17 @@ class StudentStepModule(torch.nn.Module):
     def forward(
         self,
         batch: dict[str, torch.Tensor],
-        teacher_embeddings: torch.Tensor,
-        teacher_state_sequence: torch.Tensor | None,
+        target_embeddings: torch.Tensor | None,
+        target_state_sequence: torch.Tensor | None,
+        target_metadata: EmbeddingMetadata | None,
         mask_spec: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         device = next(self.student.parameters()).device
         return compute_prediction_losses(
             self.student,
-            teacher_embeddings,
-            teacher_state_sequence,
+            target_embeddings,
+            target_state_sequence,
+            target_metadata,
             batch,
             mask_spec,
             self.backend,
@@ -917,6 +955,24 @@ def scheduled_value(
     return final_value + (peak_value - final_value) * cosine_weight
 
 
+def schedule_fractions_from_cfg(
+    *,
+    total_steps: int,
+    training_cfg: dict[str, Any],
+) -> tuple[float, float]:
+    warmup_steps = resolve_int_config(training_cfg.get("warmup_steps"), default=0) or 0
+    hold_steps = resolve_int_config(training_cfg.get("hold_steps"), default=0) or 0
+    if warmup_steps > 0 or hold_steps > 0:
+        denom = max(int(total_steps) - 1, 1)
+        warmup_fraction = min(max(float(warmup_steps) / float(denom), 0.0), 1.0)
+        remaining = max(1.0 - warmup_fraction, 0.0)
+        hold_fraction = min(max(float(hold_steps) / float(denom), 0.0), remaining)
+        return warmup_fraction, hold_fraction
+    warmup_fraction = float(training_cfg.get("warmup_fraction", 0.0))
+    hold_fraction = float(training_cfg.get("hold_fraction", 0.0))
+    return warmup_fraction, hold_fraction
+
+
 def apply_training_schedules(
     optimizer: torch.optim.Optimizer,
     *,
@@ -926,8 +982,10 @@ def apply_training_schedules(
 ) -> tuple[float, float]:
     progress = global_step / max(total_steps - 1, 1)
     schedule_type = str(training_cfg.get("lr_schedule", "fixed")).lower()
-    warmup_fraction = float(training_cfg.get("warmup_fraction", 0.0))
-    hold_fraction = float(training_cfg.get("hold_fraction", 0.0))
+    warmup_fraction, hold_fraction = schedule_fractions_from_cfg(
+        total_steps=total_steps,
+        training_cfg=training_cfg,
+    )
     lr_start = float(training_cfg.get("start_lr", training_cfg["lr"]))
     lr_peak = float(training_cfg["lr"])
     lr_final = float(training_cfg.get("final_lr", lr_peak))
@@ -1117,7 +1175,7 @@ def sample_mask_spec(
     masking_mode = str(training_cfg.get("masking_mode", "temporal_random")).lower()
     if model.token_mode == "dense" and masking_mode in {"dense_block3d", "block3d"}:
         return dense_block_mask_spec(model, batch, config)
-    if model.spatial.tokenizer_type == "conv3d":
+    if model.spatial.resolve_tokenizer_type(int(batch["dates"].shape[1])) == "conv3d":
         raise ValueError("Conv3d tubelet tokenizers require training.masking_mode=dense_block3d")
     visible_idx, masked_idx = temporal_mask_indices(
         batch["dates"].shape[1],
@@ -1148,37 +1206,41 @@ def student_visible_embeddings(
         valid[:, visible_idx],
         s2_present=None if batch.get("s2_present") is None else batch["s2_present"][:, visible_idx],
         s1_present=None if batch.get("s1_present") is None else batch["s1_present"][:, visible_idx],
+        s2_dates=None if batch.get("s2_dates") is None else batch["s2_dates"][:, visible_idx],
+        s1_dates=None if batch.get("s1_dates") is None else batch["s1_dates"][:, visible_idx],
         hls=None if hls is None else hls[:, visible_idx],
     )
 
 
-def compute_teacher_embeddings(
-    teacher: EarthWorldModel,
+def compute_target_embeddings(
+    model: EarthWorldModel,
     batch: dict[str, torch.Tensor],
     config: dict,
 ) -> torch.Tensor:
     return_hierarchical = bool(config["model"].get("hierarchical_layers"))
-    return teacher.encode_timeline(
+    return model.encode_timeline(
         batch.get("s2"),
         batch.get("s1"),
         batch["dates"],
         batch["mask"],
         s2_present=batch.get("s2_present"),
         s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
         hls=batch.get("hls"),
         return_hierarchical=return_hierarchical,
     )
 
 
-def compute_teacher_state_sequence(
-    teacher: EarthWorldModel,
+def compute_target_state_sequence(
+    model: EarthWorldModel,
     batch: dict[str, torch.Tensor],
     config: dict,
 ) -> torch.Tensor | None:
     dynamics_loss_weight = float(config["training"].get("dynamics_loss_weight", 0.0))
-    if dynamics_loss_weight <= 0.0 or teacher.latent_rollout_head is None:
+    if dynamics_loss_weight <= 0.0 or model.latent_rollout_head is None:
         return None
-    return teacher.encode_state_sequence(
+    return model.encode_state_sequence(
         batch.get("s2"),
         batch.get("s1"),
         batch["dates"],
@@ -1186,13 +1248,37 @@ def compute_teacher_state_sequence(
         hls=batch.get("hls"),
         s2_present=batch.get("s2_present"),
         s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
     )[0]
+
+
+def compute_online_embeddings(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    *,
+    return_hierarchical: bool = False,
+) -> tuple[torch.Tensor, EmbeddingMetadata]:
+    embeddings = model.encode_timeline(
+        batch.get("s2"),
+        batch.get("s1"),
+        batch["dates"],
+        batch["mask"],
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
+        hls=batch.get("hls"),
+        return_hierarchical=return_hierarchical,
+    )
+    return embeddings, current_embedding_metadata(model)
 
 
 def compute_masked_prediction_loss(
     student: EarthWorldModel,
-    teacher_embeddings: torch.Tensor,
-    teacher_state_sequence: torch.Tensor | None,
+    target_embeddings: torch.Tensor | None,
+    target_state_sequence: torch.Tensor | None,
+    target_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
     backend: str,
@@ -1201,8 +1287,9 @@ def compute_masked_prediction_loss(
 ) -> torch.Tensor:
     loss_terms = compute_prediction_losses(
         student,
-        teacher_embeddings,
-        teacher_state_sequence,
+        target_embeddings,
+        target_state_sequence,
+        target_metadata,
         batch,
         mask_spec,
         backend,
@@ -1259,32 +1346,33 @@ def expand_context_weights_for_tokens(weights: torch.Tensor | None, tokens_per_t
     return weights.repeat_interleave(tokens_per_timestep)
 
 
-def select_teacher_targets(
-    teacher: EarthWorldModel,
-    teacher_embeddings: torch.Tensor,
+def select_target_embeddings(
+    reference_model: EarthWorldModel,
+    target_embeddings: torch.Tensor,
+    target_metadata: EmbeddingMetadata,
     step_idx: torch.Tensor | None = None,
     token_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if token_idx is not None:
-        if teacher.token_mode != "dense":
+        if target_metadata.token_mode != "dense":
             raise ValueError("token_idx selection is only supported for dense token mode")
-        return teacher_embeddings[:, token_idx, :]
+        return target_embeddings[:, token_idx, :]
     if step_idx is None:
         raise ValueError("Either step_idx or token_idx must be provided")
-    if teacher.token_mode != "dense":
-        return teacher_embeddings[:, step_idx, :]
-    tokens_per_timestep = teacher.last_tokens_per_timestep
+    if target_metadata.token_mode != "dense":
+        return target_embeddings[:, step_idx, :]
+    tokens_per_timestep = int(target_metadata.tokens_per_timestep)
     token_indices = [
         torch.arange(
             int(step.item()) * tokens_per_timestep,
             (int(step.item()) + 1) * tokens_per_timestep,
-            device=teacher_embeddings.device,
+            device=target_embeddings.device,
             dtype=torch.long,
         )
         for step in step_idx
     ]
     gathered = torch.cat(token_indices, dim=0)
-    return teacher_embeddings[:, gathered, :]
+    return target_embeddings[:, gathered, :]
 
 
 def _pool_patch_validity(valid_mask: torch.Tensor, patch_px: int) -> torch.Tensor:
@@ -1314,20 +1402,20 @@ def _combine_loss_weights(
 
 
 def _dense_all_token_target_weights(
-    teacher: EarthWorldModel,
+    reference_model: EarthWorldModel,
     batch: dict[str, torch.Tensor],
+    tokens_per_timestep: int,
 ) -> torch.Tensor | None:
-    patch_px = int(teacher.spatial.patch_px)
-    fusion_mode = str(teacher.spatial.fusion_mode)
-    input_mode = str(teacher.input_mode)
-    tokens_per_timestep = int(teacher.last_tokens_per_timestep)
-    grouped_dates = teacher.spatial.aggregate_temporal_dates(batch["dates"])
+    patch_px = int(reference_model.spatial.patch_px)
+    fusion_mode = str(reference_model.spatial.fusion_mode)
+    input_mode = str(reference_model.input_mode)
+    grouped_dates = reference_model.spatial.aggregate_temporal_dates(batch["dates"])
     grouped_steps = int(grouped_dates.shape[1])
 
-    s2_valid_mask = teacher.spatial.aggregate_temporal_valid_mask(batch.get("s2_valid_mask"))
-    s1_valid_mask = teacher.spatial.aggregate_temporal_valid_mask(batch.get("s1_valid_mask"))
-    s2_present = teacher.spatial.aggregate_temporal_presence(batch.get("s2_present"))
-    s1_present = teacher.spatial.aggregate_temporal_presence(batch.get("s1_present"))
+    s2_valid_mask = reference_model.spatial.aggregate_temporal_valid_mask(batch.get("s2_valid_mask"))
+    s1_valid_mask = reference_model.spatial.aggregate_temporal_valid_mask(batch.get("s1_valid_mask"))
+    s2_present = reference_model.spatial.aggregate_temporal_presence(batch.get("s2_present"))
+    s1_present = reference_model.spatial.aggregate_temporal_presence(batch.get("s1_present"))
 
     if input_mode == "s2s1" and fusion_mode == "late_concat":
         token_pieces: list[torch.Tensor] = []
@@ -1351,7 +1439,7 @@ def _dense_all_token_target_weights(
     if s2_valid_mask is not None:
         return _pool_patch_validity(s2_valid_mask, patch_px).reshape(batch["dates"].shape[0], grouped_steps * tokens_per_timestep)
 
-    mask = teacher.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    mask = reference_model.spatial.aggregate_temporal_boolean(batch.get("mask"))
     if mask is None:
         return None
     repeated = mask.to(dtype=torch.float32)
@@ -1360,31 +1448,36 @@ def _dense_all_token_target_weights(
     return repeated
 
 
-def select_teacher_target_weights(
-    teacher: EarthWorldModel,
+def select_target_weights(
+    reference_model: EarthWorldModel,
     batch: dict[str, torch.Tensor],
+    target_metadata: EmbeddingMetadata,
     step_idx: torch.Tensor | None = None,
     token_idx: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if token_idx is not None:
-        if teacher.token_mode != "dense":
+        if target_metadata.token_mode != "dense":
             raise ValueError("token_idx selection is only supported for dense token mode")
-        weights = _dense_all_token_target_weights(teacher, batch)
+        weights = _dense_all_token_target_weights(
+            reference_model,
+            batch,
+            int(target_metadata.tokens_per_timestep),
+        )
         if weights is None:
             return None
         return weights[:, token_idx]
     if step_idx is None:
         raise ValueError("Either step_idx or token_idx must be provided")
-    if teacher.token_mode != "dense":
+    if target_metadata.token_mode != "dense":
         mask = batch.get("mask")
         if mask is None:
             return None
         return mask[:, step_idx].to(dtype=torch.float32)
-    tokens_per_timestep = int(teacher.last_tokens_per_timestep)
-    weights = _dense_all_token_target_weights(teacher, batch)
+    tokens_per_timestep = int(target_metadata.tokens_per_timestep)
+    weights = _dense_all_token_target_weights(reference_model, batch, tokens_per_timestep)
     if weights is None:
         return None
-    grouped_dates = teacher.spatial.aggregate_temporal_dates(batch["dates"])
+    grouped_dates = reference_model.spatial.aggregate_temporal_dates(batch["dates"])
     reshaped = weights.reshape(batch["dates"].shape[0], grouped_dates.shape[1], tokens_per_timestep)
     return reshaped[:, step_idx].reshape(batch["dates"].shape[0], -1)
 
@@ -1413,6 +1506,137 @@ def weighted_embedding_mse(
     return weighted_errors.sum() / normalizer
 
 
+def _all_embedding_weights(
+    reference_model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    embedding_metadata: EmbeddingMetadata,
+) -> torch.Tensor | None:
+    if embedding_metadata.token_mode == "dense":
+        return _dense_all_token_target_weights(
+            reference_model,
+            batch,
+            int(embedding_metadata.tokens_per_timestep),
+        )
+    mask = batch.get("mask")
+    if mask is None:
+        return None
+    return mask.to(dtype=torch.float32)
+
+
+def _flatten_regularization_rows(
+    embeddings: torch.Tensor,
+    weights: torch.Tensor | None,
+    *,
+    max_samples: int = 0,
+) -> torch.Tensor:
+    flat = embeddings.reshape(-1, embeddings.shape[-1])
+    if weights is None:
+        rows = flat
+    else:
+        valid = weights.reshape(-1) > 0
+        if not torch.any(valid):
+            return flat.new_zeros((0, flat.shape[-1]))
+        rows = flat[valid]
+    if max_samples > 0 and rows.shape[0] > max_samples:
+        sample_idx = torch.randperm(rows.shape[0], device=rows.device)[:max_samples]
+        rows = rows[sample_idx]
+    return rows
+
+
+def _resolve_subspace_dims(
+    reg_cfg: dict[str, Any],
+    embed_dim: int,
+) -> tuple[int, int, int]:
+    dims_cfg = reg_cfg.get("split_dims", {})
+    s1_private = int(dims_cfg.get("s1_private", 0))
+    shared = int(dims_cfg.get("shared", 0))
+    s2_private = int(dims_cfg.get("s2_private", 0))
+    if min(s1_private, shared, s2_private) < 0:
+        raise ValueError(f"split_dims must be non-negative, got {(s1_private, shared, s2_private)}")
+    if s1_private + shared + s2_private != int(embed_dim):
+        raise ValueError(
+            f"split_dims {(s1_private, shared, s2_private)} do not sum to embed_dim={embed_dim}"
+        )
+    return s1_private, shared, s2_private
+
+
+def compute_regularization_losses(
+    reference_model: EarthWorldModel,
+    embeddings: torch.Tensor | None,
+    embedding_metadata: EmbeddingMetadata | None,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if embeddings is None or embedding_metadata is None:
+        reference = next(reference_model.parameters())
+        zero = reference.new_zeros(())
+        return zero, zero
+
+    reg_cfg = config.get("regularization", {})
+    method = resolve_regularization_method(config)
+    if method == "none":
+        zero = embeddings.new_zeros(())
+        return zero, zero
+
+    mode = str(reg_cfg.get("mode", "per_subspace")).strip().lower()
+    if mode not in {"per_subspace", "global"}:
+        raise ValueError(f"Unsupported regularization.mode: {mode}")
+
+    max_samples = int(reg_cfg.get("max_samples", 0))
+    token_weights = _all_embedding_weights(reference_model, batch, embedding_metadata)
+    rows = _flatten_regularization_rows(embeddings, token_weights, max_samples=max_samples)
+    zero = embeddings.new_zeros(())
+    if rows.shape[0] < 2:
+        return zero, zero
+
+    base_lambda = float(reg_cfg.get("base_lambda", 1.0))
+    adaptive_alpha = float(reg_cfg.get("adaptive_alpha", 1.0))
+    n_projections = int(reg_cfg.get("n_projections", 1024))
+    crosscov_mu = float(reg_cfg.get("crosscov_mu", 0.0))
+    vicreg_variance_target = float(reg_cfg.get("vicreg_variance_target", 1.0))
+    vicreg_variance_epsilon = float(reg_cfg.get("vicreg_variance_epsilon", 1.0e-4))
+    vicreg_variance_weight = float(reg_cfg.get("vicreg_variance_weight", 25.0))
+    vicreg_covariance_weight = float(reg_cfg.get("vicreg_covariance_weight", 1.0))
+
+    def regularize_subspace(z: torch.Tensor) -> torch.Tensor:
+        if z.shape[1] < 1:
+            return zero
+        if method == "sigreg":
+            reg_loss, ep_statistic = cramer_wold_sigreg(z, n_projections=n_projections)
+            lambda_value = adaptive_lambda(base_lambda, adaptive_alpha, ep_statistic)
+            return lambda_value * reg_loss
+        reg_loss, _variance_loss, _covariance_loss = vicreg_regularization(
+            z,
+            variance_target=vicreg_variance_target,
+            variance_epsilon=vicreg_variance_epsilon,
+            variance_weight=vicreg_variance_weight,
+            covariance_weight=vicreg_covariance_weight,
+        )
+        return reg_loss * rows.new_tensor(base_lambda)
+
+    if mode == "global":
+        return regularize_subspace(rows), zero
+
+    s1_private_dim, shared_dim, s2_private_dim = _resolve_subspace_dims(reg_cfg, rows.shape[1])
+    s1_private = rows[:, :s1_private_dim]
+    shared = rows[:, s1_private_dim : s1_private_dim + shared_dim]
+    s2_private = rows[:, s1_private_dim + shared_dim : s1_private_dim + shared_dim + s2_private_dim]
+
+    regularization_loss = (
+        regularize_subspace(s1_private)
+        + regularize_subspace(shared)
+        + regularize_subspace(s2_private)
+    )
+
+    crosscov_penalty = zero
+    if crosscov_mu > 0.0 and shared_dim > 0:
+        if s1_private_dim > 0:
+            crosscov_penalty = crosscov_penalty + (crosscov_mu * cross_covariance_loss(shared, s1_private))
+        if s2_private_dim > 0:
+            crosscov_penalty = crosscov_penalty + (crosscov_mu * cross_covariance_loss(shared, s2_private))
+    return regularization_loss + crosscov_penalty, crosscov_penalty
+
+
 def compute_dynamics_rollout_loss(
     student: EarthWorldModel,
     teacher_state_sequence: torch.Tensor | None,
@@ -1432,11 +1656,25 @@ def compute_dynamics_rollout_loss(
         hls=batch.get("hls"),
         s2_present=batch.get("s2_present"),
         s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
     )
     rollout_horizon = min(int(horizon), student_states.shape[1] - 1)
     if rollout_horizon <= 0:
         return None
-    predicted = student.rollout_state_predictions(student_states, grouped_dates, horizon=rollout_horizon)
+    grouped_s2_dates = (
+        None if batch.get("s2_dates") is None else student.spatial.aggregate_temporal_dates(batch["s2_dates"])
+    )
+    grouped_s1_dates = (
+        None if batch.get("s1_dates") is None else student.spatial.aggregate_temporal_dates(batch["s1_dates"])
+    )
+    predicted = student.rollout_state_predictions(
+        student_states,
+        grouped_dates,
+        horizon=rollout_horizon,
+        s2_dates=grouped_s2_dates,
+        s1_dates=grouped_s1_dates,
+    )
     start_count = student_states.shape[1] - rollout_horizon
     target = torch.stack(
         [teacher_state_sequence[:, step + 1 : step + 1 + start_count, :] for step in range(rollout_horizon)],
@@ -1469,6 +1707,8 @@ def compute_cross_sensor_alignment_loss(
         return None
     s2_present = batch.get("s2_present")
     s1_present = batch.get("s1_present")
+    s2_dates = batch.get("s2_dates")
+    s1_dates = batch.get("s1_dates")
     paired_weights = None
     grouped_s2_present = student.spatial.aggregate_temporal_presence(s2_present)
     grouped_s1_present = student.spatial.aggregate_temporal_presence(s1_present)
@@ -1480,6 +1720,18 @@ def compute_cross_sensor_alignment_loss(
             paired_weights = grouped_mask.to(torch.float32)
     if paired_weights is None or float(paired_weights.sum().detach().cpu().item()) <= 0.0:
         return None
+    training_cfg = config.get("training", {})
+    use_time_proximity = resolve_bool_config(training_cfg.get("cross_sensor_time_proximity", False), default=False)
+    if use_time_proximity and s2_dates is not None and s1_dates is not None:
+        grouped_s2_dates = student.spatial.aggregate_temporal_dates(s2_dates).to(torch.float32)
+        grouped_s1_dates = student.spatial.aggregate_temporal_dates(s1_dates).to(torch.float32)
+        valid_pair = (grouped_s2_dates > 0) & (grouped_s1_dates > 0)
+        decay_days = max(1.0, float(training_cfg.get("cross_sensor_time_scale_days", 7.0)))
+        day_delta = torch.abs(grouped_s2_dates - grouped_s1_dates)
+        proximity = torch.exp(-day_delta / decay_days)
+        paired_weights = paired_weights * proximity * valid_pair.to(torch.float32)
+    if float(paired_weights.sum().detach().cpu().item()) <= 0.0:
+        return None
 
     s2_only_states, _ = student.encode_state_sequence(
         s2,
@@ -1488,6 +1740,8 @@ def compute_cross_sensor_alignment_loss(
         batch["mask"],
         s2_present=s2_present,
         s1_present=None if s1_present is None else torch.zeros_like(s1_present, dtype=torch.bool),
+        s2_dates=s2_dates,
+        s1_dates=None if s1_dates is None else torch.full_like(s1_dates, -1),
     )
     s1_only_states, _ = student.encode_state_sequence(
         torch.zeros_like(s2),
@@ -1496,14 +1750,17 @@ def compute_cross_sensor_alignment_loss(
         batch["mask"],
         s2_present=None if s2_present is None else torch.zeros_like(s2_present, dtype=torch.bool),
         s1_present=s1_present,
+        s2_dates=None if s2_dates is None else torch.full_like(s2_dates, -1),
+        s1_dates=s1_dates,
     )
     return weighted_embedding_mse(s2_only_states, s1_only_states, weights=paired_weights)
 
 
 def compute_prediction_losses(
     student: EarthWorldModel,
-    teacher_embeddings: torch.Tensor,
-    teacher_state_sequence: torch.Tensor | None,
+    target_embeddings: torch.Tensor | None,
+    target_state_sequence: torch.Tensor | None,
+    target_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
     backend: str,
@@ -1512,6 +1769,8 @@ def compute_prediction_losses(
 ) -> dict[str, torch.Tensor]:
     dates = batch["dates"]
     training_cfg = config["training"]
+    target_mode = resolve_target_mode(config)
+    regularization_method = resolve_regularization_method(config)
     predict_visible_context = bool(training_cfg.get("predict_visible_context", False))
     context_loss_weight = float(training_cfg.get("context_loss_weight", 0.0))
     context_loss_distance_weighted = bool(training_cfg.get("context_loss_distance_weighted", False))
@@ -1521,6 +1780,48 @@ def compute_prediction_losses(
     mask_mode = str(mask_spec.get("mode", "temporal")).lower()
 
     with maybe_autocast(backend, device, config):
+        target_embeddings_local = target_embeddings
+        target_state_sequence_local = target_state_sequence
+        target_metadata_local = target_metadata
+        regularization_source_embeddings = None
+        regularization_source_metadata = None
+        return_hierarchical_targets = bool(config["model"].get("hierarchical_layers"))
+
+        if target_mode == "self":
+            if return_hierarchical_targets:
+                online_target_embeddings, target_metadata_local = compute_online_embeddings(
+                    student,
+                    batch,
+                    return_hierarchical=True,
+                )
+                target_embeddings_local = online_target_embeddings.detach()
+            else:
+                online_target_embeddings, target_metadata_local = compute_online_embeddings(
+                    student,
+                    batch,
+                    return_hierarchical=False,
+                )
+                target_embeddings_local = online_target_embeddings.detach()
+                if regularization_method != "none":
+                    regularization_source_embeddings = online_target_embeddings
+                    regularization_source_metadata = target_metadata_local
+            if dynamics_loss_weight > 0.0:
+                online_state_sequence = compute_target_state_sequence(student, batch, config)
+                target_state_sequence_local = None if online_state_sequence is None else online_state_sequence.detach()
+
+        if regularization_method != "none" and regularization_source_embeddings is None:
+            regularization_source_embeddings, regularization_source_metadata = compute_online_embeddings(
+                student,
+                batch,
+                return_hierarchical=False,
+            )
+
+        if target_embeddings_local is None or target_metadata_local is None:
+            raise ValueError(
+                f"Missing target embeddings for training.target_mode={target_mode}. "
+                "EMA runs must provide target embeddings; self runs should synthesize them."
+            )
+
         if mask_mode == "dense_block3d":
             visible_token_idx = mask_spec["visible_idx"]
             masked_token_idx = mask_spec["masked_idx"]
@@ -1535,6 +1836,8 @@ def compute_prediction_losses(
                 hls=batch.get("hls"),
                 s2_present=batch.get("s2_present"),
                 s1_present=batch.get("s1_present"),
+                s2_dates=batch.get("s2_dates"),
+                s1_dates=batch.get("s1_dates"),
                 token_indices=visible_token_idx,
             )
             predicted_visible, predicted_masked = student.predict_with_context_tokens(
@@ -1545,23 +1848,26 @@ def compute_prediction_losses(
                 visible_token_indices=visible_token_idx,
                 masked_token_indices=masked_token_idx,
             )
-            masked_target = select_teacher_targets(
+            masked_target = select_target_embeddings(
                 student,
-                teacher_embeddings,
+                target_embeddings_local,
+                target_metadata_local,
                 token_idx=masked_token_idx,
             ).detach()
-            masked_weights = select_teacher_target_weights(
+            masked_weights = select_target_weights(
                 student,
                 batch,
+                target_metadata_local,
                 token_idx=masked_token_idx,
             )
             masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
 
             context_loss = torch.zeros_like(masked_loss)
             if predict_visible_context and visible_token_idx.numel() > 0 and context_loss_weight > 0.0:
-                context_target = select_teacher_targets(
+                context_target = select_target_embeddings(
                     student,
-                    teacher_embeddings,
+                    target_embeddings_local,
+                    target_metadata_local,
                     token_idx=visible_token_idx,
                 ).detach()
                 context_weights = None
@@ -1573,9 +1879,10 @@ def compute_prediction_losses(
                         dtype=predicted_visible.dtype,
                         sqrt_distance=context_loss_sqrt_distance,
                     )
-                context_target_weights = select_teacher_target_weights(
+                context_target_weights = select_target_weights(
                     student,
                     batch,
+                    target_metadata_local,
                     token_idx=visible_token_idx,
                 )
                 context_weights = _combine_loss_weights(context_target_weights, context_weights)
@@ -1589,13 +1896,23 @@ def compute_prediction_losses(
                 dates[:, visible_idx],
                 dates[:, masked_idx],
             )
-            masked_target = select_teacher_targets(student, teacher_embeddings, step_idx=masked_idx).detach()
-            masked_weights = select_teacher_target_weights(student, batch, step_idx=masked_idx)
+            masked_target = select_target_embeddings(
+                student,
+                target_embeddings_local,
+                target_metadata_local,
+                step_idx=masked_idx,
+            ).detach()
+            masked_weights = select_target_weights(student, batch, target_metadata_local, step_idx=masked_idx)
             masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
 
             context_loss = torch.zeros_like(masked_loss)
             if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
-                context_target = select_teacher_targets(student, teacher_embeddings, step_idx=visible_idx).detach()
+                context_target = select_target_embeddings(
+                    student,
+                    target_embeddings_local,
+                    target_metadata_local,
+                    step_idx=visible_idx,
+                ).detach()
                 context_weights = None
                 if context_loss_distance_weighted:
                     context_weights = temporal_context_weights(
@@ -1606,7 +1923,7 @@ def compute_prediction_losses(
                         sqrt_distance=context_loss_sqrt_distance,
                     )
                     context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
-                context_target_weights = select_teacher_target_weights(student, batch, step_idx=visible_idx)
+                context_target_weights = select_target_weights(student, batch, target_metadata_local, step_idx=visible_idx)
                 context_weights = _combine_loss_weights(context_target_weights, context_weights)
                 context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
 
@@ -1614,7 +1931,7 @@ def compute_prediction_losses(
         if dynamics_loss_weight > 0.0:
             maybe_dynamics_loss = compute_dynamics_rollout_loss(
                 student,
-                teacher_state_sequence,
+                target_state_sequence_local,
                 batch,
                 config,
             )
@@ -1627,11 +1944,19 @@ def compute_prediction_losses(
             if maybe_cross_sensor_loss is not None:
                 cross_sensor_loss = maybe_cross_sensor_loss
 
+        regularization_loss, crosscov_penalty = compute_regularization_losses(
+            student,
+            regularization_source_embeddings,
+            regularization_source_metadata,
+            batch,
+            config,
+        )
         total_loss = (
             masked_loss
             + (context_loss_weight * context_loss)
             + (dynamics_loss_weight * dynamics_loss)
             + (cross_sensor_loss_weight * cross_sensor_loss)
+            + regularization_loss
         )
 
     return {
@@ -1640,6 +1965,8 @@ def compute_prediction_losses(
         "context_loss": context_loss.detach(),
         "dynamics_loss": dynamics_loss.detach(),
         "cross_sensor_loss": cross_sensor_loss.detach(),
+        "regularization_loss": regularization_loss.detach(),
+        "crosscov_penalty": crosscov_penalty.detach(),
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "dynamics_loss_weight": torch.tensor(dynamics_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "cross_sensor_loss_weight": torch.tensor(
@@ -1654,8 +1981,9 @@ def compute_prediction_losses(
 def compute_student_loss_terms(
     student: EarthWorldModel,
     student_stepper: torch.nn.Module | None,
-    teacher_embeddings: torch.Tensor,
-    teacher_state_sequence: torch.Tensor | None,
+    target_embeddings: torch.Tensor | None,
+    target_state_sequence: torch.Tensor | None,
+    target_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
     backend: str,
@@ -1663,8 +1991,18 @@ def compute_student_loss_terms(
     config: dict,
 ) -> dict[str, torch.Tensor]:
     if student_stepper is not None:
-        return student_stepper(batch, teacher_embeddings, teacher_state_sequence, mask_spec)
-    return compute_prediction_losses(student, teacher_embeddings, teacher_state_sequence, batch, mask_spec, backend, device, config)
+        return student_stepper(batch, target_embeddings, target_state_sequence, target_metadata, mask_spec)
+    return compute_prediction_losses(
+        student,
+        target_embeddings,
+        target_state_sequence,
+        target_metadata,
+        batch,
+        mask_spec,
+        backend,
+        device,
+        config,
+    )
 
 
 def resolve_eval_config(config: dict) -> dict | None:
@@ -1686,7 +2024,7 @@ def resolve_eval_config(config: dict) -> dict | None:
 def evaluate(
     student: EarthWorldModel,
     student_stepper: torch.nn.Module | None,
-    teacher: EarthWorldModel,
+    teacher: EarthWorldModel | None,
     loader: DataLoader,
     backend: str,
     device: torch.device,
@@ -1699,21 +2037,29 @@ def evaluate(
     student.eval()
     if student_stepper is not None:
         student_stepper.eval()
-    teacher.eval()
+    if teacher is not None:
+        teacher.eval()
 
     loss_total = 0.0
     masked_loss_total = 0.0
     context_loss_total = 0.0
     dynamics_loss_total = 0.0
     cross_sensor_loss_total = 0.0
+    regularization_loss_total = 0.0
+    crosscov_penalty_total = 0.0
     step_count = 0
     started_at = time.time()
 
     with torch.no_grad():
         for step, batch in enumerate(loader, start=1):
             batch = move_batch(batch, device, backend)
-            teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
-            teacher_state_sequence = compute_teacher_state_sequence(teacher, batch, config)
+            target_embeddings = None
+            target_state_sequence = None
+            target_metadata = None
+            if teacher is not None:
+                target_embeddings = compute_target_embeddings(teacher, batch, config)
+                target_metadata = current_embedding_metadata(teacher)
+                target_state_sequence = compute_target_state_sequence(teacher, batch, config)
 
             if mask_mode == "all":
                 masking_mode = str(config["training"].get("masking_mode", "temporal_random")).lower()
@@ -1736,8 +2082,9 @@ def evaluate(
                 compute_student_loss_terms(
                     student,
                     student_stepper,
-                    teacher_embeddings,
-                    teacher_state_sequence,
+                    target_embeddings,
+                    target_state_sequence,
+                    target_metadata,
                     batch,
                     mask_spec,
                     backend,
@@ -1751,11 +2098,15 @@ def evaluate(
             batch_context_loss = torch.stack([loss_terms["context_loss"] for loss_terms in batch_losses]).mean()
             batch_dynamics_loss = torch.stack([loss_terms["dynamics_loss"] for loss_terms in batch_losses]).mean()
             batch_cross_sensor_loss = torch.stack([loss_terms["cross_sensor_loss"] for loss_terms in batch_losses]).mean()
+            batch_regularization_loss = torch.stack([loss_terms["regularization_loss"] for loss_terms in batch_losses]).mean()
+            batch_crosscov_penalty = torch.stack([loss_terms["crosscov_penalty"] for loss_terms in batch_losses]).mean()
             loss_total += float(batch_loss.cpu().item())
             masked_loss_total += float(batch_masked_loss.cpu().item())
             context_loss_total += float(batch_context_loss.cpu().item())
             dynamics_loss_total += float(batch_dynamics_loss.cpu().item())
             cross_sensor_loss_total += float(batch_cross_sensor_loss.cpu().item())
+            regularization_loss_total += float(batch_regularization_loss.cpu().item())
+            crosscov_penalty_total += float(batch_crosscov_penalty.cpu().item())
             step_count += 1
 
             if max_batches > 0 and step >= max_batches:
@@ -1767,6 +2118,8 @@ def evaluate(
         context_loss_total = reduce_scalar_sum(context_loss_total, device, distributed)
         dynamics_loss_total = reduce_scalar_sum(dynamics_loss_total, device, distributed)
         cross_sensor_loss_total = reduce_scalar_sum(cross_sensor_loss_total, device, distributed)
+        regularization_loss_total = reduce_scalar_sum(regularization_loss_total, device, distributed)
+        crosscov_penalty_total = reduce_scalar_sum(crosscov_penalty_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
 
     return {
@@ -1775,6 +2128,8 @@ def evaluate(
         "mean_context_loss": context_loss_total / max(step_count, 1),
         "mean_dynamics_loss": dynamics_loss_total / max(step_count, 1),
         "mean_cross_sensor_loss": cross_sensor_loss_total / max(step_count, 1),
+        "mean_regularization_loss": regularization_loss_total / max(step_count, 1),
+        "mean_crosscov_penalty": crosscov_penalty_total / max(step_count, 1),
         "step_count": step_count,
         "duration_sec": time.time() - started_at,
         "mask_mode": mask_mode,
@@ -1840,10 +2195,13 @@ def main() -> None:
             )
             eval_loader = maybe_wrap_loader(eval_loader, device, backend)
 
+        target_mode = resolve_target_mode(config)
         student = make_model(config, device)
-        teacher = deepcopy(student).to(device)
-        teacher.requires_grad_(False)
-        teacher.eval()
+        teacher = None
+        if target_mode == "ema":
+            teacher = deepcopy(student).to(device)
+            teacher.requires_grad_(False)
+            teacher.eval()
 
         # Performance: cuDNN autotuning + torch.compile (V-JEPA 2.1 pattern)
         if backend == "cuda":
@@ -1852,10 +2210,14 @@ def main() -> None:
             if compile_model and distributed.enabled and distributed.is_main_process:
                 print(json.dumps({"warning": "compile_model disabled under CUDA DDP"}))
             elif compile_model:
-                print(json.dumps({"action": "compiling_models", "note": "student + teacher + predictor via torch.compile"}))
+                compile_note = "student + predictor via torch.compile"
+                if teacher is not None:
+                    compile_note = "student + teacher + predictor via torch.compile"
+                print(json.dumps({"action": "compiling_models", "note": compile_note}))
                 torch._dynamo.config.optimize_ddp = False
                 student = torch.compile(student)
-                teacher = torch.compile(teacher)
+                if teacher is not None:
+                    teacher = torch.compile(teacher)
 
         optimizer = torch.optim.AdamW(
             student.parameters(),
@@ -1889,7 +2251,8 @@ def main() -> None:
             resume_path = args.resume_from.resolve()
             checkpoint = load_checkpoint(resume_path, backend)
             load_module_state(student, checkpoint["student"], "student")
-            load_module_state(teacher, checkpoint.get("teacher", checkpoint["student"]), "teacher")
+            if teacher is not None:
+                load_module_state(teacher, checkpoint.get("teacher", checkpoint["student"]), "teacher")
             optimizer_resumed = True
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1976,6 +2339,7 @@ def main() -> None:
                     else 0,
                     "start_epoch": start_epoch + 1,
                     "manifest_path": str(manifest_path),
+                    "target_mode": target_mode,
                 },
                 indent=2,
             ))
@@ -2005,6 +2369,7 @@ def main() -> None:
                     "resume_from_checkpoint": resumed_from_checkpoint,
                     "checkpoint_dir": str(checkpoint_dir),
                     "manifest_path": str(manifest_path),
+                    "target_mode": target_mode,
                 },
             )
 
@@ -2022,11 +2387,15 @@ def main() -> None:
             running_context_loss = None
             running_dynamics_loss = None
             running_cross_sensor_loss = None
+            running_regularization_loss = None
+            running_crosscov_penalty = None
             epoch_loss_total = 0.0
             epoch_masked_loss_total = 0.0
             epoch_context_loss_total = 0.0
             epoch_dynamics_loss_total = 0.0
             epoch_cross_sensor_loss_total = 0.0
+            epoch_regularization_loss_total = 0.0
+            epoch_crosscov_penalty_total = 0.0
             epoch_primary_batch_count = 0
             epoch_auxiliary_batch_count = 0
             epoch_step_count = 0
@@ -2056,15 +2425,21 @@ def main() -> None:
                     training_cfg=config["training"],
                 )
 
-                with torch.no_grad():
-                    teacher_embeddings = compute_teacher_embeddings(teacher, batch, config)
-                    teacher_state_sequence = compute_teacher_state_sequence(teacher, batch, config)
+                target_embeddings = None
+                target_state_sequence = None
+                target_metadata = None
+                if teacher is not None:
+                    with torch.no_grad():
+                        target_embeddings = compute_target_embeddings(teacher, batch, config)
+                        target_metadata = current_embedding_metadata(teacher)
+                        target_state_sequence = compute_target_state_sequence(teacher, batch, config)
 
                 loss_terms = compute_student_loss_terms(
                     student,
                     student_stepper,
-                    teacher_embeddings,
-                    teacher_state_sequence,
+                    target_embeddings,
+                    target_state_sequence,
+                    target_metadata,
                     batch,
                     mask_spec,
                     backend,
@@ -2091,17 +2466,21 @@ def main() -> None:
                     else:
                         optimizer.step()
 
-                progress = global_step / total_steps
-                momentum = ema_end - (ema_end - ema_start) * ((1 + math.cos(math.pi * progress)) / 2)
-                with torch.no_grad():
-                    for student_param, teacher_param in zip(student.parameters(), teacher.parameters()):
-                        teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
+                momentum = None
+                if teacher is not None:
+                    progress = global_step / total_steps
+                    momentum = ema_end - (ema_end - ema_start) * ((1 + math.cos(math.pi * progress)) / 2)
+                    with torch.no_grad():
+                        for student_param, teacher_param in zip(student.parameters(), teacher.parameters()):
+                            teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
 
                 detached_loss = loss.detach()
                 detached_masked_loss = loss_terms["masked_loss"]
                 detached_context_loss = loss_terms["context_loss"]
                 detached_dynamics_loss = loss_terms["dynamics_loss"]
                 detached_cross_sensor_loss = loss_terms["cross_sensor_loss"]
+                detached_regularization_loss = loss_terms["regularization_loss"]
+                detached_crosscov_penalty = loss_terms["crosscov_penalty"]
                 running_loss = detached_loss if running_loss is None else running_loss + detached_loss
                 running_masked_loss = (
                     detached_masked_loss
@@ -2123,11 +2502,23 @@ def main() -> None:
                     if running_cross_sensor_loss is None
                     else running_cross_sensor_loss + detached_cross_sensor_loss
                 )
+                running_regularization_loss = (
+                    detached_regularization_loss
+                    if running_regularization_loss is None
+                    else running_regularization_loss + detached_regularization_loss
+                )
+                running_crosscov_penalty = (
+                    detached_crosscov_penalty
+                    if running_crosscov_penalty is None
+                    else running_crosscov_penalty + detached_crosscov_penalty
+                )
                 epoch_loss_total += float(detached_loss.cpu().item())
                 epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
                 epoch_context_loss_total += float(detached_context_loss.cpu().item())
                 epoch_dynamics_loss_total += float(detached_dynamics_loss.cpu().item())
                 epoch_cross_sensor_loss_total += float(detached_cross_sensor_loss.cpu().item())
+                epoch_regularization_loss_total += float(detached_regularization_loss.cpu().item())
+                epoch_crosscov_penalty_total += float(detached_crosscov_penalty.cpu().item())
                 epoch_step_count += 1
                 global_step += 1
 
@@ -2153,6 +2544,16 @@ def main() -> None:
                         distributed=distributed,
                         device=device,
                     )
+                    mean_regularization_loss = reduce_scalar_mean(
+                        running_regularization_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    mean_crosscov_penalty = reduce_scalar_mean(
+                        running_crosscov_penalty / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
                     if distributed.is_main_process:
                         train_step_metrics = {
                             "event": "train_step",
@@ -2167,40 +2568,54 @@ def main() -> None:
                             "context_loss": float(mean_context_loss.cpu().item()),
                             "dynamics_loss": float(mean_dynamics_loss.cpu().item()),
                             "cross_sensor_loss": float(mean_cross_sensor_loss.cpu().item()),
+                            "regularization_loss": float(mean_regularization_loss.cpu().item()),
+                            "crosscov_penalty": float(mean_crosscov_penalty.cpu().item()),
                             "lr": float(current_lr),
                             "weight_decay": float(current_wd),
-                            "momentum": float(momentum),
+                            "target_mode": target_mode,
                         }
+                        if momentum is not None:
+                            train_step_metrics["momentum"] = float(momentum)
                         if backend == "tpu":
                             import torch_xla.core.xla_model as xm
 
-                            xm.master_print(
+                            log_line = (
                                 f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
-                                f"lr={current_lr:.6e} wd={current_wd:.6f} "
-                                f"momentum={momentum:.6f}"
+                                f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
+                                f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
+                                f"lr={current_lr:.6e} wd={current_wd:.6f}"
                             )
+                            if momentum is not None:
+                                log_line += f" momentum={momentum:.6f}"
+                            xm.master_print(log_line)
                         else:
-                            print(
+                            log_line = (
                                 f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
-                                f"lr={current_lr:.6e} wd={current_wd:.6f} "
-                                f"momentum={momentum:.6f}"
+                                f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
+                                f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
+                                f"lr={current_lr:.6e} wd={current_wd:.6f}"
                             )
+                            if momentum is not None:
+                                log_line += f" momentum={momentum:.6f}"
+                            print(log_line)
                         append_jsonl(metrics_path, train_step_metrics)
                     running_loss = None
                     running_masked_loss = None
                     running_context_loss = None
                     running_dynamics_loss = None
                     running_cross_sensor_loss = None
+                    running_regularization_loss = None
+                    running_crosscov_penalty = None
 
                 if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
                     break
@@ -2211,6 +2626,8 @@ def main() -> None:
             epoch_context_loss_total = reduce_scalar_sum(epoch_context_loss_total, device, distributed)
             epoch_dynamics_loss_total = reduce_scalar_sum(epoch_dynamics_loss_total, device, distributed)
             epoch_cross_sensor_loss_total = reduce_scalar_sum(epoch_cross_sensor_loss_total, device, distributed)
+            epoch_regularization_loss_total = reduce_scalar_sum(epoch_regularization_loss_total, device, distributed)
+            epoch_crosscov_penalty_total = reduce_scalar_sum(epoch_crosscov_penalty_total, device, distributed)
             epoch_primary_batch_count = int(round(reduce_scalar_sum(epoch_primary_batch_count, device, distributed)))
             epoch_auxiliary_batch_count = int(round(reduce_scalar_sum(epoch_auxiliary_batch_count, device, distributed)))
             epoch_step_count = int(round(reduce_scalar_sum(epoch_step_count, device, distributed)))
@@ -2227,10 +2644,13 @@ def main() -> None:
                 "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
                 "mean_dynamics_loss": epoch_dynamics_loss_total / max(epoch_step_count, 1),
                 "mean_cross_sensor_loss": epoch_cross_sensor_loss_total / max(epoch_step_count, 1),
+                "mean_regularization_loss": epoch_regularization_loss_total / max(epoch_step_count, 1),
+                "mean_crosscov_penalty": epoch_crosscov_penalty_total / max(epoch_step_count, 1),
                 "primary_batch_count": epoch_primary_batch_count,
                 "auxiliary_batch_count": epoch_auxiliary_batch_count,
                 "mixed_stage_active": bool(auxiliary_loader is not None and epoch < int(config["training"].get("mixed_stage_epochs", 0))),
                 "duration_sec": epoch_duration_sec,
+                "target_mode": target_mode,
             }
             if backend == "cuda":
                 peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
@@ -2253,6 +2673,8 @@ def main() -> None:
                 epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
                 epoch_summary["validation_mean_dynamics_loss"] = eval_summary["mean_dynamics_loss"]
                 epoch_summary["validation_mean_cross_sensor_loss"] = eval_summary["mean_cross_sensor_loss"]
+                epoch_summary["validation_mean_regularization_loss"] = eval_summary["mean_regularization_loss"]
+                epoch_summary["validation_mean_crosscov_penalty"] = eval_summary["mean_crosscov_penalty"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
                 if distributed.is_main_process:
                     print(
@@ -2261,6 +2683,8 @@ def main() -> None:
                         f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
                         f"validation_dynamics_loss={eval_summary['mean_dynamics_loss']:.6f} "
                         f"validation_cross_sensor_loss={eval_summary['mean_cross_sensor_loss']:.6f} "
+                        f"validation_regularization_loss={eval_summary['mean_regularization_loss']:.6f} "
+                        f"validation_crosscov_penalty={eval_summary['mean_crosscov_penalty']:.6f} "
                         f"validation_steps={eval_summary['step_count']}"
                     )
                 validation_mean_loss = float(eval_summary["mean_loss"])
@@ -2273,11 +2697,12 @@ def main() -> None:
                         "epoch": epoch,
                         "global_step": global_step,
                         "student": student.state_dict(),
-                        "teacher": teacher.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "config": config,
                         "best_validation_mean_loss": best_validation_mean_loss,
                     }
+                    if teacher is not None:
+                        payload["teacher"] = teacher.state_dict()
                     save_checkpoint(best_path, backend, payload)
                     print(f"saved best-val checkpoint: {best_path}")
                 if distributed.is_main_process:
@@ -2293,11 +2718,12 @@ def main() -> None:
                     "epoch": epoch,
                     "global_step": global_step,
                     "student": student.state_dict(),
-                    "teacher": teacher.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "config": config,
                     "best_validation_mean_loss": best_validation_mean_loss,
                 }
+                if teacher is not None:
+                    payload["teacher"] = teacher.state_dict()
                 save_checkpoint(checkpoint_path, backend, payload)
                 print(f"saved checkpoint: {checkpoint_path}")
 
@@ -2334,6 +2760,7 @@ def main() -> None:
                 "resume_from_checkpoint": resumed_from_checkpoint,
                 "start_epoch": start_epoch + 1,
                 "manifest_path": str(manifest_path),
+                "target_mode": target_mode,
                 "config": config,
             }
             write_json(summary_path, summary)

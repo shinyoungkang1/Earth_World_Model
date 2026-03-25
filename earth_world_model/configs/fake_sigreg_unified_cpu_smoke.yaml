@@ -1,0 +1,102 @@
+runtime:
+  backend: cpu
+  seed: 42
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_fake_sigreg_unified_cpu_smoke}
+
+data:
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 52
+  num_workers: 0
+  temporal_subclip_mode: random
+  temporal_subclip_schedule:
+    - start_epoch: 0
+      length: 16
+    - start_epoch: 1
+      length: 32
+    - start_epoch: 2
+      length: 52
+
+auxiliary_data:
+  enabled: true
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 4
+  num_workers: 0
+  batch_size: 2
+
+model:
+  input_mode: s2s1
+  tokenizer_type: conv3d
+  tubelet_size: 2
+  embed_dim: 64
+  patch_px: 16
+  temporal_depth: 2
+  predictor_depth: 1
+  num_heads: 4
+  hierarchical_layers: []
+  token_mode: dense
+  spatial_fusion: cross_attend
+  fusion_num_heads: 2
+  separate_sensor_encoders: true
+  use_modality_embeddings: true
+  use_patch_positional_encoding: true
+  use_missing_modality_embeddings: true
+  use_time_gap_features: true
+  use_sensor_timing_features: true
+  temporal_block_type: factorized_rope
+  use_rope_temporal_attention: true
+  rope_base: 10000.0
+  use_activation_checkpointing: false
+  enable_latent_dynamics: false
+
+training:
+  batch_size: 2
+  auxiliary_batch_size: 2
+  epochs: 2
+  mixed_stage_epochs: 1
+  mixed_stage_auxiliary_fraction: 0.5
+  lr_schedule: fixed
+  lr: 3.0e-4
+  weight_decay: 0.05
+  final_weight_decay: 0.05
+  mask_ratio: 0.5
+  masking_mode: dense_block3d
+  block_mask_cfgs:
+    - num_blocks: 2
+      spatial_scale: [0.10, 0.20]
+      temporal_scale: [0.125, 0.25]
+      aspect_ratio: [0.75, 1.5]
+  target_mode: ${EWM_TARGET_MODE:-self}
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 1
+  save_every_epochs: 1
+  max_steps_per_epoch: 2
+  predict_visible_context: false
+  context_loss_weight: 0.0
+  context_loss_distance_weighted: false
+  cross_sensor_loss_weight: 0.0
+  dynamics_loss_weight: 0.0
+
+regularization:
+  method: ${EWM_REG_METHOD:-sigreg}
+  mode: ${EWM_REG_MODE:-per_subspace}
+  n_projections: ${EWM_SIGREG_N_PROJECTIONS:-16}
+  max_samples: ${EWM_REG_MAX_SAMPLES:-32}
+  base_lambda: ${EWM_REG_BASE_LAMBDA:-1.0}
+  adaptive_alpha: ${EWM_REG_ADAPTIVE_ALPHA:-1.0}
+  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.1}
+  split_dims:
+    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-16}
+    shared: ${EWM_REG_SHARED_DIM:-32}
+    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-16}
+  vicreg_variance_target: ${EWM_VICREG_VARIANCE_TARGET:-1.0}
+  vicreg_variance_epsilon: ${EWM_VICREG_VARIANCE_EPSILON:-1.0e-4}
+  vicreg_variance_weight: ${EWM_VICREG_VARIANCE_WEIGHT:-1.0}
+  vicreg_covariance_weight: ${EWM_VICREG_COVARIANCE_WEIGHT:-1.0}
+
+eval:
+  enabled: false
