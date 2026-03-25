@@ -168,6 +168,26 @@ def load_config(path: Path) -> dict:
     return _expand_config_values(yaml.safe_load(path.read_text(encoding="utf-8")))
 
 
+_CONFIG_INT_PATTERN = re.compile(r"^[+-]?\d+$")
+_CONFIG_FLOAT_PATTERN = re.compile(
+    r"^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)$"
+)
+
+
+def _coerce_expanded_config_scalar(value: str) -> Any:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"none", "null"}:
+        return None
+    if _CONFIG_INT_PATTERN.fullmatch(stripped):
+        return int(stripped)
+    if _CONFIG_FLOAT_PATTERN.fullmatch(stripped):
+        return float(stripped)
+    return value
+
+
 def _expand_config_values(value):
     if isinstance(value, dict):
         return {key: _expand_config_values(item) for key, item in value.items()}
@@ -179,7 +199,8 @@ def _expand_config_values(value):
             lambda match: os.environ.get(match.group(1), match.group(2)),
             value,
         )
-        return os.path.expanduser(os.path.expandvars(value))
+        expanded = os.path.expanduser(os.path.expandvars(value))
+        return _coerce_expanded_config_scalar(expanded)
     return value
 
 
