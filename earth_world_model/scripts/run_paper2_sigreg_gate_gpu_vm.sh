@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DATA_ROOT_BASE="${DATA_ROOT_BASE:-/mnt/ewm-data-disk/ewm_prelim_500_1000_v1}"
-GCS_RUNS_ROOT="${GCS_RUNS_ROOT:-gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/paper2_sigreg_suite}"
+GCS_RUNS_ROOT="${GCS_RUNS_ROOT:-gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/paper2_sigreg_gate_1024}"
 SKIP_SETUP_GPU="${SKIP_SETUP_GPU:-0}"
 YEARLY_NAME="${YEARLY_NAME:-yearly_500}"
 SSL4EO_NAME="${SSL4EO_NAME:-ssl4eo_1000}"
@@ -11,32 +11,22 @@ YEARLY_TRAIN_MAX_SAMPLES="${YEARLY_TRAIN_MAX_SAMPLES:-500}"
 YEARLY_VAL_MAX_SAMPLES="${YEARLY_VAL_MAX_SAMPLES:-32}"
 SSL4EO_TRAIN_MAX_SAMPLES="${SSL4EO_TRAIN_MAX_SAMPLES:-1000}"
 SSL4EO_VAL_MAX_SAMPLES="${SSL4EO_VAL_MAX_SAMPLES:-128}"
-EWM_BATCH_SIZE="${EWM_BATCH_SIZE:-16}"
-EWM_AUXILIARY_BATCH_SIZE="${EWM_AUXILIARY_BATCH_SIZE:-16}"
-EWM_EVAL_BATCH_SIZE="${EWM_EVAL_BATCH_SIZE:-16}"
+EWM_BATCH_SIZE="${EWM_BATCH_SIZE:-8}"
+EWM_AUXILIARY_BATCH_SIZE="${EWM_AUXILIARY_BATCH_SIZE:-8}"
+EWM_EVAL_BATCH_SIZE="${EWM_EVAL_BATCH_SIZE:-8}"
 EWM_EPOCHS="${EWM_EPOCHS:-12}"
 EWM_MIXED_STAGE_EPOCHS="${EWM_MIXED_STAGE_EPOCHS:-4}"
 EWM_MIXED_STAGE_AUXILIARY_FRACTION="${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}"
 EWM_SUBCLIP_16_START="${EWM_SUBCLIP_16_START:-0}"
 EWM_SUBCLIP_32_START="${EWM_SUBCLIP_32_START:-2}"
 EWM_SUBCLIP_52_START="${EWM_SUBCLIP_52_START:-4}"
-EWM_DETACH_SELF_TARGET="${EWM_DETACH_SELF_TARGET:-false}"
-EWM_EVAL_CHECKPOINT_METRIC="${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}"
-RUN_CORE_ABLATIONS="${RUN_CORE_ABLATIONS:-1}"
-RUN_TIME_ABLATIONS="${RUN_TIME_ABLATIONS:-1}"
-RUN_ARCH_ABLATIONS="${RUN_ARCH_ABLATIONS:-1}"
-RUN_ID_FILTER="${RUN_ID_FILTER:-}"
-FORCE_RERUN="${FORCE_RERUN:-0}"
 EWM_TUBELET_SIZE="${EWM_TUBELET_SIZE:-1}"
+EWM_EVAL_CHECKPOINT_METRIC="${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
+RUN_EMA_BASELINE="${RUN_EMA_BASELINE:-1}"
+RUN_LEWM_GLOBAL="${RUN_LEWM_GLOBAL:-1}"
+RUN_OUR_SIGREG="${RUN_OUR_SIGREG:-1}"
 BASE_CONFIG_PATH="${BASE_CONFIG_PATH:-$PROJECT_ROOT/earth_world_model/configs/dense_temporal_index_pilot400_vjepa21_unified_sigreg_1024_mixed_ssl4eo_cuda_gpu_vm.yaml}"
-
-should_run_id() {
-  local run_id="$1"
-  if [[ -z "$RUN_ID_FILTER" ]]; then
-    return 0
-  fi
-  [[ "$run_id" == *"$RUN_ID_FILTER"* ]]
-}
 
 run_is_complete() {
   local run_id="$1"
@@ -51,14 +41,9 @@ run_one() {
   local run_id="$1"
   local local_data_root="$2"
   shift 2
-  local local_run_root="/tmp/ewm_paper2_sigreg_gpu/${run_id}"
+  local local_run_root="/tmp/ewm_paper2_sigreg_gate_gpu/${run_id}"
   local local_checkpoint_dir="${local_run_root}/checkpoints/${run_id}"
   local gcs_run_uri="${GCS_RUNS_ROOT%/}/${run_id}"
-
-  if ! should_run_id "$run_id"; then
-    echo "Skipping filtered run: ${run_id}"
-    return 0
-  fi
 
   if run_is_complete "$run_id"; then
     echo "Skipping completed run: ${run_id}"
@@ -103,14 +88,48 @@ run_one() {
     bash "$PROJECT_ROOT/earth_world_model/scripts/run_phase2_gpu_vm_localdisk.sh"
 }
 
-run_sigreg() {
+run_ema_baseline() {
   local run_id="$1"
-  shift
+  run_one \
+    "$run_id" \
+    "$DATA_ROOT_BASE/$YEARLY_NAME" \
+    EWM_TARGET_MODE=ema \
+    EWM_REG_METHOD=none \
+    EWM_DETACH_SELF_TARGET=true \
+    EWM_ENABLE_LATENT_DYNAMICS=true \
+    EWM_PREDICT_VISIBLE_CONTEXT=true \
+    EWM_CONTEXT_LOSS_WEIGHT=0.5 \
+    EWM_CONTEXT_LOSS_DISTANCE_WEIGHTED=true \
+    EWM_CROSS_SENSOR_LOSS_WEIGHT=0.1 \
+    EWM_DYNAMICS_LOSS_WEIGHT=0.1
+}
+
+run_lewm_global() {
+  local run_id="$1"
   run_one \
     "$run_id" \
     "$DATA_ROOT_BASE/$YEARLY_NAME" \
     EWM_TARGET_MODE=self \
-    EWM_DETACH_SELF_TARGET="$EWM_DETACH_SELF_TARGET" \
+    EWM_DETACH_SELF_TARGET=false \
+    EWM_REG_METHOD=sigreg \
+    EWM_REG_MODE=global \
+    EWM_REG_BASE_LAMBDA=1.0 \
+    EWM_REG_ADAPTIVE_ALPHA=0.0 \
+    EWM_REG_CROSSCOV_MU=0.0 \
+    EWM_ENABLE_LATENT_DYNAMICS=true \
+    EWM_PREDICT_VISIBLE_CONTEXT=false \
+    EWM_CONTEXT_LOSS_WEIGHT=0.0 \
+    EWM_CROSS_SENSOR_LOSS_WEIGHT=0.0 \
+    EWM_DYNAMICS_LOSS_WEIGHT=0.0
+}
+
+run_our_sigreg() {
+  local run_id="$1"
+  run_one \
+    "$run_id" \
+    "$DATA_ROOT_BASE/$YEARLY_NAME" \
+    EWM_TARGET_MODE=self \
+    EWM_DETACH_SELF_TARGET=false \
     EWM_REG_METHOD=sigreg \
     EWM_REG_MODE=per_subspace \
     EWM_REG_BASE_LAMBDA=1.0 \
@@ -119,79 +138,24 @@ run_sigreg() {
     EWM_REG_S1_PRIVATE_DIM=128 \
     EWM_REG_SHARED_DIM=512 \
     EWM_REG_S2_PRIVATE_DIM=384 \
-    "$@"
+    EWM_ENABLE_LATENT_DYNAMICS=true \
+    EWM_PREDICT_VISIBLE_CONTEXT=false \
+    EWM_CONTEXT_LOSS_WEIGHT=0.0 \
+    EWM_CROSS_SENSOR_LOSS_WEIGHT=0.0 \
+    EWM_DYNAMICS_LOSS_WEIGHT=0.0
 }
 
-run_ema_baseline() {
-  local run_id="$1"
-  shift
-  run_one \
-    "$run_id" \
-    "$DATA_ROOT_BASE/$YEARLY_NAME" \
-    EWM_TARGET_MODE=ema \
-    EWM_REG_METHOD=none \
-    "$@"
-}
-
-if [[ "$RUN_CORE_ABLATIONS" == "1" ]]; then
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_full_sigreg"
-
-  run_one \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_global_sigreg" \
-    "$DATA_ROOT_BASE/$YEARLY_NAME" \
-    EWM_TARGET_MODE=self \
-    EWM_DETACH_SELF_TARGET="$EWM_DETACH_SELF_TARGET" \
-    EWM_REG_METHOD=sigreg \
-    EWM_REG_MODE=global \
-    EWM_REG_BASE_LAMBDA=1.0 \
-    EWM_REG_ADAPTIVE_ALPHA=1.0 \
-    EWM_REG_CROSSCOV_MU=0.0
-
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_no_crosscov" \
-    EWM_REG_CROSSCOV_MU=0.0
-
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_fixed_lambda" \
-    EWM_REG_ADAPTIVE_ALPHA=0.0
-
+if [[ "$RUN_EMA_BASELINE" == "1" ]]; then
   run_ema_baseline \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_ema_only"
+    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_ema_oldbackbone_1024"
 fi
 
-if [[ "$RUN_TIME_ABLATIONS" == "1" ]]; then
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_no_time_gap" \
-    EWM_USE_TIME_GAP_FEATURES=false
-
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_no_sensor_timing" \
-    EWM_USE_SENSOR_TIMING_FEATURES=false
+if [[ "$RUN_LEWM_GLOBAL" == "1" ]]; then
+  run_lewm_global \
+    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_lewm_global_sigreg_1024"
 fi
 
-if [[ "$RUN_ARCH_ABLATIONS" == "1" ]]; then
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_joint_sensor_sigreg" \
-    EWM_SEPARATE_SENSOR_ENCODERS=false
-
-  run_one \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_vicreg_per_subspace" \
-    "$DATA_ROOT_BASE/$YEARLY_NAME" \
-    EWM_TARGET_MODE=self \
-    EWM_DETACH_SELF_TARGET="$EWM_DETACH_SELF_TARGET" \
-    EWM_REG_METHOD=vicreg \
-    EWM_REG_MODE=per_subspace \
-    EWM_REG_BASE_LAMBDA=1.0 \
-    EWM_REG_ADAPTIVE_ALPHA=0.0 \
-    EWM_REG_CROSSCOV_MU=0.1 \
-    EWM_REG_S1_PRIVATE_DIM=128 \
-    EWM_REG_SHARED_DIM=512 \
-    EWM_REG_S2_PRIVATE_DIM=384
-
-  run_sigreg \
-    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_alt_dims_256_512_256" \
-    EWM_REG_S1_PRIVATE_DIM=256 \
-    EWM_REG_SHARED_DIM=512 \
-    EWM_REG_S2_PRIVATE_DIM=256
+if [[ "$RUN_OUR_SIGREG" == "1" ]]; then
+  run_our_sigreg \
+    "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_our_per_subspace_sigreg_1024"
 fi

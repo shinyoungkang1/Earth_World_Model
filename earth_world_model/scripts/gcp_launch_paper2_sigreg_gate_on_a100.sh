@@ -19,17 +19,16 @@ YEARLY_TRAIN_MAX_SAMPLES="${YEARLY_TRAIN_MAX_SAMPLES:-1646}"
 YEARLY_VAL_MAX_SAMPLES="${YEARLY_VAL_MAX_SAMPLES:-64}"
 SSL4EO_TRAIN_MAX_SAMPLES="${SSL4EO_TRAIN_MAX_SAMPLES:-10000}"
 SSL4EO_VAL_MAX_SAMPLES="${SSL4EO_VAL_MAX_SAMPLES:-1000}"
-GCS_RUNS_ROOT="${GCS_RUNS_ROOT:-gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/paper2_sigreg_suite_1024_1646_10000_e12_b16}"
-RUN_CORE_ABLATIONS="${RUN_CORE_ABLATIONS:-1}"
-RUN_TIME_ABLATIONS="${RUN_TIME_ABLATIONS:-1}"
-RUN_ARCH_ABLATIONS="${RUN_ARCH_ABLATIONS:-1}"
-RUN_ID_FILTER="${RUN_ID_FILTER:-}"
+GCS_RUNS_ROOT="${GCS_RUNS_ROOT:-gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/paper2_sigreg_gate_1024_1646_10000_e12_b8}"
+RUN_EMA_BASELINE="${RUN_EMA_BASELINE:-1}"
+RUN_LEWM_GLOBAL="${RUN_LEWM_GLOBAL:-1}"
+RUN_OUR_SIGREG="${RUN_OUR_SIGREG:-1}"
 FORCE_RERUN="${FORCE_RERUN:-0}"
 SKIP_CREATE_A100="${SKIP_CREATE_A100:-0}"
 SKIP_DETACH_PREP_VM="${SKIP_DETACH_PREP_VM:-0}"
 SKIP_SYNC_REPO="${SKIP_SYNC_REPO:-0}"
 SKIP_SETUP_GPU="${SKIP_SETUP_GPU:-0}"
-RUN_LAUNCHER_LOG_PATH="${RUN_LAUNCHER_LOG_PATH:-/tmp/paper2_sigreg_suite_launcher.log}"
+RUN_LAUNCHER_LOG_PATH="${RUN_LAUNCHER_LOG_PATH:-/tmp/paper2_sigreg_gate_launcher.log}"
 
 quote_for_bash() {
   printf '%q' "$1"
@@ -91,16 +90,15 @@ gcloud compute ssh "$A100_VM_NAME" \
       YEARLY_VAL_MAX_SAMPLES=$(quote_for_bash "$YEARLY_VAL_MAX_SAMPLES") \
       SSL4EO_TRAIN_MAX_SAMPLES=$(quote_for_bash "$SSL4EO_TRAIN_MAX_SAMPLES") \
       SSL4EO_VAL_MAX_SAMPLES=$(quote_for_bash "$SSL4EO_VAL_MAX_SAMPLES") \
-      RUN_CORE_ABLATIONS=$(quote_for_bash "$RUN_CORE_ABLATIONS") \
-      RUN_TIME_ABLATIONS=$(quote_for_bash "$RUN_TIME_ABLATIONS") \
-      RUN_ARCH_ABLATIONS=$(quote_for_bash "$RUN_ARCH_ABLATIONS") \
-      RUN_ID_FILTER=$(quote_for_bash "$RUN_ID_FILTER") \
+      RUN_EMA_BASELINE=$(quote_for_bash "$RUN_EMA_BASELINE") \
+      RUN_LEWM_GLOBAL=$(quote_for_bash "$RUN_LEWM_GLOBAL") \
+      RUN_OUR_SIGREG=$(quote_for_bash "$RUN_OUR_SIGREG") \
       FORCE_RERUN=$(quote_for_bash "$FORCE_RERUN") \
       SKIP_SETUP_GPU=$(quote_for_bash "$SKIP_SETUP_GPU") \
-      bash earth_world_model/scripts/run_paper2_unified_suite_gpu_vm.sh \
+      bash earth_world_model/scripts/run_paper2_sigreg_gate_gpu_vm.sh \
       > $(quote_for_bash "$RUN_LAUNCHER_LOG_PATH") 2>&1 < /dev/null &'"
 
-echo "Launched Paper 2 SIGReg suite on $A100_VM_NAME"
+echo "Launched Paper 2 SIGReg gate runs on $A100_VM_NAME"
 echo "A100_VM_NAME=$A100_VM_NAME"
 echo "ZONE=$ZONE"
 echo "DATA_ROOT_BASE=$DATA_ROOT_BASE"

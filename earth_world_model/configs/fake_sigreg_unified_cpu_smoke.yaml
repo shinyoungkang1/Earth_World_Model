@@ -11,11 +11,11 @@ data:
   num_workers: 0
   temporal_subclip_mode: random
   temporal_subclip_schedule:
-    - start_epoch: 0
+    - start_epoch: ${EWM_SUBCLIP_16_START:-0}
       length: 16
-    - start_epoch: 1
+    - start_epoch: ${EWM_SUBCLIP_32_START:-1}
       length: 32
-    - start_epoch: 2
+    - start_epoch: ${EWM_SUBCLIP_52_START:-2}
       length: 52
 
 auxiliary_data:
@@ -70,6 +70,7 @@ training:
       temporal_scale: [0.125, 0.25]
       aspect_ratio: [0.75, 1.5]
   target_mode: ${EWM_TARGET_MODE:-self}
+  detach_self_target: ${EWM_DETACH_SELF_TARGET:-false}
   ema_momentum_start: 0.996
   ema_momentum_end: 0.999
   log_every_steps: 1
@@ -100,3 +101,4 @@ regularization:
 
 eval:
   enabled: false
+  checkpoint_metric: ${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}

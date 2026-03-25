@@ -1,7 +1,7 @@
 runtime:
   backend: ${EWM_BACKEND:-cuda}
   seed: 42
-  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_paper2_sigreg_gpu/checkpoints/dense_temporal_index_pilot400_vjepa21_unified_sigreg_auto_256_mixed_ssl4eo_cuda}
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_paper2_sigreg_1024_gpu/checkpoints/dense_temporal_index_pilot400_vjepa21_unified_sigreg_1024_mixed_ssl4eo_cuda}
   autocast_dtype: float16
 
 data:
@@ -42,7 +42,7 @@ auxiliary_data:
   assume_single_sample_per_shard: false
   max_open_shards: 16
   batch_sampler: auto
-  batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-16}
+  batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
 
 model:
   input_mode: s2s1
@@ -50,12 +50,12 @@ model:
   tokenizer_mode: ${EWM_TOKENIZER_MODE:-auto}
   auto_2d_max_timesteps: ${EWM_AUTO_2D_MAX_TIMESTEPS:-4}
   tubelet_size: ${EWM_TUBELET_SIZE:-1}
-  embed_dim: ${EWM_EMBED_DIM:-256}
+  embed_dim: ${EWM_EMBED_DIM:-1024}
   patch_px: 16
   temporal_depth: ${EWM_TEMPORAL_DEPTH:-6}
   predictor_depth: ${EWM_PREDICTOR_DEPTH:-3}
-  num_heads: ${EWM_NUM_HEADS:-8}
-  hierarchical_layers: []
+  num_heads: ${EWM_NUM_HEADS:-16}
+  hierarchical_layers: [1, 3, 5]
   token_mode: dense
   spatial_fusion: cross_attend
   fusion_num_heads: ${EWM_FUSION_NUM_HEADS:-8}
@@ -69,11 +69,11 @@ model:
   use_rope_temporal_attention: ${EWM_USE_ROPE_TEMPORAL_ATTENTION:-true}
   rope_base: 10000.0
   use_activation_checkpointing: ${EWM_USE_ACTIVATION_CHECKPOINTING:-true}
-  enable_latent_dynamics: ${EWM_ENABLE_LATENT_DYNAMICS:-false}
+  enable_latent_dynamics: ${EWM_ENABLE_LATENT_DYNAMICS:-true}
 
 training:
-  batch_size: ${EWM_BATCH_SIZE:-16}
-  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-16}
+  batch_size: ${EWM_BATCH_SIZE:-8}
+  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
   epochs: ${EWM_EPOCHS:-12}
   mixed_stage_epochs: ${EWM_MIXED_STAGE_EPOCHS:-4}
   mixed_stage_auxiliary_fraction: ${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}
@@ -107,7 +107,7 @@ training:
   max_steps_per_epoch: 0
   predict_visible_context: ${EWM_PREDICT_VISIBLE_CONTEXT:-false}
   context_loss_weight: ${EWM_CONTEXT_LOSS_WEIGHT:-0.0}
-  context_loss_distance_weighted: ${EWM_CONTEXT_LOSS_DISTANCE_WEIGHTED:-false}
+  context_loss_distance_weighted: ${EWM_CONTEXT_LOSS_DISTANCE_WEIGHTED:-true}
   context_loss_sqrt_distance: true
   cross_sensor_loss_weight: ${EWM_CROSS_SENSOR_LOSS_WEIGHT:-0.0}
   cross_sensor_time_proximity: ${EWM_CROSS_SENSOR_TIME_PROXIMITY:-true}
@@ -124,9 +124,9 @@ regularization:
   adaptive_alpha: ${EWM_REG_ADAPTIVE_ALPHA:-1.0}
   crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.1}
   split_dims:
-    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-32}
-    shared: ${EWM_REG_SHARED_DIM:-128}
-    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-96}
+    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-128}
+    shared: ${EWM_REG_SHARED_DIM:-512}
+    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-384}
   vicreg_variance_target: ${EWM_VICREG_VARIANCE_TARGET:-1.0}
   vicreg_variance_epsilon: ${EWM_VICREG_VARIANCE_EPSILON:-1.0e-4}
   vicreg_variance_weight: ${EWM_VICREG_VARIANCE_WEIGHT:-1.0}
@@ -136,7 +136,7 @@ eval:
   enabled: true
   every_epochs: 1
   checkpoint_metric: ${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}
-  batch_size: ${EWM_EVAL_BATCH_SIZE:-16}
+  batch_size: ${EWM_EVAL_BATCH_SIZE:-8}
   max_batches: 0
   mask_mode: random
   data:

@@ -255,6 +255,32 @@ def resolve_regularization_method(config: dict) -> str:
     return method
 
 
+def resolve_detach_self_target(config: dict) -> bool:
+    return resolve_bool_config(config.get("training", {}).get("detach_self_target", True), default=True)
+
+
+def resolve_eval_checkpoint_metric(config: dict) -> str:
+    metric = str(config.get("eval", {}).get("checkpoint_metric", "mean_loss")).strip().lower()
+    aliases = {
+        "loss": "mean_loss",
+        "mean_loss": "mean_loss",
+        "total": "mean_loss",
+        "total_loss": "mean_loss",
+        "masked": "mean_masked_loss",
+        "masked_loss": "mean_masked_loss",
+        "mean_masked_loss": "mean_masked_loss",
+        "prediction": "mean_masked_loss",
+        "prediction_loss": "mean_masked_loss",
+        "regularization": "mean_regularization_loss",
+        "regularization_loss": "mean_regularization_loss",
+        "mean_regularization_loss": "mean_regularization_loss",
+    }
+    if metric not in aliases:
+        supported = ", ".join(sorted(aliases))
+        raise ValueError(f"Unsupported eval.checkpoint_metric: {metric}. Supported aliases: {supported}")
+    return aliases[metric]
+
+
 def current_embedding_metadata(model: EarthWorldModel) -> EmbeddingMetadata:
     return EmbeddingMetadata(
         token_mode=str(model.token_mode),
@@ -1792,6 +1818,7 @@ def compute_prediction_losses(
     training_cfg = config["training"]
     target_mode = resolve_target_mode(config)
     regularization_method = resolve_regularization_method(config)
+    detach_self_target = resolve_detach_self_target(config)
     predict_visible_context = bool(training_cfg.get("predict_visible_context", False))
     context_loss_weight = float(training_cfg.get("context_loss_weight", 0.0))
     context_loss_distance_weighted = bool(training_cfg.get("context_loss_distance_weighted", False))
@@ -1815,20 +1842,28 @@ def compute_prediction_losses(
                     batch,
                     return_hierarchical=True,
                 )
-                target_embeddings_local = online_target_embeddings.detach()
+                target_embeddings_local = (
+                    online_target_embeddings.detach() if detach_self_target else online_target_embeddings
+                )
             else:
                 online_target_embeddings, target_metadata_local = compute_online_embeddings(
                     student,
                     batch,
                     return_hierarchical=False,
                 )
-                target_embeddings_local = online_target_embeddings.detach()
+                target_embeddings_local = (
+                    online_target_embeddings.detach() if detach_self_target else online_target_embeddings
+                )
                 if regularization_method != "none":
                     regularization_source_embeddings = online_target_embeddings
                     regularization_source_metadata = target_metadata_local
             if dynamics_loss_weight > 0.0:
                 online_state_sequence = compute_target_state_sequence(student, batch, config)
-                target_state_sequence_local = None if online_state_sequence is None else online_state_sequence.detach()
+                target_state_sequence_local = (
+                    None
+                    if online_state_sequence is None
+                    else (online_state_sequence.detach() if detach_self_target else online_state_sequence)
+                )
 
         if regularization_method != "none" and regularization_source_embeddings is None:
             regularization_source_embeddings, regularization_source_metadata = compute_online_embeddings(
@@ -2198,6 +2233,7 @@ def main() -> None:
             )
             auxiliary_loader = maybe_wrap_loader(auxiliary_loader, device, backend)
         eval_cfg = resolve_eval_config(config)
+        checkpoint_metric_name = resolve_eval_checkpoint_metric(config)
         eval_dataset = None
         eval_loader = None
         if eval_cfg is not None:
@@ -2263,6 +2299,9 @@ def main() -> None:
         epoch_summaries: list[dict] = []
         eval_summaries: list[dict] = []
         best_validation_mean_loss = None
+        best_validation_mean_masked_loss = None
+        best_validation_metric_name = checkpoint_metric_name
+        best_validation_metric_value = None
         resumed_from_checkpoint = None
         train_started_at = time.time()
         metrics_path = checkpoint_dir / "metrics.jsonl"
@@ -2294,6 +2333,18 @@ def main() -> None:
             start_epoch = int(checkpoint.get("epoch", -1)) + 1
             global_step = int(checkpoint.get("global_step", start_epoch * max(steps_per_epoch, 1)))
             best_validation_mean_loss = checkpoint.get("best_validation_mean_loss")
+            best_validation_mean_masked_loss = checkpoint.get("best_validation_mean_masked_loss")
+            best_validation_metric_name = checkpoint.get("best_validation_metric_name", checkpoint_metric_name)
+            best_validation_metric_value = checkpoint.get("best_validation_metric_value")
+            if best_validation_mean_loss is None and best_validation_metric_name == "mean_loss":
+                best_validation_mean_loss = best_validation_metric_value
+            if best_validation_mean_masked_loss is None and best_validation_metric_name == "mean_masked_loss":
+                best_validation_mean_masked_loss = best_validation_metric_value
+            if best_validation_metric_value is None:
+                if best_validation_metric_name == "mean_masked_loss":
+                    best_validation_metric_value = best_validation_mean_masked_loss
+                else:
+                    best_validation_metric_value = best_validation_mean_loss
             resumed_from_checkpoint = str(resume_path)
             if distributed.is_main_process:
                 print(
@@ -2303,6 +2354,9 @@ def main() -> None:
                             "start_epoch": start_epoch + 1,
                             "global_step": global_step,
                             "best_validation_mean_loss": best_validation_mean_loss,
+                            "best_validation_mean_masked_loss": best_validation_mean_masked_loss,
+                            "best_validation_metric_name": best_validation_metric_name,
+                            "best_validation_metric_value": best_validation_metric_value,
                             "optimizer_state_restored": optimizer_resumed,
                         },
                         indent=2,
@@ -2361,6 +2415,8 @@ def main() -> None:
                     "start_epoch": start_epoch + 1,
                     "manifest_path": str(manifest_path),
                     "target_mode": target_mode,
+                    "detach_self_target": resolve_detach_self_target(config),
+                    "checkpoint_metric_name": checkpoint_metric_name,
                 },
                 indent=2,
             ))
@@ -2391,6 +2447,8 @@ def main() -> None:
                     "checkpoint_dir": str(checkpoint_dir),
                     "manifest_path": str(manifest_path),
                     "target_mode": target_mode,
+                    "detach_self_target": resolve_detach_self_target(config),
+                    "checkpoint_metric_name": checkpoint_metric_name,
                 },
             )
 
@@ -2697,6 +2755,11 @@ def main() -> None:
                 epoch_summary["validation_mean_regularization_loss"] = eval_summary["mean_regularization_loss"]
                 epoch_summary["validation_mean_crosscov_penalty"] = eval_summary["mean_crosscov_penalty"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
+                validation_mean_loss = float(eval_summary["mean_loss"])
+                validation_mean_masked_loss = float(eval_summary["mean_masked_loss"])
+                validation_checkpoint_metric_value = float(eval_summary[checkpoint_metric_name])
+                epoch_summary["validation_checkpoint_metric_name"] = checkpoint_metric_name
+                epoch_summary["validation_checkpoint_metric_value"] = validation_checkpoint_metric_value
                 if distributed.is_main_process:
                     print(
                         f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
@@ -2706,13 +2769,18 @@ def main() -> None:
                         f"validation_cross_sensor_loss={eval_summary['mean_cross_sensor_loss']:.6f} "
                         f"validation_regularization_loss={eval_summary['mean_regularization_loss']:.6f} "
                         f"validation_crosscov_penalty={eval_summary['mean_crosscov_penalty']:.6f} "
+                        f"checkpoint_metric={checkpoint_metric_name}:{validation_checkpoint_metric_value:.6f} "
                         f"validation_steps={eval_summary['step_count']}"
                     )
-                validation_mean_loss = float(eval_summary["mean_loss"])
-                if distributed.is_main_process and (
-                    best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss
-                ):
+                if best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss:
                     best_validation_mean_loss = validation_mean_loss
+                if best_validation_mean_masked_loss is None or validation_mean_masked_loss < best_validation_mean_masked_loss:
+                    best_validation_mean_masked_loss = validation_mean_masked_loss
+                if distributed.is_main_process and (
+                    best_validation_metric_value is None or validation_checkpoint_metric_value < best_validation_metric_value
+                ):
+                    best_validation_metric_name = checkpoint_metric_name
+                    best_validation_metric_value = validation_checkpoint_metric_value
                     best_path = checkpoint_dir / "ewm_best_val.pt"
                     payload = {
                         "epoch": epoch,
@@ -2721,11 +2789,14 @@ def main() -> None:
                         "optimizer": optimizer.state_dict(),
                         "config": config,
                         "best_validation_mean_loss": best_validation_mean_loss,
+                        "best_validation_mean_masked_loss": best_validation_mean_masked_loss,
+                        "best_validation_metric_name": best_validation_metric_name,
+                        "best_validation_metric_value": best_validation_metric_value,
                     }
                     if teacher is not None:
                         payload["teacher"] = teacher.state_dict()
                     save_checkpoint(best_path, backend, payload)
-                    print(f"saved best-val checkpoint: {best_path}")
+                    print(f"saved best-val checkpoint ({best_validation_metric_name}): {best_path}")
                 if distributed.is_main_process:
                     append_jsonl(metrics_path, eval_summary)
 
@@ -2742,6 +2813,9 @@ def main() -> None:
                     "optimizer": optimizer.state_dict(),
                     "config": config,
                     "best_validation_mean_loss": best_validation_mean_loss,
+                    "best_validation_mean_masked_loss": best_validation_mean_masked_loss,
+                    "best_validation_metric_name": best_validation_metric_name,
+                    "best_validation_metric_value": best_validation_metric_value,
                 }
                 if teacher is not None:
                     payload["teacher"] = teacher.state_dict()
@@ -2778,6 +2852,9 @@ def main() -> None:
                 "eval_summaries": eval_summaries,
                 "final_epoch_mean_loss": epoch_summaries[-1]["mean_loss"] if epoch_summaries else None,
                 "best_validation_mean_loss": best_validation_mean_loss,
+                "best_validation_mean_masked_loss": best_validation_mean_masked_loss,
+                "best_validation_metric_name": best_validation_metric_name,
+                "best_validation_metric_value": best_validation_metric_value,
                 "resume_from_checkpoint": resumed_from_checkpoint,
                 "start_epoch": start_epoch + 1,
                 "manifest_path": str(manifest_path),
@@ -2794,6 +2871,9 @@ def main() -> None:
                     "summary_path": str(summary_path),
                     "manifest_path": str(manifest_path),
                     "best_validation_mean_loss": best_validation_mean_loss,
+                    "best_validation_mean_masked_loss": best_validation_mean_masked_loss,
+                    "best_validation_metric_name": best_validation_metric_name,
+                    "best_validation_metric_value": best_validation_metric_value,
                     "global_steps_completed": global_step,
                 },
             )
