@@ -255,6 +255,26 @@ def resolve_regularization_method(config: dict) -> str:
     return method
 
 
+def resolve_regularization_mode(config: dict) -> str:
+    mode = str(config.get("regularization", {}).get("mode", "per_subspace")).strip().lower()
+    if mode not in {"per_subspace", "global"}:
+        raise ValueError(f"Unsupported regularization.mode: {mode}")
+    return mode
+
+
+def resolve_regularization_subspace_dims(config: dict) -> tuple[int, int, int]:
+    dims_cfg = config.get("regularization", {}).get("split_dims", {})
+    s1_private = int(dims_cfg.get("s1_private", 0))
+    shared = int(dims_cfg.get("shared", 0))
+    s2_private = int(dims_cfg.get("s2_private", 0))
+    dims = (s1_private, shared, s2_private)
+    if min(dims) < 0:
+        raise ValueError(f"split_dims must be non-negative, got {dims}")
+    if max(dims) == 0:
+        raise ValueError("at least one split dim must be positive for per_subspace regularization")
+    return dims
+
+
 def resolve_detach_self_target(config: dict) -> bool:
     return resolve_bool_config(config.get("training", {}).get("detach_self_target", True), default=True)
 
@@ -526,7 +546,63 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         enable_latent_dynamics=resolve_bool_config(model_cfg.get("enable_latent_dynamics", True), default=True),
         dynamics_hidden_dim=model_cfg.get("dynamics_hidden_dim"),
     )
+    if resolve_regularization_method(config) != "none" and resolve_regularization_mode(config) == "per_subspace":
+        subspace_dims = resolve_regularization_subspace_dims(config)
+        model.regularization_subspace_heads = RegularizationSubspaceHeads(
+            input_dim=int(model_cfg["embed_dim"]),
+            s1_private_dim=subspace_dims[0],
+            shared_dim=subspace_dims[1],
+            s2_private_dim=subspace_dims[2],
+        )
     return model.to(device)
+
+
+class RegularizationSubspaceHeads(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        s1_private_dim: int,
+        shared_dim: int,
+        s2_private_dim: int,
+    ) -> None:
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.s1_private_dim = int(s1_private_dim)
+        self.shared_dim = int(shared_dim)
+        self.s2_private_dim = int(s2_private_dim)
+        self.s1_private = self._make_head(self.s1_private_dim)
+        self.shared = self._make_head(self.shared_dim)
+        self.s2_private = self._make_head(self.s2_private_dim)
+
+    def _make_head(self, output_dim: int) -> torch.nn.Linear | None:
+        if output_dim <= 0:
+            return None
+        return torch.nn.Linear(self.input_dim, output_dim, bias=False)
+
+    def _project(
+        self,
+        head: torch.nn.Linear | None,
+        embeddings: torch.Tensor,
+        output_dim: int,
+    ) -> torch.Tensor:
+        if head is None or output_dim <= 0:
+            return embeddings.new_zeros((*embeddings.shape[:-1], 0))
+        return head(embeddings)
+
+    def forward(self, embeddings: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "s1_private": self._project(self.s1_private, embeddings, self.s1_private_dim),
+            "shared": self._project(self.shared, embeddings, self.shared_dim),
+            "s2_private": self._project(self.s2_private, embeddings, self.s2_private_dim),
+        }
+
+
+def project_regularization_subspaces(reference_model: EarthWorldModel, embeddings: torch.Tensor) -> dict[str, torch.Tensor]:
+    heads = getattr(reference_model, "regularization_subspace_heads", None)
+    if heads is None:
+        raise ValueError("Per-subspace regularization requires regularization_subspace_heads on the model")
+    return heads(embeddings)
 
 
 class StudentStepModule(torch.nn.Module):
@@ -1570,7 +1646,7 @@ def _all_embedding_weights(
     return mask.to(dtype=torch.float32)
 
 
-def _flatten_regularization_rows(
+def _regularization_row_indices(
     embeddings: torch.Tensor,
     weights: torch.Tensor | None,
     *,
@@ -1578,33 +1654,26 @@ def _flatten_regularization_rows(
 ) -> torch.Tensor:
     flat = embeddings.reshape(-1, embeddings.shape[-1])
     if weights is None:
-        rows = flat
+        row_indices = torch.arange(flat.shape[0], device=flat.device, dtype=torch.long)
     else:
         valid = weights.reshape(-1) > 0
         if not torch.any(valid):
-            return flat.new_zeros((0, flat.shape[-1]))
-        rows = flat[valid]
-    if max_samples > 0 and rows.shape[0] > max_samples:
-        sample_idx = torch.randperm(rows.shape[0], device=rows.device)[:max_samples]
-        rows = rows[sample_idx]
-    return rows
+            return torch.zeros((0,), device=flat.device, dtype=torch.long)
+        row_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+    if max_samples > 0 and row_indices.shape[0] > max_samples:
+        sample_idx = torch.randperm(row_indices.shape[0], device=row_indices.device)[:max_samples]
+        row_indices = row_indices[sample_idx]
+    return row_indices
 
 
-def _resolve_subspace_dims(
-    reg_cfg: dict[str, Any],
-    embed_dim: int,
-) -> tuple[int, int, int]:
-    dims_cfg = reg_cfg.get("split_dims", {})
-    s1_private = int(dims_cfg.get("s1_private", 0))
-    shared = int(dims_cfg.get("shared", 0))
-    s2_private = int(dims_cfg.get("s2_private", 0))
-    if min(s1_private, shared, s2_private) < 0:
-        raise ValueError(f"split_dims must be non-negative, got {(s1_private, shared, s2_private)}")
-    if s1_private + shared + s2_private != int(embed_dim):
-        raise ValueError(
-            f"split_dims {(s1_private, shared, s2_private)} do not sum to embed_dim={embed_dim}"
-        )
-    return s1_private, shared, s2_private
+def _gather_regularization_rows(
+    embeddings: torch.Tensor,
+    row_indices: torch.Tensor,
+) -> torch.Tensor:
+    flat = embeddings.reshape(-1, embeddings.shape[-1])
+    if row_indices.numel() == 0:
+        return flat.new_zeros((0, flat.shape[-1]))
+    return flat.index_select(0, row_indices)
 
 
 def compute_regularization_losses(
@@ -1625,13 +1694,12 @@ def compute_regularization_losses(
         zero = embeddings.new_zeros(())
         return zero, zero
 
-    mode = str(reg_cfg.get("mode", "per_subspace")).strip().lower()
-    if mode not in {"per_subspace", "global"}:
-        raise ValueError(f"Unsupported regularization.mode: {mode}")
+    mode = resolve_regularization_mode(config)
 
     max_samples = int(reg_cfg.get("max_samples", 0))
     token_weights = _all_embedding_weights(reference_model, batch, embedding_metadata)
-    rows = _flatten_regularization_rows(embeddings, token_weights, max_samples=max_samples)
+    row_indices = _regularization_row_indices(embeddings, token_weights, max_samples=max_samples)
+    rows = _gather_regularization_rows(embeddings, row_indices)
     zero = embeddings.new_zeros(())
     if rows.shape[0] < 2:
         return zero, zero
@@ -1664,10 +1732,11 @@ def compute_regularization_losses(
     if mode == "global":
         return regularize_subspace(rows), zero
 
-    s1_private_dim, shared_dim, s2_private_dim = _resolve_subspace_dims(reg_cfg, rows.shape[1])
-    s1_private = rows[:, :s1_private_dim]
-    shared = rows[:, s1_private_dim : s1_private_dim + shared_dim]
-    s2_private = rows[:, s1_private_dim + shared_dim : s1_private_dim + shared_dim + s2_private_dim]
+    s1_private_dim, shared_dim, s2_private_dim = resolve_regularization_subspace_dims(config)
+    projected = project_regularization_subspaces(reference_model, embeddings)
+    s1_private = _gather_regularization_rows(projected["s1_private"], row_indices)
+    shared = _gather_regularization_rows(projected["shared"], row_indices)
+    s2_private = _gather_regularization_rows(projected["s2_private"], row_indices)
 
     regularization_loss = (
         regularize_subspace(s1_private)
