@@ -100,5 +100,7 @@ regularization:
   vicreg_covariance_weight: ${EWM_VICREG_COVARIANCE_WEIGHT:-1.0}
 
 eval:
-  enabled: false
+  enabled: ${EWM_EVAL_ENABLED:-false}
   checkpoint_metric: ${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}
+  checkpoint_min_epoch: ${EWM_EVAL_CHECKPOINT_MIN_EPOCH:-1}
+  mask_mode: random

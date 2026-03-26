@@ -74,7 +74,7 @@ model:
 training:
   batch_size: ${EWM_BATCH_SIZE:-8}
   auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
-  epochs: ${EWM_EPOCHS:-12}
+  epochs: ${EWM_EPOCHS:-8}
   mixed_stage_epochs: ${EWM_MIXED_STAGE_EPOCHS:-4}
   mixed_stage_auxiliary_fraction: ${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}
   lr_schedule: ${EWM_LR_SCHEDULE:-warmup_hold_cosine}
@@ -122,11 +122,11 @@ regularization:
   max_samples: ${EWM_REG_MAX_SAMPLES:-256}
   base_lambda: ${EWM_REG_BASE_LAMBDA:-1.0}
   adaptive_alpha: ${EWM_REG_ADAPTIVE_ALPHA:-1.0}
-  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.1}
+  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.01}
   split_dims:
-    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-128}
-    shared: ${EWM_REG_SHARED_DIM:-512}
-    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-384}
+    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-1024}
+    shared: ${EWM_REG_SHARED_DIM:-1024}
+    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-1024}
   vicreg_variance_target: ${EWM_VICREG_VARIANCE_TARGET:-1.0}
   vicreg_variance_epsilon: ${EWM_VICREG_VARIANCE_EPSILON:-1.0e-4}
   vicreg_variance_weight: ${EWM_VICREG_VARIANCE_WEIGHT:-1.0}
@@ -136,6 +136,7 @@ eval:
   enabled: true
   every_epochs: 1
   checkpoint_metric: ${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}
+  checkpoint_min_epoch: ${EWM_EVAL_CHECKPOINT_MIN_EPOCH:-1}
   batch_size: ${EWM_EVAL_BATCH_SIZE:-8}
   max_batches: 0
   mask_mode: random

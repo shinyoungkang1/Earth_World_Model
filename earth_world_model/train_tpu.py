@@ -301,6 +301,13 @@ def resolve_eval_checkpoint_metric(config: dict) -> str:
     return aliases[metric]
 
 
+def resolve_eval_checkpoint_min_epoch(config: dict) -> int:
+    min_epoch = resolve_int_config(config.get("eval", {}).get("checkpoint_min_epoch"), default=1)
+    if min_epoch is None:
+        return 1
+    return max(1, int(min_epoch))
+
+
 def current_embedding_metadata(model: EarthWorldModel) -> EmbeddingMetadata:
     return EmbeddingMetadata(
         token_mode=str(model.token_mode),
@@ -1738,11 +1745,19 @@ def compute_regularization_losses(
     shared = _gather_regularization_rows(projected["shared"], row_indices)
     s2_private = _gather_regularization_rows(projected["s2_private"], row_indices)
 
-    regularization_loss = (
-        regularize_subspace(s1_private)
-        + regularize_subspace(shared)
-        + regularize_subspace(s2_private)
-    )
+    weighted_subspace_terms: list[tuple[int, torch.Tensor]] = []
+    if s1_private_dim > 0:
+        weighted_subspace_terms.append((s1_private_dim, regularize_subspace(s1_private)))
+    if shared_dim > 0:
+        weighted_subspace_terms.append((shared_dim, regularize_subspace(shared)))
+    if s2_private_dim > 0:
+        weighted_subspace_terms.append((s2_private_dim, regularize_subspace(s2_private)))
+    total_subspace_dim = sum(dim for dim, _loss in weighted_subspace_terms)
+    if total_subspace_dim > 0:
+        weighted_sum = sum((loss * float(dim) for dim, loss in weighted_subspace_terms), zero)
+        regularization_loss = weighted_sum / float(total_subspace_dim)
+    else:
+        regularization_loss = zero
 
     crosscov_penalty = zero
     if crosscov_mu > 0.0 and shared_dim > 0:
@@ -2303,6 +2318,7 @@ def main() -> None:
             auxiliary_loader = maybe_wrap_loader(auxiliary_loader, device, backend)
         eval_cfg = resolve_eval_config(config)
         checkpoint_metric_name = resolve_eval_checkpoint_metric(config)
+        checkpoint_min_epoch = resolve_eval_checkpoint_min_epoch(config)
         eval_dataset = None
         eval_loader = None
         if eval_cfg is not None:
@@ -2486,6 +2502,7 @@ def main() -> None:
                     "target_mode": target_mode,
                     "detach_self_target": resolve_detach_self_target(config),
                     "checkpoint_metric_name": checkpoint_metric_name,
+                    "checkpoint_min_epoch": checkpoint_min_epoch,
                 },
                 indent=2,
             ))
@@ -2518,6 +2535,7 @@ def main() -> None:
                     "target_mode": target_mode,
                     "detach_self_target": resolve_detach_self_target(config),
                     "checkpoint_metric_name": checkpoint_metric_name,
+                    "checkpoint_min_epoch": checkpoint_min_epoch,
                 },
             )
 
@@ -2827,8 +2845,11 @@ def main() -> None:
                 validation_mean_loss = float(eval_summary["mean_loss"])
                 validation_mean_masked_loss = float(eval_summary["mean_masked_loss"])
                 validation_checkpoint_metric_value = float(eval_summary[checkpoint_metric_name])
+                checkpoint_eligible = (epoch + 1) >= checkpoint_min_epoch
                 epoch_summary["validation_checkpoint_metric_name"] = checkpoint_metric_name
                 epoch_summary["validation_checkpoint_metric_value"] = validation_checkpoint_metric_value
+                epoch_summary["validation_checkpoint_min_epoch"] = checkpoint_min_epoch
+                epoch_summary["validation_checkpoint_eligible"] = checkpoint_eligible
                 if distributed.is_main_process:
                     print(
                         f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
@@ -2841,11 +2862,15 @@ def main() -> None:
                         f"checkpoint_metric={checkpoint_metric_name}:{validation_checkpoint_metric_value:.6f} "
                         f"validation_steps={eval_summary['step_count']}"
                     )
-                if best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss:
+                if checkpoint_eligible and (
+                    best_validation_mean_loss is None or validation_mean_loss < best_validation_mean_loss
+                ):
                     best_validation_mean_loss = validation_mean_loss
-                if best_validation_mean_masked_loss is None or validation_mean_masked_loss < best_validation_mean_masked_loss:
+                if checkpoint_eligible and (
+                    best_validation_mean_masked_loss is None or validation_mean_masked_loss < best_validation_mean_masked_loss
+                ):
                     best_validation_mean_masked_loss = validation_mean_masked_loss
-                if distributed.is_main_process and (
+                if checkpoint_eligible and distributed.is_main_process and (
                     best_validation_metric_value is None or validation_checkpoint_metric_value < best_validation_metric_value
                 ):
                     best_validation_metric_name = checkpoint_metric_name
@@ -2866,6 +2891,11 @@ def main() -> None:
                         payload["teacher"] = teacher.state_dict()
                     save_checkpoint(best_path, backend, payload)
                     print(f"saved best-val checkpoint ({best_validation_metric_name}): {best_path}")
+                elif distributed.is_main_process and not checkpoint_eligible:
+                    print(
+                        f"epoch={epoch + 1} checkpoint skipped: "
+                        f"checkpoint_min_epoch={checkpoint_min_epoch}"
+                    )
                 if distributed.is_main_process:
                     append_jsonl(metrics_path, eval_summary)
 
@@ -2928,6 +2958,8 @@ def main() -> None:
                 "start_epoch": start_epoch + 1,
                 "manifest_path": str(manifest_path),
                 "target_mode": target_mode,
+                "checkpoint_metric_name": checkpoint_metric_name,
+                "checkpoint_min_epoch": checkpoint_min_epoch,
                 "config": config,
             }
             write_json(summary_path, summary)
