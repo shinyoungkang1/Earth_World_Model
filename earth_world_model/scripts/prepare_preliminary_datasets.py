@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yearly-train-count", type=int, default=400)
     parser.add_argument("--yearly-val-count", type=int, default=32)
     parser.add_argument("--yearly-workers", type=int, default=max(1, min(4, (os.cpu_count() or 1))))
+    parser.add_argument(
+        "--yearly-metadata-flush-size",
+        type=int,
+        default=64,
+        help="Flush yearly parquet/index metadata after this many completed samples instead of every sample.",
+    )
     parser.add_argument(
         "--yearly-gcs-download-workers",
         type=int,
@@ -202,6 +209,12 @@ def load_existing_sample_ids(index_path: Path, sequences_dir: Path) -> set[str]:
     return sample_ids
 
 
+def count_sequence_files(sequences_dir: Path) -> int:
+    if not sequences_dir.exists():
+        return 0
+    return sum(1 for _ in sequences_dir.glob("*.npz"))
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -209,6 +222,36 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def add_progress_timestamps(progress_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    now_iso = utc_now_iso()
+    started_at = now_iso
+    elapsed_sec: float | None = None
+
+    if progress_path.exists():
+        try:
+            existing = read_json(progress_path)
+            started_at = str(existing.get("started_at") or started_at)
+        except Exception:
+            started_at = now_iso
+
+    try:
+        started_dt = datetime.fromisoformat(started_at)
+        elapsed_sec = max(0.0, (datetime.now(timezone.utc) - started_dt).total_seconds())
+    except Exception:
+        started_at = now_iso
+        elapsed_sec = 0.0
+
+    payload = dict(payload)
+    payload["started_at"] = started_at
+    payload["updated_at"] = now_iso
+    payload["elapsed_sec"] = float(elapsed_sec)
+    return payload
 
 
 def load_sample_payload(path: Path) -> dict[str, Any] | None:
@@ -509,18 +552,23 @@ def process_yearly_record(
 def write_yearly_progress(
     *,
     progress_path: Path,
+    sequences_dir: Path,
     split_name: str,
     target_count: int,
     completed_count: int,
+    observed_completed_count: int | None = None,
     sample_id: str | None,
 ) -> None:
+    if observed_completed_count is None:
+        observed_completed_count = max(int(completed_count), count_sequence_files(sequences_dir))
     payload = {
         "split": split_name,
         "target_count": int(target_count),
-        "completed_count": int(completed_count),
+        "completed_count": int(observed_completed_count),
+        "indexed_completed_count": int(completed_count),
         "last_completed_sample_id": sample_id,
     }
-    write_json(progress_path, payload)
+    write_json(progress_path, add_progress_timestamps(progress_path, payload))
 
 
 def convert_yearly_split_incremental(
@@ -537,6 +585,7 @@ def convert_yearly_split_incremental(
     gcs_download_timeout_sec: int,
     gcs_download_retries: int,
     gcs_transfer_backend: str,
+    metadata_flush_size: int,
     worker_limiter: threading.Semaphore | None = None,
 ) -> dict[str, Any]:
     if overwrite and output_dir.exists():
@@ -552,6 +601,7 @@ def convert_yearly_split_incremental(
     progress_path = output_dir / "progress.json"
 
     completed_sample_ids = load_existing_sample_ids(index_path, sequences_dir)
+    observed_completed_count = int(len(completed_sample_ids))
     processed = 0
     skipped = 0
     pending_records: list[dict[str, Any]] = []
@@ -562,15 +612,49 @@ def convert_yearly_split_incremental(
             staged_existing = staging_dir / sample_id
             if staged_existing.exists():
                 shutil.rmtree(staged_existing)
-            write_yearly_progress(
-                progress_path=progress_path,
-                split_name=split_name,
-                target_count=len(records),
-                completed_count=len(completed_sample_ids),
-                sample_id=sample_id,
-            )
             continue
         pending_records.append(record)
+
+    write_yearly_progress(
+        progress_path=progress_path,
+        sequences_dir=sequences_dir,
+        split_name=split_name,
+        target_count=len(records),
+        completed_count=len(completed_sample_ids),
+        observed_completed_count=observed_completed_count,
+        sample_id=None,
+    )
+
+    flush_size = max(1, int(metadata_flush_size))
+    pending_index_rows: list[dict[str, Any]] = []
+    pending_failed_rows: list[dict[str, Any]] = []
+    pending_normalization_rows: list[dict[str, Any]] = []
+    pending_completed_ids: list[str] = []
+
+    def flush_metadata(*, sample_id: str | None) -> None:
+        nonlocal observed_completed_count
+        if pending_index_rows:
+            append_parquet_rows(index_path, pending_index_rows)
+            pending_index_rows.clear()
+        if pending_failed_rows:
+            append_parquet_rows(failed_path, pending_failed_rows)
+            pending_failed_rows.clear()
+        if pending_normalization_rows:
+            append_parquet_rows(normalization_path, pending_normalization_rows)
+            pending_normalization_rows.clear()
+        if pending_completed_ids:
+            completed_sample_ids.update(pending_completed_ids)
+            observed_completed_count = max(observed_completed_count, len(completed_sample_ids))
+            pending_completed_ids.clear()
+        write_yearly_progress(
+            progress_path=progress_path,
+            sequences_dir=sequences_dir,
+            split_name=split_name,
+            target_count=len(records),
+            completed_count=len(completed_sample_ids),
+            observed_completed_count=observed_completed_count,
+            sample_id=sample_id,
+        )
 
     worker_count = max(1, int(yearly_workers))
     if worker_count == 1:
@@ -589,19 +673,18 @@ def convert_yearly_split_incremental(
                 gcs_download_retries=gcs_download_retries,
                 gcs_transfer_backend=gcs_transfer_backend,
             )
-            append_parquet_rows(index_path, result["npz_rows"])
-            append_parquet_rows(failed_path, result["failed_rows"])
-            append_parquet_rows(normalization_path, result["normalization_rows"])
-            completed_sample_ids.add(str(result["sample_id"]))
+            pending_index_rows.extend(result["npz_rows"])
+            pending_failed_rows.extend(result["failed_rows"])
+            pending_normalization_rows.extend(result["normalization_rows"])
+            pending_completed_ids.append(str(result["sample_id"]))
             processed += 1
             shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
-            write_yearly_progress(
-                progress_path=progress_path,
-                split_name=split_name,
-                target_count=len(records),
-                completed_count=len(completed_sample_ids),
-                sample_id=str(result["sample_id"]),
+            observed_completed_count = max(
+                observed_completed_count,
+                len(completed_sample_ids) + len(pending_completed_ids),
             )
+            if len(pending_completed_ids) >= flush_size:
+                flush_metadata(sample_id=str(result["sample_id"]))
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_record = {
@@ -626,24 +709,26 @@ def convert_yearly_split_incremental(
                 record = future_to_record[future]
                 sample_id = str(record["sample_id"])
                 result = future.result()
-                append_parquet_rows(index_path, result["npz_rows"])
-                append_parquet_rows(failed_path, result["failed_rows"])
-                append_parquet_rows(normalization_path, result["normalization_rows"])
-                completed_sample_ids.add(sample_id)
+                pending_index_rows.extend(result["npz_rows"])
+                pending_failed_rows.extend(result["failed_rows"])
+                pending_normalization_rows.extend(result["normalization_rows"])
+                pending_completed_ids.append(sample_id)
                 processed += 1
                 shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
-                write_yearly_progress(
-                    progress_path=progress_path,
-                    split_name=split_name,
-                    target_count=len(records),
-                    completed_count=len(completed_sample_ids),
-                    sample_id=sample_id,
+                observed_completed_count = max(
+                    observed_completed_count,
+                    len(completed_sample_ids) + len(pending_completed_ids),
                 )
+                if len(pending_completed_ids) >= flush_size:
+                    flush_metadata(sample_id=sample_id)
 
+    flush_metadata(sample_id=pending_completed_ids[-1] if pending_completed_ids else None)
+    actual_completed_count = max(int(len(completed_sample_ids)), observed_completed_count, count_sequence_files(sequences_dir))
     summary = {
         "split": split_name,
         "target_count": int(len(records)),
-        "completed_count": int(len(completed_sample_ids)),
+        "completed_count": int(actual_completed_count),
+        "indexed_completed_count": int(len(completed_sample_ids)),
         "processed_this_run": int(processed),
         "skipped_existing": int(skipped),
         "output_dir": str(output_dir),
@@ -738,7 +823,7 @@ def write_ssl4eo_progress(
         "cumulative_samples": int(cumulative_samples),
         "last_filename": last_filename,
     }
-    write_json(progress_path, payload)
+    write_json(progress_path, add_progress_timestamps(progress_path, payload))
 
 
 def open_ssl4eo_target(path: Path):
@@ -1094,6 +1179,7 @@ def main() -> int:
             gcs_download_timeout_sec=int(args.yearly_gcs_download_timeout_sec),
             gcs_download_retries=int(args.yearly_gcs_download_retries),
             gcs_transfer_backend=str(args.yearly_gcs_transfer_backend),
+            metadata_flush_size=int(args.yearly_metadata_flush_size),
             worker_limiter=shared_worker_limiter,
         )
         val_summary = convert_yearly_split_incremental(
@@ -1109,6 +1195,7 @@ def main() -> int:
             gcs_download_timeout_sec=int(args.yearly_gcs_download_timeout_sec),
             gcs_download_retries=int(args.yearly_gcs_download_retries),
             gcs_transfer_backend=str(args.yearly_gcs_transfer_backend),
+            metadata_flush_size=int(args.yearly_metadata_flush_size),
             worker_limiter=shared_worker_limiter,
         )
         return {
