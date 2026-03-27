@@ -215,6 +215,20 @@ def count_sequence_files(sequences_dir: Path) -> int:
     return sum(1 for _ in sequences_dir.glob("*.npz"))
 
 
+def prune_completed_yearly_staging(*, completed_sample_ids: set[str], staging_dir: Path) -> int:
+    if not staging_dir.exists():
+        return 0
+    removed = 0
+    for sample_dir in staging_dir.iterdir():
+        if not sample_dir.is_dir():
+            continue
+        if sample_dir.name not in completed_sample_ids:
+            continue
+        shutil.rmtree(sample_dir, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -530,23 +544,28 @@ def process_yearly_record(
         gcs_transfer_backend=gcs_transfer_backend,
     )
     sample_id = str(record["sample_id"])
-    tif_paths = sorted(staged_sample_dir.glob("*.tif"))
-    yearly_record = EE_CONVERTER.read_ee_tif_records(
-        sample_id=sample_id,
-        tif_paths=tif_paths,
-        manifests={},
-        locations={},
-        year=int(year),
-        chip_size=int(chip_size),
-    )
-    npz_rows = EE_CONVERTER.write_npz_records(output_dir, [yearly_record])
-    return {
-        "sample_id": sample_id,
-        "npz_rows": npz_rows,
-        "failed_rows": [failure for failure in yearly_record.get("failed_chunks", [])],
-        "normalization_rows": [event for event in yearly_record.get("normalization_events", [])],
-        "staged_sample_dir": str(staged_sample_dir),
-    }
+    try:
+        tif_paths = sorted(staged_sample_dir.glob("*.tif"))
+        yearly_record = EE_CONVERTER.read_ee_tif_records(
+            sample_id=sample_id,
+            tif_paths=tif_paths,
+            manifests={},
+            locations={},
+            year=int(year),
+            chip_size=int(chip_size),
+        )
+        npz_rows = EE_CONVERTER.write_npz_records(output_dir, [yearly_record])
+        return {
+            "sample_id": sample_id,
+            "npz_rows": npz_rows,
+            "failed_rows": [failure for failure in yearly_record.get("failed_chunks", [])],
+            "normalization_rows": [event for event in yearly_record.get("normalization_events", [])],
+        }
+    finally:
+        # Once the final NPZ exists, the raw per-sample staging copy is no longer needed.
+        # Cleaning here prevents the main thread's metadata work from allowing staging to balloon.
+        if staged_sample_dir.exists():
+            shutil.rmtree(staged_sample_dir, ignore_errors=True)
 
 
 def write_yearly_progress(
@@ -601,6 +620,10 @@ def convert_yearly_split_incremental(
     progress_path = output_dir / "progress.json"
 
     completed_sample_ids = load_existing_sample_ids(index_path, sequences_dir)
+    pruned_existing_staging_dirs = prune_completed_yearly_staging(
+        completed_sample_ids=completed_sample_ids,
+        staging_dir=staging_dir,
+    )
     observed_completed_count = int(len(completed_sample_ids))
     processed = 0
     skipped = 0
@@ -678,7 +701,6 @@ def convert_yearly_split_incremental(
             pending_normalization_rows.extend(result["normalization_rows"])
             pending_completed_ids.append(str(result["sample_id"]))
             processed += 1
-            shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
             observed_completed_count = max(
                 observed_completed_count,
                 len(completed_sample_ids) + len(pending_completed_ids),
@@ -714,7 +736,6 @@ def convert_yearly_split_incremental(
                 pending_normalization_rows.extend(result["normalization_rows"])
                 pending_completed_ids.append(sample_id)
                 processed += 1
-                shutil.rmtree(Path(result["staged_sample_dir"]), ignore_errors=True)
                 observed_completed_count = max(
                     observed_completed_count,
                     len(completed_sample_ids) + len(pending_completed_ids),
@@ -731,6 +752,7 @@ def convert_yearly_split_incremental(
         "indexed_completed_count": int(len(completed_sample_ids)),
         "processed_this_run": int(processed),
         "skipped_existing": int(skipped),
+        "pruned_existing_staging_dirs": int(pruned_existing_staging_dirs),
         "output_dir": str(output_dir),
         "index_path": str(index_path),
         "progress_path": str(progress_path),
