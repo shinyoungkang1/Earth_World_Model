@@ -152,6 +152,11 @@ bash earth_world_model/scripts/gcp_prepare_yearly10k_ssl4eo50k_to_ssd.sh
 
 That launcher creates or reuses the prep VM and SSD, syncs the repo, bootstraps the remote Python environment, and starts the dataset build remotely. It does not require local copies of the training data.
 
+For post-training validation bookkeeping, see:
+
+- [POSTTRAIN_EVAL_README.md](/home/shin/Mineral_Gas_Locator/earth_world_model/scripts/POSTTRAIN_EVAL_README.md)
+- [POSTTRAIN_EVAL_MANIFEST_TEMPLATE.yaml](/home/shin/Mineral_Gas_Locator/earth_world_model/scripts/POSTTRAIN_EVAL_MANIFEST_TEMPLATE.yaml)
+
 ## Current Results (2026-03-22)
 
 3-region regression (PA + SWPA + WV, 636 wells, f12_gas target):

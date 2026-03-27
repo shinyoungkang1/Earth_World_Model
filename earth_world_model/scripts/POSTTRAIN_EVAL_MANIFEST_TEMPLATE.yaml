@@ -1,0 +1,62 @@
+run:
+  run_id: "replace_me"
+  experiment_family: "paper2_or_paper3"
+  notes: ""
+
+repo:
+  git_commit: "replace_me"
+  config_repo_path: "earth_world_model/configs/replace_me.yaml"
+  launcher_script: "earth_world_model/scripts/run_phase2_gpu_vm.sh"
+
+gcs:
+  run_uri: "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/replace_me"
+  checkpoint_uri: "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/replace_me/checkpoints/ewm_best_val.pt"
+  summary_uri: "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/replace_me/training_summary.json"
+  metrics_uri: "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/replace_me/metrics.jsonl"
+  run_manifest_uri: "gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/replace_me/run_manifest.json"
+
+prepared_data:
+  yearly_root: "/mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/yearly_10000"
+  yearly_train_index_path: "/mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/yearly_10000/train/dense_temporal_index.parquet"
+  yearly_val_index_path: "/mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/yearly_10000/val/dense_temporal_index.parquet"
+  ssl4eo_root: "/mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/ssl4eo_50000"
+
+eval_bundle:
+  checkpoint_path: "/tmp/ewm_eval/checkpoints/ewm_best_val.pt"
+  config_path: "earth_world_model/configs/replace_me.yaml"
+  index_path: "/mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/yearly_10000/train/dense_temporal_index.parquet"
+  output_root: "/tmp/ewm_eval_outputs/replace_me"
+  device: "cuda"
+  sample_indices: "0,1,2,3,4"
+  run_drift: true
+  run_retrieval: true
+  run_probes: true
+  run_flood: false
+
+benchmarks:
+  flood_data_dir: "/path/to/sen1floods11"
+  dfc2020_manifest: "/path/to/dfc2020/manifest.parquet"
+  dfc2020_data_root: "/path/to/dfc2020"
+  bigearthnetv2_manifest: "/path/to/bigearthnetv2/manifest.parquet"
+  bigearthnetv2_data_root: "/path/to/bigearthnetv2"
+  biomassters_manifest: "/path/to/biomassters/manifest.parquet"
+  biomassters_data_root: "/path/to/biomassters"
+
+validation_metrics:
+  checkpoint_metric_name: "mean_masked_loss"
+  expected_summary_fields:
+    - "mean_loss"
+    - "mean_masked_loss"
+    - "mean_context_loss"
+    - "mean_dynamics_loss"
+    - "mean_cross_sensor_loss"
+    - "mean_state_change_loss"
+    - "mean_regularization_loss"
+    - "mean_crosscov_penalty"
+
+post_run_checks:
+  - "Confirm checkpoint exists in GCS"
+  - "Confirm training_summary.json exists in GCS"
+  - "Confirm run_manifest.json exists in GCS"
+  - "Confirm yearly index path exists on eval machine"
+  - "Confirm benchmark data path exists for any enabled downstream eval"
