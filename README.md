@@ -96,6 +96,62 @@ python scripts/train_ewm_attentive_probe.py \
   --probe-depth 1 --epochs 200
 ```
 
+## Fresh Laptop Cloud Setup
+
+If a laptop only has the repo checkout and no local data, that is still enough to launch the remote prep pipeline. The data prep flow is designed to run on GCP VMs and pull from GCS/Hugging Face there.
+
+Minimum local prerequisites:
+
+- `git`
+- `bash`
+- `tar`
+- `gcloud` CLI
+- Google Cloud access to project `omois-483220`
+
+Required cloud access:
+
+- `gcloud auth login`
+- `gcloud auth application-default login`
+- permission to create/start/stop/ssh/scp Compute Engine VMs
+- permission to create/attach/detach persistent disks
+- permission to read/write the project GCS buckets
+
+Recommended local setup:
+
+```bash
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project omois-483220
+gcloud config set compute/zone us-central1-c
+```
+
+Optional SSH convenience setup:
+
+```bash
+gcloud compute config-ssh
+```
+
+Notes:
+
+- `gcloud compute config-ssh` does not require a service-account JSON key in the normal laptop setup.
+- It creates or reuses local SSH keys and updates `~/.ssh/config` for Compute Engine hosts.
+- `gcloud compute ssh` and `gcloud compute scp` can still work without this step.
+
+What is not stored in git:
+
+- datasets
+- checkpoints
+- `earth_world_model/local_paper2_viz`
+- results/model caches
+
+For the current remote SSD prep flow, the main entrypoint is:
+
+```bash
+bash earth_world_model/scripts/gcp_prepare_yearly10k_ssl4eo50k_to_ssd.sh
+```
+
+That launcher creates or reuses the prep VM and SSD, syncs the repo, bootstraps the remote Python environment, and starts the dataset build remotely. It does not require local copies of the training data.
+
 ## Current Results (2026-03-22)
 
 3-region regression (PA + SWPA + WV, 636 wells, f12_gas target):
