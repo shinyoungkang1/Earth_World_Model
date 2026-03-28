@@ -57,6 +57,11 @@ model:
   scene_latent_dim: 64
   state_latent_dim: 64
   delta_hidden_dim: 64
+  observation_planning:
+    enabled: ${EWM_OBSERVATION_PLANNING_ENABLED:-true}
+    hidden_dim: 64
+    action_dim: 32
+    sensor_vocab: [s2, s1, hls]
 
 training:
   batch_size: ${EWM_BATCH_SIZE:-2}
@@ -95,6 +100,27 @@ training:
   scene_consistency_weight: ${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}
   delta_loss_weight: ${EWM_DELTA_LOSS_WEIGHT:-0.0}
   delta_random_horizon_max: ${EWM_DELTA_RANDOM_HORIZON_MAX:-0}
+  observation_planning:
+    enabled: ${EWM_TRAIN_OBSERVATION_PLANNING_ENABLED:-false}
+    random_horizon_max: ${EWM_TRAIN_OBSERVATION_PLANNING_RANDOM_HORIZON_MAX:-0}
+    transition_loss_weight: ${EWM_TRAIN_OBSERVATION_PLANNING_TRANSITION_LOSS_WEIGHT:-0.0}
+    score_loss_weight: ${EWM_TRAIN_OBSERVATION_PLANNING_SCORE_LOSS_WEIGHT:-0.0}
+    utility_temperature: ${EWM_TRAIN_OBSERVATION_PLANNING_UTILITY_TEMPERATURE:-0.01}
+    cost_scale: ${EWM_TRAIN_OBSERVATION_PLANNING_COST_SCALE:-1.0}
+    sensor_costs:
+      s2: ${EWM_TRAIN_OBSERVATION_PLANNING_COST_S2:-1.0}
+      s1: ${EWM_TRAIN_OBSERVATION_PLANNING_COST_S1:-1.0}
+      hls: ${EWM_TRAIN_OBSERVATION_PLANNING_COST_HLS:-1.0}
+  sensor_dropout:
+    enabled: ${EWM_SENSOR_DROPOUT_ENABLED:-true}
+    mode: ${EWM_SENSOR_DROPOUT_MODE:-sequence}
+    keep_at_least_one_sensor: true
+    s2_sequence_drop_prob: ${EWM_SENSOR_DROPOUT_S2_SEQUENCE_PROB:-0.2}
+    s1_sequence_drop_prob: ${EWM_SENSOR_DROPOUT_S1_SEQUENCE_PROB:-0.2}
+    hls_sequence_drop_prob: ${EWM_SENSOR_DROPOUT_HLS_SEQUENCE_PROB:-0.0}
+    s2_timestep_drop_prob: ${EWM_SENSOR_DROPOUT_S2_TIMESTEP_PROB:-0.0}
+    s1_timestep_drop_prob: ${EWM_SENSOR_DROPOUT_S1_TIMESTEP_PROB:-0.0}
+    hls_timestep_drop_prob: ${EWM_SENSOR_DROPOUT_HLS_TIMESTEP_PROB:-0.0}
 
 regularization:
   method: none

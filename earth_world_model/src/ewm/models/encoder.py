@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,15 @@ class ConvPatchEmbed3D(nn.Module):
         return outputs.permute(0, 2, 3, 4, 1).reshape(batch, groups, grid_h * grid_w, channels)
 
 
+@dataclass(frozen=True)
+class SensorAdapterSpec:
+    name: str
+    in_channels: int
+    supports_2d: bool
+    supports_3d: bool
+    supports_missing_embedding: bool = True
+
+
 class SpatialEncoder(nn.Module):
     """Patchify S2/S1 inputs with explicit 2D or 3D tokenizers."""
 
@@ -130,6 +140,12 @@ class SpatialEncoder(nn.Module):
         self.s1_proj_3d: nn.Module | None = None
         self.hls_proj_3d: nn.Module | None = None
         self.joint_proj_3d: nn.Module | None = None
+        self.extra_linear_proj = nn.ModuleDict()
+        self.extra_proj_2d = nn.ModuleDict()
+        self.extra_proj_3d = nn.ModuleDict()
+        self.extra_mod_embeds = nn.ParameterDict()
+        self.extra_missing_embeds = nn.ParameterDict()
+        self._sensor_specs: dict[str, SensorAdapterSpec] = {}
         if self.tokenizer_mode == "auto":
             self.s2_proj_2d = ConvPatchEmbed2D(12, embed_dim, self.patch_px)
             self.s1_proj_2d = ConvPatchEmbed2D(2, embed_dim, self.patch_px)
@@ -190,6 +206,71 @@ class SpatialEncoder(nn.Module):
                 mlp_ratio=2.0,
                 dropout=0.1,
             )
+        self._register_builtin_sensor_specs()
+
+    def _register_builtin_sensor_specs(self) -> None:
+        self._sensor_specs["s2"] = SensorAdapterSpec("s2", in_channels=12, supports_2d=True, supports_3d=True)
+        self._sensor_specs["s1"] = SensorAdapterSpec("s1", in_channels=2, supports_2d=True, supports_3d=True)
+        self._sensor_specs["joint"] = SensorAdapterSpec(
+            "joint",
+            in_channels=14,
+            supports_2d=True,
+            supports_3d=True,
+            supports_missing_embedding=False,
+        )
+        self._sensor_specs["hls"] = SensorAdapterSpec(
+            "hls",
+            in_channels=6,
+            supports_2d=True,
+            supports_3d=True,
+            supports_missing_embedding=False,
+        )
+
+    def describe_sensor_adapters(self) -> dict[str, SensorAdapterSpec]:
+        return dict(self._sensor_specs)
+
+    def sensor_names(self) -> tuple[str, ...]:
+        return tuple(self._sensor_specs.keys())
+
+    def has_sensor_adapter(self, name: str) -> bool:
+        return str(name).strip().lower() in self._sensor_specs
+
+    def register_runtime_sensor_adapter(
+        self,
+        name: str,
+        *,
+        in_channels: int,
+        supports_2d: bool = True,
+        supports_3d: bool = True,
+        supports_missing_embedding: bool = True,
+    ) -> None:
+        sensor_name = str(name).strip().lower()
+        if sensor_name in self._sensor_specs:
+            raise ValueError(f"Sensor adapter {sensor_name!r} is already registered")
+        if not supports_2d and not supports_3d:
+            raise ValueError("A sensor adapter must support at least one tokenizer mode")
+        channels = int(in_channels)
+        if channels <= 0:
+            raise ValueError(f"in_channels must be positive, got {channels}")
+        self._sensor_specs[sensor_name] = SensorAdapterSpec(
+            name=sensor_name,
+            in_channels=channels,
+            supports_2d=bool(supports_2d),
+            supports_3d=bool(supports_3d),
+            supports_missing_embedding=bool(supports_missing_embedding),
+        )
+        self.extra_linear_proj[sensor_name] = SensorProjector(channels * self.patch_px * self.patch_px, self.embed_dim)
+        if supports_2d:
+            self.extra_proj_2d[sensor_name] = ConvPatchEmbed2D(channels, self.embed_dim, self.patch_px)
+        if supports_3d:
+            self.extra_proj_3d[sensor_name] = ConvPatchEmbed3D(channels, self.embed_dim, self.patch_px, self.tubelet_size)
+        self.extra_mod_embeds[sensor_name] = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        if self.use_modality_embeddings:
+            nn.init.normal_(self.extra_mod_embeds[sensor_name], std=1.0e-6)
+        if supports_missing_embedding:
+            self.extra_missing_embeds[sensor_name] = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+            if self.use_missing_modality_embeddings:
+                nn.init.normal_(self.extra_missing_embeds[sensor_name], std=1.0e-6)
 
     def resolve_tokenizer_type(self, timesteps: int | None = None) -> str:
         if self.tokenizer_mode == "force_2d":
@@ -204,30 +285,40 @@ class SpatialEncoder(nn.Module):
 
     def _projector_for(self, modality: str, tokenizer_type: str) -> nn.Module:
         tokenizer_type = str(tokenizer_type).lower()
-        if tokenizer_type == "linear":
-            projector_map = {
-                "s2": self.s2_proj,
-                "s1": self.s1_proj,
-                "joint": self.joint_proj,
-                "hls": self.hls_proj,
-            }
-        elif tokenizer_type == "conv2d":
-            projector_map = {
-                "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_2d,
-                "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_2d,
-                "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_2d,
-                "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_2d,
-            }
-        elif tokenizer_type == "conv3d":
-            projector_map = {
-                "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_3d,
-                "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_3d,
-                "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_3d,
-                "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_3d,
-            }
+        if modality in self.extra_linear_proj:
+            if tokenizer_type == "linear":
+                projector = self.extra_linear_proj[modality]
+            elif tokenizer_type == "conv2d":
+                projector = self.extra_proj_2d[modality] if modality in self.extra_proj_2d else None
+            elif tokenizer_type == "conv3d":
+                projector = self.extra_proj_3d[modality] if modality in self.extra_proj_3d else None
+            else:
+                raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
         else:
-            raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
-        projector = projector_map.get(modality)
+            if tokenizer_type == "linear":
+                projector_map = {
+                    "s2": self.s2_proj,
+                    "s1": self.s1_proj,
+                    "joint": self.joint_proj,
+                    "hls": self.hls_proj,
+                }
+            elif tokenizer_type == "conv2d":
+                projector_map = {
+                    "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_2d,
+                    "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_2d,
+                    "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_2d,
+                    "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_2d,
+                }
+            elif tokenizer_type == "conv3d":
+                projector_map = {
+                    "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_3d,
+                    "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_3d,
+                    "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_3d,
+                    "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_3d,
+                }
+            else:
+                raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
+            projector = projector_map.get(modality)
         if projector is None:
             raise ValueError(f"Unsupported modality {modality!r} for tokenizer_type={tokenizer_type}")
         return projector
@@ -269,6 +360,8 @@ class SpatialEncoder(nn.Module):
                 mod_embed = self.hls_mod_embed
             elif modality == "joint":
                 mod_embed = self.joint_mod_embed
+            elif modality in self.extra_mod_embeds:
+                mod_embed = self.extra_mod_embeds[modality]
             else:
                 raise ValueError(f"Unsupported modality {modality!r}")
             mod_embed = mod_embed.to(device=result.device, dtype=result.dtype)
@@ -282,6 +375,8 @@ class SpatialEncoder(nn.Module):
             missing = self.s2_missing_embed
         elif modality == "s1":
             missing = self.s1_missing_embed
+        elif modality in self.extra_missing_embeds:
+            missing = self.extra_missing_embeds[modality]
         else:
             raise ValueError(f"Unsupported modality {modality!r}")
         missing = missing.to(device=device, dtype=dtype)
@@ -428,35 +523,49 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         tokenizer_type: str | None = None,
     ) -> list[torch.Tensor]:
         pieces: list[torch.Tensor] = []
         if hls is not None:
             pieces.append(self._project_step_tokens(hls, modality="hls", tokenizer_type=tokenizer_type))
-            return pieces
-
-        if s2 is None or s1 is None:
-            raise ValueError("s2 and s1 are required when hls is not provided")
-        if not self.separate_sensor_encoders:
-            joint_inputs = torch.cat(
-                [
-                    self._apply_presence_mask_step(s2, s2_present),
-                    self._apply_presence_mask_step(s1, s1_present),
-                ],
-                dim=1,
-            )
-            pieces.append(self._project_step_tokens(joint_inputs, modality="joint", tokenizer_type=tokenizer_type))
-            return pieces
-        s2_tokens = self._project_step_tokens(s2, modality="s2", tokenizer_type=tokenizer_type)
-        s1_tokens = self._project_step_tokens(s1, modality="s1", tokenizer_type=tokenizer_type)
-        if self.use_missing_modality_embeddings and s2_present is not None:
-            missing = (~s2_present.to(torch.bool)).view(-1, 1, 1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
-            s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
-        if self.use_missing_modality_embeddings and s1_present is not None:
-            missing = (~s1_present.to(torch.bool)).view(-1, 1, 1).to(device=s1_tokens.device, dtype=s1_tokens.dtype)
-            s1_tokens = s1_tokens + (missing * self._missing_embed("s1", device=s1_tokens.device, dtype=s1_tokens.dtype, ndims=s1_tokens.ndim))
-        pieces.append(s2_tokens)
-        pieces.append(s1_tokens)
+        if s2 is not None or s1 is not None:
+            if s2 is None or s1 is None:
+                raise ValueError("s2 and s1 must either both be provided or both be omitted")
+            if not self.separate_sensor_encoders:
+                joint_inputs = torch.cat(
+                    [
+                        self._apply_presence_mask_step(s2, s2_present),
+                        self._apply_presence_mask_step(s1, s1_present),
+                    ],
+                    dim=1,
+                )
+                pieces.append(self._project_step_tokens(joint_inputs, modality="joint", tokenizer_type=tokenizer_type))
+            else:
+                s2_tokens = self._project_step_tokens(s2, modality="s2", tokenizer_type=tokenizer_type)
+                s1_tokens = self._project_step_tokens(s1, modality="s1", tokenizer_type=tokenizer_type)
+                if self.use_missing_modality_embeddings and s2_present is not None:
+                    missing = (~s2_present.to(torch.bool)).view(-1, 1, 1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
+                    s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
+                if self.use_missing_modality_embeddings and s1_present is not None:
+                    missing = (~s1_present.to(torch.bool)).view(-1, 1, 1).to(device=s1_tokens.device, dtype=s1_tokens.dtype)
+                    s1_tokens = s1_tokens + (missing * self._missing_embed("s1", device=s1_tokens.device, dtype=s1_tokens.dtype, ndims=s1_tokens.ndim))
+                pieces.append(s2_tokens)
+                pieces.append(s1_tokens)
+        for sensor_name, sensor_inputs in sorted((extra_sensors or {}).items()):
+            if not self.has_sensor_adapter(sensor_name):
+                raise ValueError(f"Unknown runtime sensor adapter {sensor_name!r}")
+            sensor_tokens = self._project_step_tokens(sensor_inputs, modality=sensor_name, tokenizer_type=tokenizer_type)
+            sensor_present = None if extra_sensor_present is None else extra_sensor_present.get(sensor_name)
+            if self.use_missing_modality_embeddings and sensor_present is not None:
+                missing = (~sensor_present.to(torch.bool)).view(-1, 1, 1).to(device=sensor_tokens.device, dtype=sensor_tokens.dtype)
+                sensor_tokens = sensor_tokens + (
+                    missing * self._missing_embed(sensor_name, device=sensor_tokens.device, dtype=sensor_tokens.dtype, ndims=sensor_tokens.ndim)
+                )
+            pieces.append(sensor_tokens)
+        if not pieces:
+            raise ValueError("At least one sensor input is required")
         return pieces
 
     def encode_sequence_modalities(
@@ -466,40 +575,67 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         tokenizer_type: str | None = None,
     ) -> list[torch.Tensor]:
-        resolved_tokenizer = self.resolve_tokenizer_type(s2.shape[1] if s2 is not None else hls.shape[1],) if tokenizer_type is None else str(tokenizer_type).lower()
+        if tokenizer_type is None:
+            if s2 is not None:
+                time_source = s2
+            elif hls is not None:
+                time_source = hls
+            elif extra_sensors:
+                time_source = next(iter(extra_sensors.values()))
+            else:
+                raise ValueError("At least one sequence input is required")
+            resolved_tokenizer = self.resolve_tokenizer_type(time_source.shape[1])
+        else:
+            resolved_tokenizer = str(tokenizer_type).lower()
         if resolved_tokenizer != "conv3d":
             raise ValueError("encode_sequence_modalities is only supported for conv3d tokenizers")
         pieces: list[torch.Tensor] = []
         if hls is not None:
             pieces.append(self._project_sequence_tokens(hls, modality="hls", tokenizer_type=resolved_tokenizer))
-            return pieces
-
-        if s2 is None or s1 is None:
-            raise ValueError("s2 and s1 are required when hls is not provided")
-        if not self.separate_sensor_encoders:
-            joint_inputs = torch.cat(
-                [
-                    self._apply_presence_mask_sequence(s2, s2_present),
-                    self._apply_presence_mask_sequence(s1, s1_present),
-                ],
-                dim=2,
-            )
-            pieces.append(self._project_sequence_tokens(joint_inputs, modality="joint", tokenizer_type=resolved_tokenizer))
-            return pieces
-        s2_tokens = self._project_sequence_tokens(s2, modality="s2", tokenizer_type=resolved_tokenizer)
-        s1_tokens = self._project_sequence_tokens(s1, modality="s1", tokenizer_type=resolved_tokenizer)
-        grouped_s2_present = self.aggregate_temporal_presence(s2_present, tokenizer_type=resolved_tokenizer)
-        grouped_s1_present = self.aggregate_temporal_presence(s1_present, tokenizer_type=resolved_tokenizer)
-        if self.use_missing_modality_embeddings and grouped_s2_present is not None:
-            missing = (~grouped_s2_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
-            s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
-        if self.use_missing_modality_embeddings and grouped_s1_present is not None:
-            missing = (~grouped_s1_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=s1_tokens.device, dtype=s1_tokens.dtype)
-            s1_tokens = s1_tokens + (missing * self._missing_embed("s1", device=s1_tokens.device, dtype=s1_tokens.dtype, ndims=s1_tokens.ndim))
-        pieces.append(s2_tokens)
-        pieces.append(s1_tokens)
+        if s2 is not None or s1 is not None:
+            if s2 is None or s1 is None:
+                raise ValueError("s2 and s1 must either both be provided or both be omitted")
+            if not self.separate_sensor_encoders:
+                joint_inputs = torch.cat(
+                    [
+                        self._apply_presence_mask_sequence(s2, s2_present),
+                        self._apply_presence_mask_sequence(s1, s1_present),
+                    ],
+                    dim=2,
+                )
+                pieces.append(self._project_sequence_tokens(joint_inputs, modality="joint", tokenizer_type=resolved_tokenizer))
+            else:
+                s2_tokens = self._project_sequence_tokens(s2, modality="s2", tokenizer_type=resolved_tokenizer)
+                s1_tokens = self._project_sequence_tokens(s1, modality="s1", tokenizer_type=resolved_tokenizer)
+                grouped_s2_present = self.aggregate_temporal_presence(s2_present, tokenizer_type=resolved_tokenizer)
+                grouped_s1_present = self.aggregate_temporal_presence(s1_present, tokenizer_type=resolved_tokenizer)
+                if self.use_missing_modality_embeddings and grouped_s2_present is not None:
+                    missing = (~grouped_s2_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
+                    s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
+                if self.use_missing_modality_embeddings and grouped_s1_present is not None:
+                    missing = (~grouped_s1_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=s1_tokens.device, dtype=s1_tokens.dtype)
+                    s1_tokens = s1_tokens + (missing * self._missing_embed("s1", device=s1_tokens.device, dtype=s1_tokens.dtype, ndims=s1_tokens.ndim))
+                pieces.append(s2_tokens)
+                pieces.append(s1_tokens)
+        for sensor_name, sensor_inputs in sorted((extra_sensors or {}).items()):
+            if not self.has_sensor_adapter(sensor_name):
+                raise ValueError(f"Unknown runtime sensor adapter {sensor_name!r}")
+            sensor_tokens = self._project_sequence_tokens(sensor_inputs, modality=sensor_name, tokenizer_type=resolved_tokenizer)
+            grouped_present = None
+            if extra_sensor_present is not None:
+                grouped_present = self.aggregate_temporal_presence(extra_sensor_present.get(sensor_name), tokenizer_type=resolved_tokenizer)
+            if self.use_missing_modality_embeddings and grouped_present is not None:
+                missing = (~grouped_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=sensor_tokens.device, dtype=sensor_tokens.dtype)
+                sensor_tokens = sensor_tokens + (
+                    missing * self._missing_embed(sensor_name, device=sensor_tokens.device, dtype=sensor_tokens.dtype, ndims=sensor_tokens.ndim)
+                )
+            pieces.append(sensor_tokens)
+        if not pieces:
+            raise ValueError("At least one sensor input is required")
         return pieces
 
     def step_token_template(self, tokens_per_step: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -538,17 +674,19 @@ class SpatialEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported token rank {reference.ndim}")
         if self.fusion_mode == "cross_attend":
-            if len(pieces) != 2:
-                raise ValueError("cross_attend fusion requires exactly two modality token tensors")
-            left, right = pieces
-            if reference.ndim == 4:
-                batch, timesteps, patch_tokens, embed_dim = left.shape
-                fused = self.cross_modal_fusion(
-                    left.reshape(batch * timesteps, patch_tokens, embed_dim),
-                    right.reshape(batch * timesteps, patch_tokens, embed_dim),
-                )
-                return fused.reshape(batch, timesteps, patch_tokens, embed_dim)
-            return self.cross_modal_fusion(left, right)
+            if self.cross_modal_fusion is None:
+                raise RuntimeError("cross_attend fusion requested, but cross_modal_fusion is not initialized")
+            fused = pieces[0]
+            for other in pieces[1:]:
+                if reference.ndim == 4:
+                    batch, timesteps, patch_tokens, embed_dim = fused.shape
+                    fused = self.cross_modal_fusion(
+                        fused.reshape(batch * timesteps, patch_tokens, embed_dim),
+                        other.reshape(batch * timesteps, patch_tokens, embed_dim),
+                    ).reshape(batch, timesteps, patch_tokens, embed_dim)
+                else:
+                    fused = self.cross_modal_fusion(fused, other)
+            return fused
         if self.fusion_mode == "early_mean":
             return torch.stack(pieces, dim=0).mean(dim=0)
         return torch.cat(pieces, dim=cat_dim)
@@ -560,6 +698,8 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         tokenizer_type: str | None = None,
     ) -> torch.Tensor:
         resolved_tokenizer = self.tokenizer_type if tokenizer_type is None else str(tokenizer_type).lower()
@@ -574,6 +714,8 @@ class SpatialEncoder(nn.Module):
                 hls=hls,
                 s2_present=s2_present,
                 s1_present=s1_present,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
                 tokenizer_type=resolved_tokenizer,
             )
         )
@@ -586,9 +728,22 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         tokenizer_type: str | None = None,
     ) -> torch.Tensor:
-        resolved_tokenizer = self.resolve_tokenizer_type(s2.shape[1] if s2 is not None else hls.shape[1]) if tokenizer_type is None else str(tokenizer_type).lower()
+        if tokenizer_type is None:
+            if s2 is not None:
+                time_source = s2
+            elif hls is not None:
+                time_source = hls
+            elif extra_sensors:
+                time_source = next(iter(extra_sensors.values()))
+            else:
+                raise ValueError("At least one sequence input is required")
+            resolved_tokenizer = self.resolve_tokenizer_type(time_source.shape[1])
+        else:
+            resolved_tokenizer = str(tokenizer_type).lower()
         if resolved_tokenizer != "conv3d":
             raise ValueError("encode_sequence_tokens is only supported for conv3d tokenizers")
         combined = self.fuse_tokens(
@@ -598,6 +753,8 @@ class SpatialEncoder(nn.Module):
                 hls=hls,
                 s2_present=s2_present,
                 s1_present=s1_present,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
                 tokenizer_type=resolved_tokenizer,
             )
         )
@@ -610,6 +767,8 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         return_tokens: bool = False,
         tokenizer_type: str | None = None,
     ) -> torch.Tensor:
@@ -624,6 +783,8 @@ class SpatialEncoder(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            extra_sensors=extra_sensors,
+            extra_sensor_present=extra_sensor_present,
             tokenizer_type=resolved_tokenizer,
         )
         if return_tokens:

@@ -171,6 +171,22 @@ class FactorizedAuxLossOutputs:
     scene_loss: torch.Tensor
     delta_loss: torch.Tensor
     delta_horizon: torch.Tensor
+    planning_transition_loss: torch.Tensor
+    planning_score_loss: torch.Tensor
+    planning_horizon: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SensorDropoutConfig:
+    enabled: bool = False
+    mode: str = "sequence"
+    keep_at_least_one_sensor: bool = True
+    s2_sequence_drop_prob: float = 0.0
+    s1_sequence_drop_prob: float = 0.0
+    hls_sequence_drop_prob: float = 0.0
+    s2_timestep_drop_prob: float = 0.0
+    s1_timestep_drop_prob: float = 0.0
+    hls_timestep_drop_prob: float = 0.0
 
 
 def should_use_ssl4eo_shard_sampler(dataset: torch.utils.data.Dataset, data_cfg: dict[str, Any], batch_size: int) -> bool:
@@ -600,6 +616,7 @@ def make_loader(
 
 def make_model(config: dict, device: torch.device) -> EarthWorldModel:
     model_cfg = config["model"]
+    planning_cfg = model_cfg.get("observation_planning", {})
     model = EarthWorldModel(
         embed_dim=model_cfg["embed_dim"],
         patch_px=model_cfg["patch_px"],
@@ -631,6 +648,10 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         scene_latent_dim=model_cfg.get("scene_latent_dim"),
         state_latent_dim=model_cfg.get("state_latent_dim"),
         delta_hidden_dim=model_cfg.get("delta_hidden_dim"),
+        enable_observation_planning=resolve_bool_config(planning_cfg.get("enabled", False), default=False),
+        planning_hidden_dim=planning_cfg.get("hidden_dim"),
+        planning_action_dim=planning_cfg.get("action_dim"),
+        planning_sensor_vocab=planning_cfg.get("sensor_vocab"),
     )
     if resolve_regularization_method(config) != "none" and resolve_regularization_mode(config) == "per_subspace":
         subspace_dims = resolve_regularization_subspace_dims(config)
@@ -1362,10 +1383,163 @@ def load_module_state(module: torch.nn.Module, state_dict: dict, label: str) -> 
         )
 
 
-def move_batch(batch: dict[str, torch.Tensor], device: torch.device, backend: str) -> dict[str, torch.Tensor]:
+def _move_value_to_device(value: Any, device: torch.device, backend: str) -> Any:
     if backend == "tpu":
+        return value
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _move_value_to_device(item, device, backend) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_value_to_device(item, device, backend) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(item, device, backend) for item in value)
+    return value
+
+
+def move_batch(batch: dict[str, Any], device: torch.device, backend: str) -> dict[str, Any]:
+    return {key: _move_value_to_device(value, device, backend) for key, value in batch.items()}
+
+
+def resolve_sensor_dropout_cfg(training_cfg: dict[str, Any]) -> SensorDropoutConfig:
+    cfg = training_cfg.get("sensor_dropout")
+    if not isinstance(cfg, dict):
+        return SensorDropoutConfig()
+    return SensorDropoutConfig(
+        enabled=resolve_bool_config(cfg.get("enabled", False), default=False),
+        mode=str(cfg.get("mode", "sequence")).strip().lower(),
+        keep_at_least_one_sensor=resolve_bool_config(cfg.get("keep_at_least_one_sensor", True), default=True),
+        s2_sequence_drop_prob=min(max(float(cfg.get("s2_sequence_drop_prob", 0.0)), 0.0), 1.0),
+        s1_sequence_drop_prob=min(max(float(cfg.get("s1_sequence_drop_prob", 0.0)), 0.0), 1.0),
+        hls_sequence_drop_prob=min(max(float(cfg.get("hls_sequence_drop_prob", 0.0)), 0.0), 1.0),
+        s2_timestep_drop_prob=min(max(float(cfg.get("s2_timestep_drop_prob", 0.0)), 0.0), 1.0),
+        s1_timestep_drop_prob=min(max(float(cfg.get("s1_timestep_drop_prob", 0.0)), 0.0), 1.0),
+        hls_timestep_drop_prob=min(max(float(cfg.get("hls_timestep_drop_prob", 0.0)), 0.0), 1.0),
+    )
+
+
+def _sensor_presence_fallback(batch: dict[str, Any], sensor_name: str) -> torch.Tensor | None:
+    sensor = batch.get(sensor_name)
+    dates = batch.get("dates")
+    if not torch.is_tensor(sensor) or not torch.is_tensor(dates):
+        return None
+    if sensor.ndim < 2:
+        return None
+    present = torch.ones(sensor.shape[:2], device=sensor.device, dtype=torch.bool)
+    global_mask = batch.get("mask")
+    if torch.is_tensor(global_mask):
+        present = present & global_mask.to(device=sensor.device, dtype=torch.bool)
+    return present
+
+
+def _temporal_dropout_mask(
+    reference: torch.Tensor,
+    *,
+    sequence_prob: float,
+    timestep_prob: float,
+    mode: str,
+) -> torch.Tensor:
+    batch, timesteps = reference.shape[:2]
+    if mode == "sequence":
+        if sequence_prob <= 0.0:
+            return torch.zeros((batch, timesteps), device=reference.device, dtype=torch.bool)
+        return (torch.rand((batch, 1), device=reference.device) < sequence_prob).expand(-1, timesteps)
+    if mode == "timestep":
+        if timestep_prob <= 0.0:
+            return torch.zeros((batch, timesteps), device=reference.device, dtype=torch.bool)
+        return torch.rand((batch, timesteps), device=reference.device) < timestep_prob
+    if mode == "mixed":
+        seq_mask = (torch.rand((batch, 1), device=reference.device) < sequence_prob).expand(-1, timesteps)
+        step_mask = torch.rand((batch, timesteps), device=reference.device) < timestep_prob
+        return seq_mask | step_mask
+    raise ValueError(f"Unsupported sensor dropout mode: {mode}")
+
+
+def _apply_sensor_drop_to_tensor(sensor: torch.Tensor, drop_mask: torch.Tensor) -> torch.Tensor:
+    if sensor.ndim < 2:
+        raise ValueError(f"Expected sensor tensor with temporal dimension, got {tuple(sensor.shape)}")
+    expand_shape = [drop_mask.shape[0], drop_mask.shape[1]] + [1] * (sensor.ndim - 2)
+    keep = (~drop_mask).to(device=sensor.device, dtype=sensor.dtype).reshape(*expand_shape)
+    return sensor * keep
+
+
+def maybe_apply_sensor_dropout(batch: dict[str, Any], config: dict) -> dict[str, Any]:
+    dropout_cfg = resolve_sensor_dropout_cfg(config["training"])
+    if not dropout_cfg.enabled:
         return batch
-    return {key: value.to(device) for key, value in batch.items()}
+
+    available: dict[str, torch.Tensor] = {}
+    for name in ("s2", "s1", "hls"):
+        sensor = batch.get(name)
+        if torch.is_tensor(sensor):
+            available[name] = sensor
+    if not available:
+        return batch
+
+    result = dict(batch)
+    drop_masks: dict[str, torch.Tensor] = {}
+    for name, sensor in available.items():
+        if name == "s2":
+            drop_masks[name] = _temporal_dropout_mask(
+                sensor,
+                sequence_prob=dropout_cfg.s2_sequence_drop_prob,
+                timestep_prob=dropout_cfg.s2_timestep_drop_prob,
+                mode=dropout_cfg.mode,
+            )
+        elif name == "s1":
+            drop_masks[name] = _temporal_dropout_mask(
+                sensor,
+                sequence_prob=dropout_cfg.s1_sequence_drop_prob,
+                timestep_prob=dropout_cfg.s1_timestep_drop_prob,
+                mode=dropout_cfg.mode,
+            )
+        else:
+            drop_masks[name] = _temporal_dropout_mask(
+                sensor,
+                sequence_prob=dropout_cfg.hls_sequence_drop_prob,
+                timestep_prob=dropout_cfg.hls_timestep_drop_prob,
+                mode=dropout_cfg.mode,
+            )
+
+    if dropout_cfg.keep_at_least_one_sensor and drop_masks:
+        all_dropped = torch.ones_like(next(iter(drop_masks.values())))
+        for mask in drop_masks.values():
+            all_dropped = all_dropped & mask
+        if all_dropped.any():
+            sensor_names = list(drop_masks.keys())
+            for sensor_idx, sensor_name in enumerate(sensor_names):
+                keep_mask = all_dropped & (torch.randint(0, len(sensor_names), all_dropped.shape, device=all_dropped.device) == sensor_idx)
+                drop_masks[sensor_name] = drop_masks[sensor_name] & (~keep_mask)
+            remaining_all_dropped = torch.ones_like(all_dropped)
+            for mask in drop_masks.values():
+                remaining_all_dropped = remaining_all_dropped & mask
+            if remaining_all_dropped.any():
+                first_name = sensor_names[0]
+                drop_masks[first_name] = drop_masks[first_name] & (~remaining_all_dropped)
+
+    for sensor_name, drop_mask in drop_masks.items():
+        result[sensor_name] = _apply_sensor_drop_to_tensor(available[sensor_name], drop_mask)
+        present_key = f"{sensor_name}_present"
+        present = batch.get(present_key)
+        if present is None and sensor_name in {"s2", "s1"}:
+            present = _sensor_presence_fallback(batch, sensor_name)
+        if torch.is_tensor(present):
+            result[present_key] = present.to(device=drop_mask.device, dtype=torch.bool) & (~drop_mask)
+        date_key = f"{sensor_name}_dates"
+        sensor_dates = batch.get(date_key)
+        if torch.is_tensor(sensor_dates):
+            result[date_key] = sensor_dates.masked_fill(drop_mask, -1)
+        result[f"{sensor_name}_drop_mask"] = drop_mask
+    return result
+
+
+def _slice_temporal_sensor_dict(
+    sensor_dict: dict[str, torch.Tensor] | None,
+    temporal_index: torch.Tensor,
+) -> dict[str, torch.Tensor] | None:
+    if sensor_dict is None:
+        return None
+    return {name: value[:, temporal_index] for name, value in sensor_dict.items()}
 
 
 def maybe_wrap_loader(loader: DataLoader, device: torch.device, backend: str):
@@ -1691,6 +1865,8 @@ def student_visible_embeddings(
         s2_dates=None if batch.get("s2_dates") is None else batch["s2_dates"][:, visible_idx],
         s1_dates=None if batch.get("s1_dates") is None else batch["s1_dates"][:, visible_idx],
         hls=None if hls is None else hls[:, visible_idx],
+        extra_sensors=_slice_temporal_sensor_dict(batch.get("extra_sensors"), visible_idx),
+        extra_sensor_present=_slice_temporal_sensor_dict(batch.get("extra_sensor_present"), visible_idx),
     )
 
 
@@ -1710,6 +1886,8 @@ def compute_target_embeddings(
         s2_dates=batch.get("s2_dates"),
         s1_dates=batch.get("s1_dates"),
         hls=batch.get("hls"),
+        extra_sensors=batch.get("extra_sensors"),
+        extra_sensor_present=batch.get("extra_sensor_present"),
         return_hierarchical=return_hierarchical,
     )
 
@@ -1732,6 +1910,8 @@ def compute_target_state_sequence(
         s1_present=batch.get("s1_present"),
         s2_dates=batch.get("s2_dates"),
         s1_dates=batch.get("s1_dates"),
+        extra_sensors=batch.get("extra_sensors"),
+        extra_sensor_present=batch.get("extra_sensor_present"),
     )[0]
 
 
@@ -1752,6 +1932,8 @@ def compute_target_factorized_latents(
         s1_present=batch.get("s1_present"),
         s2_dates=batch.get("s2_dates"),
         s1_dates=batch.get("s1_dates"),
+        extra_sensors=batch.get("extra_sensors"),
+        extra_sensor_present=batch.get("extra_sensor_present"),
     )
 
 
@@ -1771,6 +1953,8 @@ def compute_online_factorized_latents(
         s1_present=batch.get("s1_present"),
         s2_dates=batch.get("s2_dates"),
         s1_dates=batch.get("s1_dates"),
+        extra_sensors=batch.get("extra_sensors"),
+        extra_sensor_present=batch.get("extra_sensor_present"),
         token_indices=token_indices,
     )
 
@@ -1791,6 +1975,8 @@ def compute_online_embeddings(
         s2_dates=batch.get("s2_dates"),
         s1_dates=batch.get("s1_dates"),
         hls=batch.get("hls"),
+        extra_sensors=batch.get("extra_sensors"),
+        extra_sensor_present=batch.get("extra_sensor_present"),
         return_hierarchical=return_hierarchical,
     )
     return embeddings, current_embedding_metadata(model)
@@ -2400,6 +2586,8 @@ def compute_dynamics_rollout_loss(
             s1_present=batch.get("s1_present"),
             s2_dates=batch.get("s2_dates"),
             s1_dates=batch.get("s1_dates"),
+            extra_sensors=batch.get("extra_sensors"),
+            extra_sensor_present=batch.get("extra_sensor_present"),
         )
     rollout_horizon = min(int(horizon), student_states.shape[1] - 1)
     if rollout_horizon <= 0:
@@ -2553,6 +2741,8 @@ def compute_masked_context_losses(
                 s1_present=batch.get("s1_present"),
                 s2_dates=batch.get("s2_dates"),
                 s1_dates=batch.get("s1_dates"),
+                extra_sensors=batch.get("extra_sensors"),
+                extra_sensor_present=batch.get("extra_sensor_present"),
                 token_indices=visible_token_idx,
             )
             predicted_visible, predicted_masked = student.predict_with_context_tokens(
@@ -2664,6 +2854,230 @@ def compute_masked_context_losses(
     )
 
 
+def resolve_observation_planning_training_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = config.get("training", {})
+    raw_cfg = training_cfg.get("observation_planning")
+    if isinstance(raw_cfg, dict):
+        return raw_cfg
+    return {}
+
+
+def _grouped_sensor_presence_for_planning(
+    student: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    sensor_name: str,
+    grouped_steps: int,
+) -> torch.Tensor:
+    sensor_key = str(sensor_name).strip().lower()
+    grouped_present = None
+    if sensor_key == "s2":
+        grouped_present = student.spatial.aggregate_temporal_presence(batch.get("s2_present"))
+        if grouped_present is None and batch.get("s2") is not None:
+            grouped_present = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    elif sensor_key == "s1":
+        grouped_present = student.spatial.aggregate_temporal_presence(batch.get("s1_present"))
+        if grouped_present is None and batch.get("s1") is not None:
+            grouped_present = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    elif sensor_key == "hls":
+        grouped_present = student.spatial.aggregate_temporal_presence(batch.get("hls_present"))
+        if grouped_present is None and batch.get("hls") is not None:
+            grouped_present = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    else:
+        extra_present = batch.get("extra_sensor_present")
+        if isinstance(extra_present, dict):
+            grouped_present = student.spatial.aggregate_temporal_presence(extra_present.get(sensor_key))
+        if grouped_present is None:
+            extra_sensors = batch.get("extra_sensors")
+            if isinstance(extra_sensors, dict) and sensor_key in extra_sensors:
+                grouped_present = student.spatial.aggregate_temporal_boolean(batch.get("mask"))
+    if grouped_present is None:
+        return torch.zeros(
+            (batch["dates"].shape[0], grouped_steps),
+            device=batch["dates"].device,
+            dtype=torch.float32,
+        )
+    return grouped_present.to(device=batch["dates"].device, dtype=torch.float32)
+
+
+def _grouped_sensor_dates_for_planning(
+    student: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    sensor_name: str,
+    grouped_reference_dates: torch.Tensor,
+) -> torch.Tensor:
+    sensor_key = str(sensor_name).strip().lower()
+    raw_dates = None
+    if sensor_key == "s2":
+        raw_dates = batch.get("s2_dates")
+    elif sensor_key == "s1":
+        raw_dates = batch.get("s1_dates")
+    elif sensor_key == "hls":
+        raw_dates = batch.get("hls_dates")
+    else:
+        extra_dates = batch.get("extra_sensor_dates")
+        if isinstance(extra_dates, dict):
+            raw_dates = extra_dates.get(sensor_key)
+    if raw_dates is None:
+        return grouped_reference_dates
+    grouped_sensor_dates = student.spatial.aggregate_temporal_dates(raw_dates).to(
+        device=grouped_reference_dates.device,
+        dtype=torch.float32,
+    )
+    return torch.where(grouped_sensor_dates > 0, grouped_sensor_dates, grouped_reference_dates)
+
+
+def _planning_sensor_cost_tensor(
+    student: EarthWorldModel,
+    config: dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    planning_cfg = resolve_observation_planning_training_cfg(config)
+    raw_costs = planning_cfg.get("sensor_costs")
+    sensor_costs = raw_costs if isinstance(raw_costs, dict) else {}
+    return torch.tensor(
+        [float(sensor_costs.get(sensor_name, 1.0)) for sensor_name in student.planning_sensor_vocab],
+        device=device,
+        dtype=dtype,
+    )
+
+
+def compute_observation_planning_losses(
+    student: EarthWorldModel,
+    target_factorized: dict[str, torch.Tensor] | None,
+    target_state_sequence: torch.Tensor | None,
+    student_factorized_partial: dict[str, torch.Tensor] | None,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+    *,
+    factorized_latent_version: str,
+    device: torch.device,
+    reference_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    zero = torch.zeros((), device=device, dtype=reference_dtype)
+    zero_horizon = torch.zeros((), device=device, dtype=torch.long)
+    planning_cfg = resolve_observation_planning_training_cfg(config)
+    planning_enabled = resolve_bool_config(planning_cfg.get("enabled", False), default=False)
+    if (
+        factorized_latent_version == "none"
+        or not planning_enabled
+        or not student.enable_observation_planning
+        or student.action_conditioned_transition_head is None
+        or student.observation_planning_head is None
+        or student.observation_action_embed is None
+    ):
+        return zero, zero, zero_horizon
+    if target_factorized is None or target_state_sequence is None or student_factorized_partial is None:
+        raise ValueError("Observation planning training requires factorized teacher and student latents")
+
+    candidate_sensors = tuple(student.planning_sensor_vocab)
+    if not candidate_sensors:
+        return zero, zero, zero_horizon
+
+    student_states = student_factorized_partial["state_sequence"]
+    grouped_dates = student_factorized_partial["grouped_dates"].to(device=device, dtype=torch.float32)
+    teacher_states = target_state_sequence.detach()
+    source_state_weights = student_factorized_partial["state_weights"].to(device=device, dtype=reference_dtype)
+    teacher_state_weights = target_factorized["state_weights"].to(device=device, dtype=reference_dtype)
+    max_horizon = min(
+        max(0, int(planning_cfg.get("random_horizon_max", 0))),
+        max(0, int(student_states.shape[1]) - 1),
+    )
+    if max_horizon <= 0:
+        return zero, zero, zero_horizon
+
+    horizon = int(torch.randint(1, max_horizon + 1, (1,), device=device).item())
+    start_count = student_states.shape[1] - horizon
+    if start_count <= 0:
+        return zero, zero, zero_horizon
+
+    target_future_states = teacher_states[:, horizon : horizon + start_count, :]
+    step_pair_weights = (
+        teacher_state_weights[:, horizon : horizon + start_count]
+        * source_state_weights[:, :start_count]
+    )
+    if float(step_pair_weights.sum().detach().cpu().item()) <= 0.0:
+        return zero, zero, torch.tensor(horizon, device=device, dtype=torch.long)
+
+    source_dates = grouped_dates[:, :start_count]
+    action_labels: list[torch.Tensor] = []
+    action_delta_days: list[torch.Tensor] = []
+    for sensor_name in candidate_sensors:
+        grouped_presence = _grouped_sensor_presence_for_planning(
+            student,
+            batch,
+            sensor_name,
+            grouped_steps=student_states.shape[1],
+        )
+        action_labels.append(grouped_presence[:, horizon : horizon + start_count])
+        sensor_dates = _grouped_sensor_dates_for_planning(student, batch, sensor_name, grouped_dates)
+        future_sensor_dates = sensor_dates[:, horizon : horizon + start_count]
+        action_delta_days.append(torch.clamp(future_sensor_dates - source_dates, min=0.0))
+
+    label_tensor = torch.stack(action_labels, dim=-1).to(device=device, dtype=reference_dtype)
+    delta_tensor = torch.stack(action_delta_days, dim=-1).to(device=device, dtype=reference_dtype)
+    positive_rows = (label_tensor.sum(dim=-1) > 0).to(dtype=reference_dtype)
+    step_pair_weights = step_pair_weights * positive_rows
+    if float(step_pair_weights.sum().detach().cpu().item()) <= 0.0:
+        return zero, zero, torch.tensor(horizon, device=device, dtype=torch.long)
+
+    sensor_costs = _planning_sensor_cost_tensor(student, config, device=device, dtype=reference_dtype)
+    flat_scene_latent = (
+        student_factorized_partial["scene_latent"]
+        .unsqueeze(1)
+        .expand(-1, start_count, -1)
+        .reshape(-1, student_factorized_partial["scene_latent"].shape[-1])
+    )
+    flat_state_sequence = student_states[:, :start_count, :].reshape(-1, 1, student_states.shape[-1])
+    flat_target_future_states = target_future_states.reshape(-1, target_future_states.shape[-1])
+    flat_labels = label_tensor.reshape(-1, len(candidate_sensors))
+    flat_delta_days = delta_tensor.reshape(-1, len(candidate_sensors))
+    flat_costs = sensor_costs.unsqueeze(0).expand(flat_labels.shape[0], -1)
+    flat_step_weights = step_pair_weights.reshape(-1, 1)
+
+    predicted_future_states = student.predict_future_states_from_actions(
+        flat_scene_latent,
+        flat_state_sequence,
+        sensor_names=candidate_sensors,
+        delta_days=flat_delta_days,
+        costs=flat_costs,
+        state_index=0,
+    )
+    transition_weights = flat_labels * flat_step_weights
+    planning_transition_loss = weighted_embedding_mse(
+        predicted_future_states,
+        flat_target_future_states.unsqueeze(1).expand(-1, len(candidate_sensors), -1),
+        weights=transition_weights,
+    )
+
+    planning_scores = student.score_observation_actions(
+        flat_scene_latent,
+        flat_state_sequence,
+        sensor_names=candidate_sensors,
+        delta_days=flat_delta_days,
+        costs=flat_costs,
+        state_index=0,
+    )
+    normalized_future = F.normalize(predicted_future_states.detach(), dim=-1)
+    normalized_target = F.normalize(
+        flat_target_future_states.unsqueeze(1).expand(-1, len(candidate_sensors), -1),
+        dim=-1,
+    )
+    prediction_error = F.mse_loss(normalized_future, normalized_target, reduction="none").mean(dim=-1)
+    utility_temperature = max(1.0e-4, float(planning_cfg.get("utility_temperature", 0.01)))
+    cost_scale = max(0.0, float(planning_cfg.get("cost_scale", 1.0)))
+    utility_targets = flat_labels * torch.exp(-prediction_error / utility_temperature) * torch.exp(
+        -cost_scale * flat_costs
+    )
+    score_predictions = torch.sigmoid(planning_scores)
+    score_weights = flat_step_weights.expand_as(flat_labels)
+    planning_score_loss = (
+        ((score_predictions - utility_targets) ** 2) * score_weights
+    ).sum() / score_weights.sum().clamp_min(1.0e-6)
+    return planning_transition_loss, planning_score_loss, torch.tensor(horizon, device=device, dtype=torch.long)
+
+
 def compute_factorized_auxiliary_losses(
     student: EarthWorldModel,
     target_factorized: dict[str, torch.Tensor] | None,
@@ -2685,6 +3099,9 @@ def compute_factorized_auxiliary_losses(
             scene_loss=zero,
             delta_loss=zero,
             delta_horizon=zero_horizon,
+            planning_transition_loss=zero,
+            planning_score_loss=zero,
+            planning_horizon=zero_horizon,
         )
     if target_factorized is None or target_state_sequence is None or student_factorized_partial is None:
         raise ValueError("Factorized latent training requires both target and student partial factorized latents")
@@ -2739,11 +3156,26 @@ def compute_factorized_auxiliary_losses(
                 delta_loss = weighted_embedding_mse(predicted_delta, target_delta, weights=delta_weights)
                 delta_horizon = torch.tensor(horizon, device=device, dtype=torch.long)
 
+    planning_transition_loss, planning_score_loss, planning_horizon = compute_observation_planning_losses(
+        student,
+        target_factorized,
+        target_state_sequence,
+        student_factorized_partial,
+        batch,
+        config,
+        factorized_latent_version=factorized_latent_version,
+        device=device,
+        reference_dtype=reference_dtype,
+    )
+
     return FactorizedAuxLossOutputs(
         state_loss=state_loss,
         scene_loss=scene_loss,
         delta_loss=delta_loss,
         delta_horizon=delta_horizon,
+        planning_transition_loss=planning_transition_loss,
+        planning_score_loss=planning_score_loss,
+        planning_horizon=planning_horizon,
     )
 
 
@@ -2769,6 +3201,9 @@ def compute_prediction_losses(
     mask_state_loss_weight = float(training_cfg.get("mask_state_loss_weight", 0.0))
     scene_consistency_weight = float(training_cfg.get("scene_consistency_weight", 0.0))
     delta_loss_weight = float(training_cfg.get("delta_loss_weight", 0.0))
+    planning_cfg = resolve_observation_planning_training_cfg(config)
+    planning_transition_loss_weight = float(planning_cfg.get("transition_loss_weight", 0.0))
+    planning_score_loss_weight = float(planning_cfg.get("score_loss_weight", 0.0))
 
     with maybe_autocast(backend, device, config):
         targets = build_training_targets(
@@ -2819,6 +3254,9 @@ def compute_prediction_losses(
         scene_loss = factorized_outputs.scene_loss
         delta_loss = factorized_outputs.delta_loss
         factorized_masked_horizon = factorized_outputs.delta_horizon
+        planning_transition_loss = factorized_outputs.planning_transition_loss
+        planning_score_loss = factorized_outputs.planning_score_loss
+        factorized_planning_horizon = factorized_outputs.planning_horizon
 
         dynamics_loss = torch.zeros_like(masked_loss)
         if dynamics_loss_weight > 0.0:
@@ -2867,6 +3305,8 @@ def compute_prediction_losses(
             + (dynamics_loss_weight * dynamics_loss)
             + (cross_sensor_loss_weight * cross_sensor_loss)
             + (delta_loss_weight * delta_loss)
+            + (planning_transition_loss_weight * planning_transition_loss)
+            + (planning_score_loss_weight * planning_score_loss)
             + regularization_loss
         )
 
@@ -2879,6 +3319,8 @@ def compute_prediction_losses(
         "dynamics_loss": dynamics_loss.detach(),
         "cross_sensor_loss": cross_sensor_loss.detach(),
         "delta_loss": delta_loss.detach(),
+        "planning_transition_loss": planning_transition_loss.detach(),
+        "planning_score_loss": planning_score_loss.detach(),
         "regularization_loss": regularization_loss.detach(),
         "crosscov_penalty": crosscov_penalty.detach(),
         "regularization_debug": regularization_debug,
@@ -2896,8 +3338,19 @@ def compute_prediction_losses(
             dtype=total_loss.dtype,
         ),
         "delta_loss_weight": torch.tensor(delta_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "planning_transition_loss_weight": torch.tensor(
+            planning_transition_loss_weight,
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        ),
+        "planning_score_loss_weight": torch.tensor(
+            planning_score_loss_weight,
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        ),
         "factorized_latent_version": factorized_latent_version,
         "factorized_delta_horizon": factorized_masked_horizon,
+        "factorized_planning_horizon": factorized_planning_horizon,
         "predict_visible_context": torch.tensor(1 if predict_visible_context else 0, device=total_loss.device),
     }
 
@@ -2974,6 +3427,8 @@ def evaluate(
     dynamics_loss_total = 0.0
     cross_sensor_loss_total = 0.0
     delta_loss_total = 0.0
+    planning_transition_loss_total = 0.0
+    planning_score_loss_total = 0.0
     regularization_loss_total = 0.0
     crosscov_penalty_total = 0.0
     step_count = 0
@@ -2982,6 +3437,7 @@ def evaluate(
     with torch.no_grad():
         for step, batch in enumerate(loader, start=1):
             batch = move_batch(batch, device, backend)
+            student_batch = batch
             target_embeddings = None
             target_state_sequence = None
             target_factorized = None
@@ -3005,7 +3461,7 @@ def evaluate(
                     )
                 ]
             elif mask_mode == "random":
-                mask_specs = [sample_mask_spec(student, batch, config)]
+                mask_specs = [sample_mask_spec(student, student_batch, config)]
             else:
                 raise ValueError(f"Unsupported eval.mask_mode: {mask_mode}")
 
@@ -3017,7 +3473,7 @@ def evaluate(
                     target_state_sequence,
                     target_factorized,
                     target_metadata,
-                    batch,
+                    student_batch,
                     mask_spec,
                     backend,
                     device,
@@ -3033,6 +3489,12 @@ def evaluate(
             batch_dynamics_loss = torch.stack([loss_terms["dynamics_loss"] for loss_terms in batch_losses]).mean()
             batch_cross_sensor_loss = torch.stack([loss_terms["cross_sensor_loss"] for loss_terms in batch_losses]).mean()
             batch_delta_loss = torch.stack([loss_terms["delta_loss"] for loss_terms in batch_losses]).mean()
+            batch_planning_transition_loss = torch.stack(
+                [loss_terms["planning_transition_loss"] for loss_terms in batch_losses]
+            ).mean()
+            batch_planning_score_loss = torch.stack(
+                [loss_terms["planning_score_loss"] for loss_terms in batch_losses]
+            ).mean()
             batch_regularization_loss = torch.stack([loss_terms["regularization_loss"] for loss_terms in batch_losses]).mean()
             batch_crosscov_penalty = torch.stack([loss_terms["crosscov_penalty"] for loss_terms in batch_losses]).mean()
             loss_total += float(batch_loss.cpu().item())
@@ -3043,6 +3505,8 @@ def evaluate(
             dynamics_loss_total += float(batch_dynamics_loss.cpu().item())
             cross_sensor_loss_total += float(batch_cross_sensor_loss.cpu().item())
             delta_loss_total += float(batch_delta_loss.cpu().item())
+            planning_transition_loss_total += float(batch_planning_transition_loss.cpu().item())
+            planning_score_loss_total += float(batch_planning_score_loss.cpu().item())
             regularization_loss_total += float(batch_regularization_loss.cpu().item())
             crosscov_penalty_total += float(batch_crosscov_penalty.cpu().item())
             step_count += 1
@@ -3059,6 +3523,8 @@ def evaluate(
         dynamics_loss_total = reduce_scalar_sum(dynamics_loss_total, device, distributed)
         cross_sensor_loss_total = reduce_scalar_sum(cross_sensor_loss_total, device, distributed)
         delta_loss_total = reduce_scalar_sum(delta_loss_total, device, distributed)
+        planning_transition_loss_total = reduce_scalar_sum(planning_transition_loss_total, device, distributed)
+        planning_score_loss_total = reduce_scalar_sum(planning_score_loss_total, device, distributed)
         regularization_loss_total = reduce_scalar_sum(regularization_loss_total, device, distributed)
         crosscov_penalty_total = reduce_scalar_sum(crosscov_penalty_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
@@ -3072,6 +3538,8 @@ def evaluate(
         "mean_dynamics_loss": dynamics_loss_total / max(step_count, 1),
         "mean_cross_sensor_loss": cross_sensor_loss_total / max(step_count, 1),
         "mean_delta_loss": delta_loss_total / max(step_count, 1),
+        "mean_planning_transition_loss": planning_transition_loss_total / max(step_count, 1),
+        "mean_planning_score_loss": planning_score_loss_total / max(step_count, 1),
         "mean_regularization_loss": regularization_loss_total / max(step_count, 1),
         "mean_crosscov_penalty": crosscov_penalty_total / max(step_count, 1),
         "step_count": step_count,
@@ -3364,6 +3832,8 @@ def main() -> None:
             running_dynamics_loss = None
             running_cross_sensor_loss = None
             running_delta_loss = None
+            running_planning_transition_loss = None
+            running_planning_score_loss = None
             running_regularization_loss = None
             running_crosscov_penalty = None
             epoch_loss_total = 0.0
@@ -3374,6 +3844,8 @@ def main() -> None:
             epoch_dynamics_loss_total = 0.0
             epoch_cross_sensor_loss_total = 0.0
             epoch_delta_loss_total = 0.0
+            epoch_planning_transition_loss_total = 0.0
+            epoch_planning_score_loss_total = 0.0
             epoch_regularization_loss_total = 0.0
             epoch_crosscov_penalty_total = 0.0
             epoch_primary_batch_count = 0
@@ -3393,11 +3865,12 @@ def main() -> None:
                 start=1,
             ):
                 batch = move_batch(batch, device, backend)
+                student_batch = maybe_apply_sensor_dropout(batch, config)
                 if data_source == "auxiliary":
                     epoch_auxiliary_batch_count += 1
                 else:
                     epoch_primary_batch_count += 1
-                mask_spec = sample_mask_spec(student, batch, config)
+                mask_spec = sample_mask_spec(student, student_batch, config)
                 current_lr, current_wd = apply_training_schedules(
                     optimizer,
                     global_step=global_step,
@@ -3423,7 +3896,7 @@ def main() -> None:
                     target_state_sequence,
                     target_factorized,
                     target_metadata,
-                    batch,
+                    student_batch,
                     mask_spec,
                     backend,
                     device,
@@ -3494,6 +3967,8 @@ def main() -> None:
                 detached_dynamics_loss = loss_terms["dynamics_loss"]
                 detached_cross_sensor_loss = loss_terms["cross_sensor_loss"]
                 detached_delta_loss = loss_terms["delta_loss"]
+                detached_planning_transition_loss = loss_terms["planning_transition_loss"]
+                detached_planning_score_loss = loss_terms["planning_score_loss"]
                 detached_regularization_loss = loss_terms["regularization_loss"]
                 detached_crosscov_penalty = loss_terms["crosscov_penalty"]
                 running_loss = detached_loss if running_loss is None else running_loss + detached_loss
@@ -3532,6 +4007,16 @@ def main() -> None:
                     if running_delta_loss is None
                     else running_delta_loss + detached_delta_loss
                 )
+                running_planning_transition_loss = (
+                    detached_planning_transition_loss
+                    if running_planning_transition_loss is None
+                    else running_planning_transition_loss + detached_planning_transition_loss
+                )
+                running_planning_score_loss = (
+                    detached_planning_score_loss
+                    if running_planning_score_loss is None
+                    else running_planning_score_loss + detached_planning_score_loss
+                )
                 running_regularization_loss = (
                     detached_regularization_loss
                     if running_regularization_loss is None
@@ -3550,6 +4035,8 @@ def main() -> None:
                 epoch_dynamics_loss_total += float(detached_dynamics_loss.cpu().item())
                 epoch_cross_sensor_loss_total += float(detached_cross_sensor_loss.cpu().item())
                 epoch_delta_loss_total += float(detached_delta_loss.cpu().item())
+                epoch_planning_transition_loss_total += float(detached_planning_transition_loss.cpu().item())
+                epoch_planning_score_loss_total += float(detached_planning_score_loss.cpu().item())
                 epoch_regularization_loss_total += float(detached_regularization_loss.cpu().item())
                 epoch_crosscov_penalty_total += float(detached_crosscov_penalty.cpu().item())
                 epoch_step_count += 1
@@ -3623,6 +4110,16 @@ def main() -> None:
                         distributed=distributed,
                         device=device,
                     )
+                    mean_planning_transition_loss = reduce_scalar_mean(
+                        running_planning_transition_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    mean_planning_score_loss = reduce_scalar_mean(
+                        running_planning_score_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
                     mean_regularization_loss = reduce_scalar_mean(
                         running_regularization_loss / log_every,
                         distributed=distributed,
@@ -3650,6 +4147,8 @@ def main() -> None:
                             "dynamics_loss": float(mean_dynamics_loss.cpu().item()),
                             "cross_sensor_loss": float(mean_cross_sensor_loss.cpu().item()),
                             "delta_loss": float(mean_delta_loss.cpu().item()),
+                            "planning_transition_loss": float(mean_planning_transition_loss.cpu().item()),
+                            "planning_score_loss": float(mean_planning_score_loss.cpu().item()),
                             "regularization_loss": float(mean_regularization_loss.cpu().item()),
                             "crosscov_penalty": float(mean_crosscov_penalty.cpu().item()),
                             "lr": float(current_lr),
@@ -3671,6 +4170,8 @@ def main() -> None:
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
                                 f"delta_loss={mean_delta_loss.cpu().item():.6f} "
+                                f"planning_transition_loss={mean_planning_transition_loss.cpu().item():.6f} "
+                                f"planning_score_loss={mean_planning_score_loss.cpu().item():.6f} "
                                 f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
                                 f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f}"
@@ -3689,6 +4190,8 @@ def main() -> None:
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
                                 f"delta_loss={mean_delta_loss.cpu().item():.6f} "
+                                f"planning_transition_loss={mean_planning_transition_loss.cpu().item():.6f} "
+                                f"planning_score_loss={mean_planning_score_loss.cpu().item():.6f} "
                                 f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
                                 f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f}"
@@ -3705,6 +4208,8 @@ def main() -> None:
                     running_dynamics_loss = None
                     running_cross_sensor_loss = None
                     running_delta_loss = None
+                    running_planning_transition_loss = None
+                    running_planning_score_loss = None
                     running_regularization_loss = None
                     running_crosscov_penalty = None
 
@@ -3720,6 +4225,16 @@ def main() -> None:
             epoch_dynamics_loss_total = reduce_scalar_sum(epoch_dynamics_loss_total, device, distributed)
             epoch_cross_sensor_loss_total = reduce_scalar_sum(epoch_cross_sensor_loss_total, device, distributed)
             epoch_delta_loss_total = reduce_scalar_sum(epoch_delta_loss_total, device, distributed)
+            epoch_planning_transition_loss_total = reduce_scalar_sum(
+                epoch_planning_transition_loss_total,
+                device,
+                distributed,
+            )
+            epoch_planning_score_loss_total = reduce_scalar_sum(
+                epoch_planning_score_loss_total,
+                device,
+                distributed,
+            )
             epoch_regularization_loss_total = reduce_scalar_sum(epoch_regularization_loss_total, device, distributed)
             epoch_crosscov_penalty_total = reduce_scalar_sum(epoch_crosscov_penalty_total, device, distributed)
             epoch_primary_batch_count = int(round(reduce_scalar_sum(epoch_primary_batch_count, device, distributed)))
@@ -3741,6 +4256,8 @@ def main() -> None:
                 "mean_dynamics_loss": epoch_dynamics_loss_total / max(epoch_step_count, 1),
                 "mean_cross_sensor_loss": epoch_cross_sensor_loss_total / max(epoch_step_count, 1),
                 "mean_delta_loss": epoch_delta_loss_total / max(epoch_step_count, 1),
+                "mean_planning_transition_loss": epoch_planning_transition_loss_total / max(epoch_step_count, 1),
+                "mean_planning_score_loss": epoch_planning_score_loss_total / max(epoch_step_count, 1),
                 "mean_regularization_loss": epoch_regularization_loss_total / max(epoch_step_count, 1),
                 "mean_crosscov_penalty": epoch_crosscov_penalty_total / max(epoch_step_count, 1),
                 "primary_batch_count": epoch_primary_batch_count,
@@ -3773,6 +4290,8 @@ def main() -> None:
                 epoch_summary["validation_mean_dynamics_loss"] = eval_summary["mean_dynamics_loss"]
                 epoch_summary["validation_mean_cross_sensor_loss"] = eval_summary["mean_cross_sensor_loss"]
                 epoch_summary["validation_mean_delta_loss"] = eval_summary["mean_delta_loss"]
+                epoch_summary["validation_mean_planning_transition_loss"] = eval_summary["mean_planning_transition_loss"]
+                epoch_summary["validation_mean_planning_score_loss"] = eval_summary["mean_planning_score_loss"]
                 epoch_summary["validation_mean_regularization_loss"] = eval_summary["mean_regularization_loss"]
                 epoch_summary["validation_mean_crosscov_penalty"] = eval_summary["mean_crosscov_penalty"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
@@ -3794,6 +4313,8 @@ def main() -> None:
                         f"validation_dynamics_loss={eval_summary['mean_dynamics_loss']:.6f} "
                         f"validation_cross_sensor_loss={eval_summary['mean_cross_sensor_loss']:.6f} "
                         f"validation_delta_loss={eval_summary['mean_delta_loss']:.6f} "
+                        f"validation_planning_transition_loss={eval_summary['mean_planning_transition_loss']:.6f} "
+                        f"validation_planning_score_loss={eval_summary['mean_planning_score_loss']:.6f} "
                         f"validation_regularization_loss={eval_summary['mean_regularization_loss']:.6f} "
                         f"validation_crosscov_penalty={eval_summary['mean_crosscov_penalty']:.6f} "
                         f"checkpoint_metric={checkpoint_metric_name}:{validation_checkpoint_metric_value:.6f} "

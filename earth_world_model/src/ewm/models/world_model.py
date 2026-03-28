@@ -189,6 +189,10 @@ class EarthWorldModel(nn.Module):
         scene_latent_dim: int | None = None,
         state_latent_dim: int | None = None,
         delta_hidden_dim: int | None = None,
+        enable_observation_planning: bool = False,
+        planning_hidden_dim: int | None = None,
+        planning_action_dim: int | None = None,
+        planning_sensor_vocab: list[str] | tuple[str, ...] | None = None,
     ):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -232,6 +236,7 @@ class EarthWorldModel(nn.Module):
             use_time_gap_features=use_time_gap_features,
             use_sensor_timing_features=use_sensor_timing_features,
         )
+        self.enable_observation_planning = bool(enable_observation_planning)
         self._last_tokens_per_timestep = 1
 
         normalized_hierarchical = self._normalize_layer_indices(hierarchical_layers, self.temporal_depth)
@@ -365,6 +370,30 @@ class EarthWorldModel(nn.Module):
             if self.enable_latent_dynamics
             else None
         )
+        self.planning_sensor_vocab = tuple(
+            str(name).strip().lower() for name in (planning_sensor_vocab or self.spatial.sensor_names())
+        )
+        self.planning_sensor_to_idx = {name: idx for idx, name in enumerate(self.planning_sensor_vocab)}
+        self.planning_action_dim = int(planning_action_dim or embed_dim)
+        self.observation_action_embed = None
+        self.action_conditioned_transition_head = None
+        self.observation_planning_head = None
+        if self.enable_observation_planning:
+            planning_hidden = int(planning_hidden_dim or self.state_latent_dim)
+            planning_input_dim = self.state_latent_dim + self.scene_latent_dim + self.planning_action_dim + 2
+            self.observation_action_embed = nn.Embedding(max(1, len(self.planning_sensor_vocab)), self.planning_action_dim)
+            self.action_conditioned_transition_head = nn.Sequential(
+                nn.LayerNorm(planning_input_dim),
+                nn.Linear(planning_input_dim, planning_hidden),
+                nn.GELU(),
+                nn.Linear(planning_hidden, self.state_latent_dim),
+            )
+            self.observation_planning_head = nn.Sequential(
+                nn.LayerNorm(planning_input_dim),
+                nn.Linear(planning_input_dim, planning_hidden),
+                nn.GELU(),
+                nn.Linear(planning_hidden, 1),
+            )
 
     @staticmethod
     def _normalize_layer_indices(
@@ -388,6 +417,30 @@ class EarthWorldModel(nn.Module):
 
     def _resolved_tokenizer_type(self, dates: torch.Tensor) -> str:
         return self.spatial.resolve_tokenizer_type(int(dates.shape[1]))
+
+    def register_runtime_sensor_adapter(
+        self,
+        name: str,
+        *,
+        in_channels: int,
+        supports_2d: bool = True,
+        supports_3d: bool = True,
+        supports_missing_embedding: bool = True,
+        add_to_planning_vocab: bool = False,
+    ) -> None:
+        self.spatial.register_runtime_sensor_adapter(
+            name,
+            in_channels=in_channels,
+            supports_2d=supports_2d,
+            supports_3d=supports_3d,
+            supports_missing_embedding=supports_missing_embedding,
+        )
+        sensor_name = str(name).strip().lower()
+        if add_to_planning_vocab and sensor_name not in self.planning_sensor_to_idx:
+            raise RuntimeError(
+                "Planning vocab extension requires constructing the model with the new sensor included in "
+                "model.observation_planning.sensor_vocab"
+            )
 
     def _group_temporal_spans(self, dates: torch.Tensor, *, tokenizer_type: str) -> torch.Tensor:
         if tokenizer_type != "conv3d":
@@ -472,6 +525,8 @@ class EarthWorldModel(nn.Module):
         s1_present: torch.Tensor | None = None,
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         visible_token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.token_mode != "dense":
@@ -479,15 +534,20 @@ class EarthWorldModel(nn.Module):
         tokenizer_type = self._resolved_tokenizer_type(dates)
         if tokenizer_type == "conv3d":
             if hls is not None:
-                timeline = self.spatial.encode_sequence_tokens(hls=hls, tokenizer_type=tokenizer_type)
+                timeline = self.spatial.encode_sequence_tokens(
+                    hls=hls,
+                    extra_sensors=extra_sensors,
+                    extra_sensor_present=extra_sensor_present,
+                    tokenizer_type=tokenizer_type,
+                )
             else:
-                if s2 is None or s1 is None:
-                    raise ValueError("s2 and s1 are required when hls is not provided")
                 timeline = self.spatial.encode_sequence_tokens(
                     s2=s2,
                     s1=s1,
                     s2_present=s2_present,
                     s1_present=s1_present,
+                    extra_sensors=extra_sensors,
+                    extra_sensor_present=extra_sensor_present,
                     tokenizer_type=tokenizer_type,
                 )
             grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
@@ -496,16 +556,23 @@ class EarthWorldModel(nn.Module):
             step_embeddings = []
             for timestep in range(dates.shape[1]):
                 if hls is not None:
-                    step_embeddings.append(self.spatial.encode_step_tokens(hls=hls[:, timestep], tokenizer_type=tokenizer_type))
+                    step_embeddings.append(
+                        self.spatial.encode_step_tokens(
+                            hls=hls[:, timestep],
+                            extra_sensors=self._slice_extra_sensor_inputs(extra_sensors, timestep),
+                            extra_sensor_present=self._slice_extra_sensor_inputs(extra_sensor_present, timestep),
+                            tokenizer_type=tokenizer_type,
+                        )
+                    )
                 else:
-                    if s2 is None or s1 is None:
-                        raise ValueError("s2 and s1 are required when hls is not provided")
                     step_embeddings.append(
                         self.spatial.encode_step_tokens(
                             s2=s2[:, timestep],
                             s1=s1[:, timestep],
                             s2_present=None if s2_present is None else s2_present[:, timestep],
                             s1_present=None if s1_present is None else s1_present[:, timestep],
+                            extra_sensors=self._slice_extra_sensor_inputs(extra_sensors, timestep),
+                            extra_sensor_present=self._slice_extra_sensor_inputs(extra_sensor_present, timestep),
                             tokenizer_type=tokenizer_type,
                         )
                     )
@@ -632,6 +699,8 @@ class EarthWorldModel(nn.Module):
         s1_present: torch.Tensor | None = None,
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_rope_positions = self.temporal_block_type == "stage_d_rope" and self.use_rope_temporal_attention
@@ -644,15 +713,20 @@ class EarthWorldModel(nn.Module):
         )
         if tokenizer_type == "conv3d":
             if hls is not None:
-                timeline = self.spatial.encode_sequence_tokens(hls=hls, tokenizer_type=tokenizer_type)
+                timeline = self.spatial.encode_sequence_tokens(
+                    hls=hls,
+                    extra_sensors=extra_sensors,
+                    extra_sensor_present=extra_sensor_present,
+                    tokenizer_type=tokenizer_type,
+                )
             else:
-                if s2 is None or s1 is None:
-                    raise ValueError("s2 and s1 are required when hls is not provided")
                 timeline = self.spatial.encode_sequence_tokens(
                     s2=s2,
                     s1=s1,
                     s2_present=s2_present,
                     s1_present=s1_present,
+                    extra_sensors=extra_sensors,
+                    extra_sensor_present=extra_sensor_present,
                     tokenizer_type=tokenizer_type,
                 )
             encoded_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
@@ -684,15 +758,19 @@ class EarthWorldModel(nn.Module):
         step_embeddings = []
         for timestep in range(dates.shape[1]):
             if hls is not None:
-                spatial_tokens = self.spatial.encode_step_tokens(hls=hls[:, timestep])
+                spatial_tokens = self.spatial.encode_step_tokens(
+                    hls=hls[:, timestep],
+                    extra_sensors=self._slice_extra_sensor_inputs(extra_sensors, timestep),
+                    extra_sensor_present=self._slice_extra_sensor_inputs(extra_sensor_present, timestep),
+                )
             else:
-                if s2 is None or s1 is None:
-                    raise ValueError("s2 and s1 are required when hls is not provided")
                 spatial_tokens = self.spatial.encode_step_tokens(
                     s2=s2[:, timestep],
                     s1=s1[:, timestep],
                     s2_present=None if s2_present is None else s2_present[:, timestep],
                     s1_present=None if s1_present is None else s1_present[:, timestep],
+                    extra_sensors=self._slice_extra_sensor_inputs(extra_sensors, timestep),
+                    extra_sensor_present=self._slice_extra_sensor_inputs(extra_sensor_present, timestep),
                     tokenizer_type=tokenizer_type,
                 )
 
@@ -741,6 +819,8 @@ class EarthWorldModel(nn.Module):
         s1_present: torch.Tensor | None = None,
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         token_indices: torch.Tensor | None = None,
         return_hierarchical: bool = False,
         return_structured: bool = False,
@@ -756,6 +836,8 @@ class EarthWorldModel(nn.Module):
                 s1_present=s1_present,
                 s2_dates=s2_dates,
                 s1_dates=s1_dates,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
                 visible_token_indices=token_indices,
             )
             encoded = self._run_temporal_encoder(
@@ -784,6 +866,8 @@ class EarthWorldModel(nn.Module):
             s1_present=s1_present,
             s2_dates=s2_dates,
             s1_dates=s1_dates,
+            extra_sensors=extra_sensors,
+            extra_sensor_present=extra_sensor_present,
             token_indices=token_indices,
         )
         encoded = self._run_temporal_encoder(timeline, position_ids=position_ids, return_hierarchical=return_hierarchical)
@@ -935,6 +1019,15 @@ class EarthWorldModel(nn.Module):
         denom = weights.sum(dim=dim, keepdim=True).clamp_min(1.0e-6)
         return weighted.sum(dim=dim) / denom
 
+    @staticmethod
+    def _slice_extra_sensor_inputs(
+        sensor_dict: dict[str, torch.Tensor] | None,
+        index: int,
+    ) -> dict[str, torch.Tensor] | None:
+        if sensor_dict is None:
+            return None
+        return {name: value[:, index] for name, value in sensor_dict.items()}
+
     def encode_factorized_latents(
         self,
         s2: torch.Tensor | None,
@@ -947,6 +1040,8 @@ class EarthWorldModel(nn.Module):
         s1_present: torch.Tensor | None = None,
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
         token_indices: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if not self.use_factorized_latents:
@@ -965,6 +1060,8 @@ class EarthWorldModel(nn.Module):
                 s1_present=s1_present,
                 s2_dates=s2_dates,
                 s1_dates=s1_dates,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
                 visible_token_indices=token_indices,
             )
             encoded_structured = self._run_temporal_encoder(
@@ -991,6 +1088,8 @@ class EarthWorldModel(nn.Module):
                 s1_present=s1_present,
                 s2_dates=s2_dates,
                 s1_dates=s1_dates,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
             )
             tokenizer_type = self._resolved_tokenizer_type(dates)
             grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
@@ -1030,6 +1129,8 @@ class EarthWorldModel(nn.Module):
         s1_present: torch.Tensor | None = None,
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
+        extra_sensors: dict[str, torch.Tensor] | None = None,
+        extra_sensor_present: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_factorized_latents:
             factorized = self.encode_factorized_latents(
@@ -1042,6 +1143,8 @@ class EarthWorldModel(nn.Module):
                 s1_present=s1_present,
                 s2_dates=s2_dates,
                 s1_dates=s1_dates,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
             )
             return factorized["state_sequence"], factorized["grouped_dates"]
         if self.token_mode == "dense":
@@ -1056,6 +1159,8 @@ class EarthWorldModel(nn.Module):
                     s1_present=s1_present,
                     s2_dates=s2_dates,
                     s1_dates=s1_dates,
+                    extra_sensors=extra_sensors,
+                    extra_sensor_present=extra_sensor_present,
                     return_structured=True,
                 )
                 grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=self._resolved_tokenizer_type(dates))
@@ -1070,6 +1175,8 @@ class EarthWorldModel(nn.Module):
                 s1_present=s1_present,
                 s2_dates=s2_dates,
                 s1_dates=s1_dates,
+                extra_sensors=extra_sensors,
+                extra_sensor_present=extra_sensor_present,
             )
             grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=self._resolved_tokenizer_type(dates))
             return self._state_sequence_from_dense_embeddings(dense), grouped_dates
@@ -1083,6 +1190,8 @@ class EarthWorldModel(nn.Module):
             s1_present=s1_present,
             s2_dates=s2_dates,
             s1_dates=s1_dates,
+            extra_sensors=extra_sensors,
+            extra_sensor_present=extra_sensor_present,
         )
         return pooled, dates
 
@@ -1156,6 +1265,134 @@ class EarthWorldModel(nn.Module):
             raise RuntimeError("Latent dynamics are disabled for this model")
         temporal_context = self.temporal_pos(dates, s2_dates=s2_dates, s1_dates=s1_dates)
         return self.latent_rollout_head.rollout(state_sequence, temporal_context, horizon=horizon)
+
+    def describe_sensor_interfaces(self) -> dict[str, object]:
+        return {
+            "spatial_adapters": self.spatial.describe_sensor_adapters(),
+            "planning_sensor_vocab": self.planning_sensor_vocab,
+            "observation_planning_enabled": self.enable_observation_planning,
+        }
+
+    def _planning_sensor_indices(
+        self,
+        sensor_names: list[str] | tuple[str, ...],
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if not sensor_names:
+            raise ValueError("sensor_names must not be empty")
+        indices: list[int] = []
+        for name in sensor_names:
+            key = str(name).strip().lower()
+            if key not in self.planning_sensor_to_idx:
+                raise ValueError(
+                    f"Unknown planning sensor {key!r}; known sensors: {sorted(self.planning_sensor_to_idx)}"
+                )
+            indices.append(self.planning_sensor_to_idx[key])
+        return torch.tensor(indices, device=device, dtype=torch.long)
+
+    def predict_future_states_from_actions(
+        self,
+        scene_latent: torch.Tensor,
+        state_sequence: torch.Tensor,
+        *,
+        sensor_names: list[str] | tuple[str, ...],
+        delta_days: torch.Tensor | list[float] | tuple[float, ...] | float,
+        costs: torch.Tensor | list[float] | tuple[float, ...] | float | None = None,
+        state_index: int = -1,
+    ) -> torch.Tensor:
+        if not self.enable_observation_planning or self.action_conditioned_transition_head is None or self.observation_action_embed is None:
+            raise RuntimeError("Observation planning is disabled for this model")
+        if scene_latent.ndim != 2:
+            raise ValueError(f"scene_latent must be [B, D], got {tuple(scene_latent.shape)}")
+        if state_sequence.ndim != 3:
+            raise ValueError(f"state_sequence must be [B, T, D], got {tuple(state_sequence.shape)}")
+        batch = scene_latent.shape[0]
+        action_count = len(sensor_names)
+        sensor_idx = self._planning_sensor_indices(sensor_names, device=scene_latent.device)
+        sensor_embed = self.observation_action_embed(sensor_idx).unsqueeze(0).expand(batch, -1, -1)
+        delta_tensor = torch.as_tensor(delta_days, device=scene_latent.device, dtype=scene_latent.dtype)
+        if delta_tensor.ndim == 0:
+            delta_tensor = delta_tensor.view(1).expand(action_count)
+        if delta_tensor.ndim == 1:
+            delta_tensor = delta_tensor.view(1, -1).expand(batch, -1)
+        if delta_tensor.shape != (batch, action_count):
+            raise ValueError(
+                f"delta_days must broadcast to [B, A]={batch, action_count}, got {tuple(delta_tensor.shape)}"
+            )
+        if costs is None:
+            cost_tensor = torch.zeros((batch, action_count), device=scene_latent.device, dtype=scene_latent.dtype)
+        else:
+            cost_tensor = torch.as_tensor(costs, device=scene_latent.device, dtype=scene_latent.dtype)
+            if cost_tensor.ndim == 0:
+                cost_tensor = cost_tensor.view(1).expand(action_count)
+            if cost_tensor.ndim == 1:
+                cost_tensor = cost_tensor.view(1, -1).expand(batch, -1)
+            if cost_tensor.shape != (batch, action_count):
+                raise ValueError(
+                    f"costs must broadcast to [B, A]={batch, action_count}, got {tuple(cost_tensor.shape)}"
+                )
+        base_state = state_sequence[:, state_index, :].unsqueeze(1).expand(-1, action_count, -1)
+        scene_expand = scene_latent.unsqueeze(1).expand(-1, action_count, -1)
+        action_inputs = torch.cat(
+            [
+                base_state,
+                scene_expand,
+                sensor_embed,
+                (delta_tensor / 366.0).unsqueeze(-1),
+                cost_tensor.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return self.action_conditioned_transition_head(action_inputs)
+
+    def score_observation_actions(
+        self,
+        scene_latent: torch.Tensor,
+        state_sequence: torch.Tensor,
+        *,
+        sensor_names: list[str] | tuple[str, ...],
+        delta_days: torch.Tensor | list[float] | tuple[float, ...] | float,
+        costs: torch.Tensor | list[float] | tuple[float, ...] | float | None = None,
+        state_index: int = -1,
+    ) -> torch.Tensor:
+        if not self.enable_observation_planning or self.observation_planning_head is None or self.observation_action_embed is None:
+            raise RuntimeError("Observation planning is disabled for this model")
+        predicted_future = self.predict_future_states_from_actions(
+            scene_latent,
+            state_sequence,
+            sensor_names=sensor_names,
+            delta_days=delta_days,
+            costs=costs,
+            state_index=state_index,
+        )
+        batch, action_count, _ = predicted_future.shape
+        sensor_idx = self._planning_sensor_indices(sensor_names, device=scene_latent.device)
+        sensor_embed = self.observation_action_embed(sensor_idx).unsqueeze(0).expand(batch, -1, -1)
+        delta_tensor = torch.as_tensor(delta_days, device=scene_latent.device, dtype=scene_latent.dtype)
+        if delta_tensor.ndim == 0:
+            delta_tensor = delta_tensor.view(1).expand(action_count)
+        if delta_tensor.ndim == 1:
+            delta_tensor = delta_tensor.view(1, -1).expand(batch, -1)
+        if costs is None:
+            cost_tensor = torch.zeros((batch, action_count), device=scene_latent.device, dtype=scene_latent.dtype)
+        else:
+            cost_tensor = torch.as_tensor(costs, device=scene_latent.device, dtype=scene_latent.dtype)
+            if cost_tensor.ndim == 0:
+                cost_tensor = cost_tensor.view(1).expand(action_count)
+            if cost_tensor.ndim == 1:
+                cost_tensor = cost_tensor.view(1, -1).expand(batch, -1)
+        planning_inputs = torch.cat(
+            [
+                predicted_future,
+                scene_latent.unsqueeze(1).expand(-1, action_count, -1),
+                sensor_embed,
+                (delta_tensor / 366.0).unsqueeze(-1),
+                cost_tensor.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return self.observation_planning_head(planning_inputs).squeeze(-1)
 
     @property
     def last_tokens_per_timestep(self) -> int:
