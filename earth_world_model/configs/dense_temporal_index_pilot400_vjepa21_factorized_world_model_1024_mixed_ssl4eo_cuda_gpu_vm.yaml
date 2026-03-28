@@ -131,6 +131,12 @@ training:
   scene_consistency_weight: ${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}
   delta_loss_weight: ${EWM_DELTA_LOSS_WEIGHT:-0.0}
   delta_random_horizon_max: ${EWM_DELTA_RANDOM_HORIZON_MAX:-0}
+  delta_gap_normalize: ${EWM_DELTA_GAP_NORMALIZE:-false}
+  delta_weight_schedule:
+    enabled: ${EWM_DELTA_WEIGHT_SCHEDULE_ENABLED:-false}
+    mode: ${EWM_DELTA_WEIGHT_SCHEDULE_MODE:-after_mixed_stage}
+    start_epoch: ${EWM_DELTA_WEIGHT_SCHEDULE_START_EPOCH:-0}
+    warmup_epochs: ${EWM_DELTA_WEIGHT_SCHEDULE_WARMUP_EPOCHS:-0}
   observation_planning:
     enabled: ${EWM_TRAIN_OBSERVATION_PLANNING_ENABLED:-false}
     random_horizon_max: ${EWM_TRAIN_OBSERVATION_PLANNING_RANDOM_HORIZON_MAX:-0}

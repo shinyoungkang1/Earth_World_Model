@@ -857,6 +857,17 @@ For the `yearly_10000 + ssl4eo_50000` study, the intended run order is:
    - the model predicts the future latent state for the realized future observation and learns a planning score for candidate actions
    - also uses the weaker `v2` delta setting rather than the more aggressive `0.25 / 4-step` configuration
 
+6. `factorized_z_zt_delta_v2_sensor_dropout_gapnorm_warmup`
+   - run `#4` plus a more conservative and more reviewer-defensible delta objective
+   - keeps `v2`, sensor dropout, and short-horizon random delta prediction
+   - gap-normalizes the delta target so the model predicts latent change rate rather than raw latent distance across irregular revisit gaps
+   - automatically warms the effective delta loss weight after the mixed stage instead of turning the full delta objective on from the start
+   - recommended launch defaults:
+     - delta loss weight max `0.1`
+     - random delta horizon max `2`
+     - delta target gap normalization enabled
+     - delta warmup starts after the mixed stage and ramps for `2` epochs
+
 The observation-planning training signal is self-supervised. For a sampled horizon, the model uses the current latent state and scene latent, then:
 
 - predicts the future latent state under the realized future observation action

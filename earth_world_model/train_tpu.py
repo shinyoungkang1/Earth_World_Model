@@ -727,6 +727,7 @@ class StudentStepModule(torch.nn.Module):
         target_factorized: dict[str, torch.Tensor] | None,
         target_metadata: EmbeddingMetadata | None,
         mask_spec: dict[str, Any],
+        epoch_index: int | None = None,
     ) -> dict[str, torch.Tensor]:
         device = next(self.student.parameters()).device
         return compute_prediction_losses(
@@ -740,6 +741,7 @@ class StudentStepModule(torch.nn.Module):
             self.backend,
             device,
             self.config,
+            epoch_index=epoch_index,
         )
 
 
@@ -2144,6 +2146,41 @@ def compute_masked_prediction_loss(
     return loss_terms["total_loss"]
 
 
+def resolve_effective_delta_loss_weight(
+    training_cfg: dict,
+    *,
+    epoch_index: int | None,
+) -> float:
+    delta_loss_weight_max = float(training_cfg.get("delta_loss_weight", 0.0))
+    if delta_loss_weight_max <= 0.0:
+        return 0.0
+
+    schedule_cfg = dict(training_cfg.get("delta_weight_schedule", {}) or {})
+    if not bool(schedule_cfg.get("enabled", False)):
+        return delta_loss_weight_max
+    if epoch_index is None:
+        return delta_loss_weight_max
+
+    mode = str(schedule_cfg.get("mode", "after_mixed_stage")).strip().lower()
+    if mode == "after_mixed_stage":
+        start_epoch = max(0, int(training_cfg.get("mixed_stage_epochs", 0)))
+    elif mode == "epoch":
+        start_epoch = max(0, int(schedule_cfg.get("start_epoch", 0)))
+    else:
+        raise ValueError(f"Unsupported training.delta_weight_schedule.mode: {mode}")
+
+    if epoch_index < start_epoch:
+        return 0.0
+
+    warmup_epochs = max(0, int(schedule_cfg.get("warmup_epochs", 0)))
+    if warmup_epochs <= 0:
+        return delta_loss_weight_max
+
+    warmup_progress = min(epoch_index - start_epoch + 1, warmup_epochs)
+    warmup_fraction = float(warmup_progress) / float(warmup_epochs)
+    return delta_loss_weight_max * warmup_fraction
+
+
 def temporal_context_weights(
     visible_idx: torch.Tensor,
     masked_idx: torch.Tensor,
@@ -3088,6 +3125,7 @@ def compute_factorized_auxiliary_losses(
     config: dict,
     *,
     factorized_latent_version: str,
+    effective_delta_loss_weight: float,
     device: torch.device,
     reference_dtype: torch.dtype,
 ) -> FactorizedAuxLossOutputs:
@@ -3107,8 +3145,8 @@ def compute_factorized_auxiliary_losses(
         raise ValueError("Factorized latent training requires both target and student partial factorized latents")
 
     training_cfg = config["training"]
-    delta_loss_weight = float(training_cfg.get("delta_loss_weight", 0.0))
     delta_random_horizon_max = int(training_cfg.get("delta_random_horizon_max", 0))
+    delta_gap_normalize = bool(training_cfg.get("delta_gap_normalize", False))
 
     target_scene_latent = target_factorized["scene_latent"].detach()
     state_weights = masked_state_step_weights(student, batch, mask_spec)
@@ -3124,7 +3162,7 @@ def compute_factorized_auxiliary_losses(
     delta_loss = torch.zeros_like(state_loss)
     delta_horizon = zero_horizon
 
-    if factorized_latent_version == "v2" and delta_loss_weight > 0.0:
+    if factorized_latent_version == "v2" and effective_delta_loss_weight > 0.0:
         max_horizon = min(
             max(0, int(delta_random_horizon_max)),
             max(0, int(student_factorized_partial["state_sequence"].shape[1]) - 1),
@@ -3140,6 +3178,15 @@ def compute_factorized_auxiliary_losses(
             if predicted_delta.shape[1] > 0:
                 teacher_states = target_state_sequence.detach()
                 target_delta = teacher_states[:, horizon:, :] - teacher_states[:, :-horizon, :]
+                if delta_gap_normalize:
+                    teacher_grouped_dates = target_factorized["grouped_dates"].to(
+                        device=teacher_states.device,
+                        dtype=teacher_states.dtype,
+                    )
+                    delta_days = (
+                        teacher_grouped_dates[:, horizon:] - teacher_grouped_dates[:, :-horizon]
+                    ).abs().clamp_min(1.0).unsqueeze(-1)
+                    target_delta = target_delta / delta_days
                 teacher_state_weights = target_factorized["state_weights"].to(
                     device=teacher_states.device,
                     dtype=teacher_states.dtype,
@@ -3190,6 +3237,8 @@ def compute_prediction_losses(
     backend: str,
     device: torch.device,
     config: dict,
+    *,
+    epoch_index: int | None = None,
 ) -> dict[str, torch.Tensor]:
     training_cfg = config["training"]
     regularization_method = resolve_regularization_method(config)
@@ -3200,7 +3249,8 @@ def compute_prediction_losses(
     cross_sensor_loss_weight = float(training_cfg.get("cross_sensor_loss_weight", 0.0))
     mask_state_loss_weight = float(training_cfg.get("mask_state_loss_weight", 0.0))
     scene_consistency_weight = float(training_cfg.get("scene_consistency_weight", 0.0))
-    delta_loss_weight = float(training_cfg.get("delta_loss_weight", 0.0))
+    delta_loss_weight_max = float(training_cfg.get("delta_loss_weight", 0.0))
+    delta_loss_weight = resolve_effective_delta_loss_weight(training_cfg, epoch_index=epoch_index)
     planning_cfg = resolve_observation_planning_training_cfg(config)
     planning_transition_loss_weight = float(planning_cfg.get("transition_loss_weight", 0.0))
     planning_score_loss_weight = float(planning_cfg.get("score_loss_weight", 0.0))
@@ -3247,6 +3297,7 @@ def compute_prediction_losses(
             mask_spec,
             config,
             factorized_latent_version=factorized_latent_version,
+            effective_delta_loss_weight=delta_loss_weight,
             device=device,
             reference_dtype=targets.target_embeddings.dtype,
         )
@@ -3338,6 +3389,11 @@ def compute_prediction_losses(
             dtype=total_loss.dtype,
         ),
         "delta_loss_weight": torch.tensor(delta_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "delta_loss_weight_max": torch.tensor(
+            delta_loss_weight_max,
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        ),
         "planning_transition_loss_weight": torch.tensor(
             planning_transition_loss_weight,
             device=total_loss.device,
@@ -3367,9 +3423,19 @@ def compute_student_loss_terms(
     backend: str,
     device: torch.device,
     config: dict,
+    *,
+    epoch_index: int | None = None,
 ) -> dict[str, torch.Tensor]:
     if student_stepper is not None:
-        return student_stepper(batch, target_embeddings, target_state_sequence, target_factorized, target_metadata, mask_spec)
+        return student_stepper(
+            batch,
+            target_embeddings,
+            target_state_sequence,
+            target_factorized,
+            target_metadata,
+            mask_spec,
+            epoch_index,
+        )
     return compute_prediction_losses(
         student,
         target_embeddings,
@@ -3381,6 +3447,7 @@ def compute_student_loss_terms(
         backend,
         device,
         config,
+        epoch_index=epoch_index,
     )
 
 
@@ -3410,6 +3477,8 @@ def evaluate(
     config: dict,
     eval_cfg: dict,
     distributed: DistributedContext,
+    *,
+    epoch_index: int | None = None,
 ) -> dict:
     mask_mode = eval_cfg["mask_mode"]
     max_batches = int(eval_cfg.get("max_batches", 0))
@@ -3478,6 +3547,7 @@ def evaluate(
                     backend,
                     device,
                     config,
+                    epoch_index=epoch_index,
                 )
                 for mask_spec in mask_specs
             ]
@@ -3529,6 +3599,10 @@ def evaluate(
         crosscov_penalty_total = reduce_scalar_sum(crosscov_penalty_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
 
+    effective_delta_loss_weight = resolve_effective_delta_loss_weight(
+        config["training"],
+        epoch_index=epoch_index,
+    )
     return {
         "mean_loss": loss_total / max(step_count, 1),
         "mean_masked_loss": masked_loss_total / max(step_count, 1),
@@ -3542,6 +3616,8 @@ def evaluate(
         "mean_planning_score_loss": planning_score_loss_total / max(step_count, 1),
         "mean_regularization_loss": regularization_loss_total / max(step_count, 1),
         "mean_crosscov_penalty": crosscov_penalty_total / max(step_count, 1),
+        "delta_loss_weight": float(effective_delta_loss_weight),
+        "delta_loss_weight_max": float(config["training"].get("delta_loss_weight", 0.0)),
         "step_count": step_count,
         "duration_sec": time.time() - started_at,
         "mask_mode": mask_mode,
@@ -3821,6 +3897,11 @@ def main() -> None:
                 set_loader_epoch(auxiliary_loader, epoch)
             if eval_loader is not None:
                 set_loader_epoch(eval_loader, epoch)
+            epoch_delta_loss_weight = resolve_effective_delta_loss_weight(
+                config["training"],
+                epoch_index=epoch,
+            )
+            epoch_delta_loss_weight_max = float(config["training"].get("delta_loss_weight", 0.0))
             student.train()
             if student_stepper is not None:
                 student_stepper.train()
@@ -3901,6 +3982,7 @@ def main() -> None:
                     backend,
                     device,
                     config,
+                    epoch_index=epoch,
                 )
                 loss = loss_terms["total_loss"]
                 grad_balance_probe = maybe_collect_grad_balance_probe(
@@ -4151,6 +4233,8 @@ def main() -> None:
                             "planning_score_loss": float(mean_planning_score_loss.cpu().item()),
                             "regularization_loss": float(mean_regularization_loss.cpu().item()),
                             "crosscov_penalty": float(mean_crosscov_penalty.cpu().item()),
+                            "delta_loss_weight": float(epoch_delta_loss_weight),
+                            "delta_loss_weight_max": float(epoch_delta_loss_weight_max),
                             "lr": float(current_lr),
                             "weight_decay": float(current_wd),
                             "target_mode": target_mode,
@@ -4260,6 +4344,8 @@ def main() -> None:
                 "mean_planning_score_loss": epoch_planning_score_loss_total / max(epoch_step_count, 1),
                 "mean_regularization_loss": epoch_regularization_loss_total / max(epoch_step_count, 1),
                 "mean_crosscov_penalty": epoch_crosscov_penalty_total / max(epoch_step_count, 1),
+                "delta_loss_weight": float(epoch_delta_loss_weight),
+                "delta_loss_weight_max": float(epoch_delta_loss_weight_max),
                 "primary_batch_count": epoch_primary_batch_count,
                 "auxiliary_batch_count": epoch_auxiliary_batch_count,
                 "mixed_stage_active": bool(auxiliary_loader is not None and epoch < int(config["training"].get("mixed_stage_epochs", 0))),
@@ -4275,7 +4361,18 @@ def main() -> None:
                 epoch_summary["peak_gpu_mem_mb"] = peak_memory_mb
 
             if eval_loader is not None and eval_cfg is not None and (epoch + 1) % eval_cfg["every_epochs"] == 0:
-                eval_summary = evaluate(student, student_stepper, teacher, eval_loader, backend, device, config, eval_cfg, distributed)
+                eval_summary = evaluate(
+                    student,
+                    student_stepper,
+                    teacher,
+                    eval_loader,
+                    backend,
+                    device,
+                    config,
+                    eval_cfg,
+                    distributed,
+                    epoch_index=epoch,
+                )
                 eval_summary["epoch"] = epoch + 1
                 eval_summary["event"] = "validation"
                 eval_summary["timestamp"] = time.time()
