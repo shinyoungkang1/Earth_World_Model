@@ -103,6 +103,10 @@ training:
   ema_momentum_start: ${EWM_EMA_MOMENTUM_START:-0.996}
   ema_momentum_end: ${EWM_EMA_MOMENTUM_END:-0.999}
   log_every_steps: 10
+  grad_balance_probe_every_steps: ${EWM_GRAD_BALANCE_PROBE_EVERY_STEPS:-0}
+  grad_balance_probe_max_events: ${EWM_GRAD_BALANCE_PROBE_MAX_EVENTS:-0}
+  regularization_probe_every_steps: ${EWM_REGULARIZATION_PROBE_EVERY_STEPS:-0}
+  regularization_probe_max_events: ${EWM_REGULARIZATION_PROBE_MAX_EVENTS:-0}
   save_every_epochs: 1
   max_steps_per_epoch: 0
   predict_visible_context: ${EWM_PREDICT_VISIBLE_CONTEXT:-false}
@@ -120,9 +124,10 @@ regularization:
   mode: ${EWM_REG_MODE:-per_subspace}
   n_projections: ${EWM_SIGREG_N_PROJECTIONS:-128}
   max_samples: ${EWM_REG_MAX_SAMPLES:-256}
+  crosscov_max_samples: ${EWM_REG_CROSSCOV_MAX_SAMPLES:-0}
   base_lambda: ${EWM_REG_BASE_LAMBDA:-1.0}
   adaptive_alpha: ${EWM_REG_ADAPTIVE_ALPHA:-1.0}
-  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.01}
+  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.002}
   split_dims:
     s1_private: ${EWM_REG_S1_PRIVATE_DIM:-1024}
     shared: ${EWM_REG_SHARED_DIM:-1024}

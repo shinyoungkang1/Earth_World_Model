@@ -17,14 +17,30 @@ from ewm.models.transformer_blocks import FactorizedRopeBlock, RopeTransformerBl
 class TemporalMetadataEncoding(nn.Module):
     """Encode EO acquisition timing with cyclic and interval-aware features."""
 
-    def __init__(self, embed_dim: int, *, use_time_gap_features: bool = True):
+    def __init__(
+        self,
+        embed_dim: int,
+        *,
+        use_time_gap_features: bool = True,
+        use_sensor_timing_features: bool = False,
+    ):
         super().__init__()
         self.embed_dim = int(embed_dim)
         self.use_time_gap_features = bool(use_time_gap_features)
+        self.use_sensor_timing_features = bool(use_sensor_timing_features)
         self.proj = nn.Sequential(
             nn.Linear(8, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
+        )
+        self.sensor_proj = (
+            nn.Sequential(
+                nn.Linear(6, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            if self.use_sensor_timing_features
+            else None
         )
 
     def forward(
@@ -33,6 +49,8 @@ class TemporalMetadataEncoding(nn.Module):
         *,
         span_days: torch.Tensor | None = None,
         valid_fraction: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dates = dates.to(torch.float32)
         batch, timesteps = dates.shape
@@ -72,7 +90,28 @@ class TemporalMetadataEncoding(nn.Module):
             ],
             dim=-1,
         )
-        return self.proj(features)
+        encoded = self.proj(features)
+        if self.sensor_proj is not None and (s2_dates is not None or s1_dates is not None):
+            s2_dates = torch.full_like(dates, -1.0) if s2_dates is None else s2_dates.to(device=dates.device, dtype=torch.float32)
+            s1_dates = torch.full_like(dates, -1.0) if s1_dates is None else s1_dates.to(device=dates.device, dtype=torch.float32)
+            s2_available = (s2_dates > 0).to(torch.float32)
+            s1_available = (s1_dates > 0).to(torch.float32)
+            safe_s2_dates = torch.where(s2_available > 0, s2_dates, torch.zeros_like(s2_dates))
+            safe_s1_dates = torch.where(s1_available > 0, s1_dates, torch.zeros_like(s1_dates))
+            offset = torch.abs(safe_s2_dates - safe_s1_dates)
+            sensor_features = torch.stack(
+                [
+                    safe_s2_dates / 366.0,
+                    safe_s1_dates / 366.0,
+                    offset / 366.0,
+                    s2_available,
+                    s1_available,
+                    s2_available * s1_available,
+                ],
+                dim=-1,
+            )
+            encoded = encoded + self.sensor_proj(sensor_features)
+        return encoded
 
 
 class LatentRolloutHead(nn.Module):
@@ -138,9 +177,12 @@ class EarthWorldModel(nn.Module):
         rope_base: float = 10000.0,
         use_activation_checkpointing: bool = False,
         tokenizer_type: str = "linear",
+        tokenizer_mode: str | None = None,
+        auto_2d_max_timesteps: int = 4,
         tubelet_size: int = 2,
         separate_sensor_encoders: bool = True,
         use_time_gap_features: bool = True,
+        use_sensor_timing_features: bool = False,
         enable_latent_dynamics: bool = True,
         dynamics_hidden_dim: int | None = None,
     ):
@@ -169,10 +211,16 @@ class EarthWorldModel(nn.Module):
             use_patch_positional_encoding=use_patch_positional_encoding,
             use_missing_modality_embeddings=use_missing_modality_embeddings,
             tokenizer_type=tokenizer_type,
+            tokenizer_mode=tokenizer_mode,
+            auto_2d_max_timesteps=auto_2d_max_timesteps,
             tubelet_size=tubelet_size,
             separate_sensor_encoders=separate_sensor_encoders,
         )
-        self.temporal_pos = TemporalMetadataEncoding(embed_dim, use_time_gap_features=use_time_gap_features)
+        self.temporal_pos = TemporalMetadataEncoding(
+            embed_dim,
+            use_time_gap_features=use_time_gap_features,
+            use_sensor_timing_features=use_sensor_timing_features,
+        )
         self._last_tokens_per_timestep = 1
 
         normalized_hierarchical = self._normalize_layer_indices(hierarchical_layers, self.temporal_depth)
@@ -290,19 +338,28 @@ class EarthWorldModel(nn.Module):
                 normalized.append(idx)
         return sorted(normalized)
 
-    def _group_temporal_spans(self, dates: torch.Tensor) -> torch.Tensor:
-        if self.spatial.tokenizer_type != "conv3d":
+    def _resolved_tokenizer_type(self, dates: torch.Tensor) -> str:
+        return self.spatial.resolve_tokenizer_type(int(dates.shape[1]))
+
+    def _group_temporal_spans(self, dates: torch.Tensor, *, tokenizer_type: str) -> torch.Tensor:
+        if tokenizer_type != "conv3d":
             return torch.zeros_like(dates, dtype=torch.float32)
-        groups = self.spatial._group_count(dates.shape[1])
+        groups = self.spatial._group_count(dates.shape[1], tokenizer_type=tokenizer_type)
         grouped = dates.to(torch.float32).reshape(dates.shape[0], groups, self.spatial.tubelet_size)
         return grouped[:, :, -1] - grouped[:, :, 0]
 
-    def _group_temporal_valid_fraction(self, mask: torch.Tensor | None, dates: torch.Tensor) -> torch.Tensor | None:
+    def _group_temporal_valid_fraction(
+        self,
+        mask: torch.Tensor | None,
+        dates: torch.Tensor,
+        *,
+        tokenizer_type: str,
+    ) -> torch.Tensor | None:
         if mask is None:
             return None
-        if self.spatial.tokenizer_type != "conv3d":
+        if tokenizer_type != "conv3d":
             return mask.to(torch.float32)
-        groups = self.spatial._group_count(dates.shape[1])
+        groups = self.spatial._group_count(dates.shape[1], tokenizer_type=tokenizer_type)
         reshaped = mask.to(torch.float32).reshape(mask.shape[0], groups, self.spatial.tubelet_size)
         return reshaped.mean(dim=2)
 
@@ -311,11 +368,26 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         *,
         mask: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        grouped_dates = self.spatial.aggregate_temporal_dates(dates)
-        span_days = self._group_temporal_spans(dates)
-        valid_fraction = self._group_temporal_valid_fraction(mask, dates)
-        return self.temporal_pos(grouped_dates, span_days=span_days, valid_fraction=valid_fraction)
+        tokenizer_type = self._resolved_tokenizer_type(dates)
+        grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
+        span_days = self._group_temporal_spans(dates, tokenizer_type=tokenizer_type)
+        valid_fraction = self._group_temporal_valid_fraction(mask, dates, tokenizer_type=tokenizer_type)
+        grouped_s2_dates = (
+            None if s2_dates is None else self.spatial.aggregate_temporal_dates(s2_dates, tokenizer_type=tokenizer_type)
+        )
+        grouped_s1_dates = (
+            None if s1_dates is None else self.spatial.aggregate_temporal_dates(s1_dates, tokenizer_type=tokenizer_type)
+        )
+        return self.temporal_pos(
+            grouped_dates,
+            span_days=span_days,
+            valid_fraction=valid_fraction,
+            s2_dates=grouped_s2_dates,
+            s1_dates=grouped_s1_dates,
+        )
 
     @staticmethod
     def _dense_visibility_mask(
@@ -350,13 +422,16 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
         visible_token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if self.token_mode != "dense":
             raise ValueError("Structured timeline inputs are only available in dense token mode")
-        if self.spatial.tokenizer_type == "conv3d":
+        tokenizer_type = self._resolved_tokenizer_type(dates)
+        if tokenizer_type == "conv3d":
             if hls is not None:
-                timeline = self.spatial.encode_sequence_tokens(hls=hls)
+                timeline = self.spatial.encode_sequence_tokens(hls=hls, tokenizer_type=tokenizer_type)
             else:
                 if s2 is None or s1 is None:
                     raise ValueError("s2 and s1 are required when hls is not provided")
@@ -365,14 +440,15 @@ class EarthWorldModel(nn.Module):
                     s1=s1,
                     s2_present=s2_present,
                     s1_present=s1_present,
+                    tokenizer_type=tokenizer_type,
                 )
-            grouped_dates = self.spatial.aggregate_temporal_dates(dates)
-            grouped_mask = self.spatial.aggregate_temporal_boolean(mask)
+            grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
+            grouped_mask = self.spatial.aggregate_temporal_boolean(mask, tokenizer_type=tokenizer_type)
         else:
             step_embeddings = []
             for timestep in range(dates.shape[1]):
                 if hls is not None:
-                    step_embeddings.append(self.spatial.encode_step_tokens(hls=hls[:, timestep]))
+                    step_embeddings.append(self.spatial.encode_step_tokens(hls=hls[:, timestep], tokenizer_type=tokenizer_type))
                 else:
                     if s2 is None or s1 is None:
                         raise ValueError("s2 and s1 are required when hls is not provided")
@@ -382,13 +458,19 @@ class EarthWorldModel(nn.Module):
                             s1=s1[:, timestep],
                             s2_present=None if s2_present is None else s2_present[:, timestep],
                             s1_present=None if s1_present is None else s1_present[:, timestep],
+                            tokenizer_type=tokenizer_type,
                         )
                     )
             timeline = torch.stack(step_embeddings, dim=1)
             grouped_dates = dates
             grouped_mask = mask
         self._last_tokens_per_timestep = int(timeline.shape[2])
-        timeline = timeline + self._temporal_metadata_embeddings(dates, mask=mask).unsqueeze(2)
+        timeline = timeline + self._temporal_metadata_embeddings(
+            dates,
+            mask=mask,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
+        ).unsqueeze(2)
         visibility_mask = self._dense_visibility_mask(
             timeline.shape[0],
             grouped_dates.shape[1],
@@ -500,13 +582,21 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
         token_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_rope_positions = self.temporal_block_type == "stage_d_rope" and self.use_rope_temporal_attention
-        temporal_metadata = self._temporal_metadata_embeddings(dates, mask=mask)
-        if self.spatial.tokenizer_type == "conv3d":
+        tokenizer_type = self._resolved_tokenizer_type(dates)
+        temporal_metadata = self._temporal_metadata_embeddings(
+            dates,
+            mask=mask,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
+        )
+        if tokenizer_type == "conv3d":
             if hls is not None:
-                timeline = self.spatial.encode_sequence_tokens(hls=hls)
+                timeline = self.spatial.encode_sequence_tokens(hls=hls, tokenizer_type=tokenizer_type)
             else:
                 if s2 is None or s1 is None:
                     raise ValueError("s2 and s1 are required when hls is not provided")
@@ -515,9 +605,10 @@ class EarthWorldModel(nn.Module):
                     s1=s1,
                     s2_present=s2_present,
                     s1_present=s1_present,
+                    tokenizer_type=tokenizer_type,
                 )
-            encoded_dates = self.spatial.aggregate_temporal_dates(dates)
-            encoded_mask = self.spatial.aggregate_temporal_boolean(mask)
+            encoded_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
+            encoded_mask = self.spatial.aggregate_temporal_boolean(mask, tokenizer_type=tokenizer_type)
             if self.token_mode == "dense":
                 self._last_tokens_per_timestep = int(timeline.shape[2])
                 if not use_rope_positions:
@@ -554,6 +645,7 @@ class EarthWorldModel(nn.Module):
                     s1=s1[:, timestep],
                     s2_present=None if s2_present is None else s2_present[:, timestep],
                     s1_present=None if s1_present is None else s1_present[:, timestep],
+                    tokenizer_type=tokenizer_type,
                 )
 
             if self.token_mode == "dense":
@@ -599,6 +691,8 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
         token_indices: torch.Tensor | None = None,
         return_hierarchical: bool = False,
         return_structured: bool = False,
@@ -612,6 +706,8 @@ class EarthWorldModel(nn.Module):
                 hls=hls,
                 s2_present=s2_present,
                 s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
                 visible_token_indices=token_indices,
             )
             encoded = self._run_temporal_encoder(
@@ -638,6 +734,8 @@ class EarthWorldModel(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
             token_indices=token_indices,
         )
         encoded = self._run_temporal_encoder(timeline, position_ids=position_ids, return_hierarchical=return_hierarchical)
@@ -789,6 +887,8 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.token_mode == "dense":
             if self.temporal_block_type == "factorized_rope":
@@ -800,9 +900,11 @@ class EarthWorldModel(nn.Module):
                     hls=hls,
                     s2_present=s2_present,
                     s1_present=s1_present,
+                    s2_dates=s2_dates,
+                    s1_dates=s1_dates,
                     return_structured=True,
                 )
-                grouped_dates = self.spatial.aggregate_temporal_dates(dates)
+                grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=self._resolved_tokenizer_type(dates))
                 return structured.mean(dim=2), grouped_dates
             dense = self.encode_timeline(
                 s2=s2,
@@ -812,8 +914,10 @@ class EarthWorldModel(nn.Module):
                 hls=hls,
                 s2_present=s2_present,
                 s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
             )
-            grouped_dates = self.spatial.aggregate_temporal_dates(dates)
+            grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=self._resolved_tokenizer_type(dates))
             return self._state_sequence_from_dense_embeddings(dense), grouped_dates
         pooled = self.encode_timeline(
             s2=s2,
@@ -823,6 +927,8 @@ class EarthWorldModel(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
         )
         return pooled, dates
 
@@ -832,10 +938,12 @@ class EarthWorldModel(nn.Module):
         dates: torch.Tensor,
         *,
         horizon: int,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.latent_rollout_head is None:
             raise RuntimeError("Latent dynamics are disabled for this model")
-        temporal_context = self.temporal_pos(dates)
+        temporal_context = self.temporal_pos(dates, s2_dates=s2_dates, s1_dates=s1_dates)
         return self.latent_rollout_head.rollout(state_sequence, temporal_context, horizon=horizon)
 
     @property
@@ -858,6 +966,8 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
         mode: str = "mean",
     ) -> torch.Tensor:
         """Extract a fixed-size embedding from an input sequence.
@@ -876,10 +986,10 @@ class EarthWorldModel(nn.Module):
             raise ValueError(f"Unsupported embedding mode {mode!r}; choose from {self._EMBEDDING_MODES}")
 
         if mode == "multilayer":
-            return self._extract_multilayer(s2, s1, dates, mask, hls, s2_present, s1_present)
+            return self._extract_multilayer(s2, s1, dates, mask, hls, s2_present, s1_present, s2_dates, s1_dates)
 
         if mode == "ensemble":
-            return self._extract_ensemble(s2, s1, dates, mask, hls, s2_present, s1_present)
+            return self._extract_ensemble(s2, s1, dates, mask, hls, s2_present, s1_present, s2_dates, s1_dates)
 
         # Modes that operate on the full encoder timeline
         timeline, position_ids = self._build_timeline_inputs(
@@ -890,6 +1000,8 @@ class EarthWorldModel(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
         )
 
         if mode == "l2_mean":
@@ -912,6 +1024,8 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Concatenate mean-pooled outputs from encoder layers 1, 3, 5."""
         timeline, position_ids = self._build_timeline_inputs(
@@ -922,6 +1036,8 @@ class EarthWorldModel(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
         )
 
         # Run encoder layer-by-layer, collect intermediates
@@ -949,6 +1065,8 @@ class EarthWorldModel(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multi-mask predictor ensemble matching JEPA training distribution.
 
@@ -956,7 +1074,7 @@ class EarthWorldModel(nn.Module):
         Each pattern encodes visible timesteps, then runs predict_with_context.
         Averages the visible-position predictor outputs across all patterns.
         """
-        if self.spatial.tokenizer_type == "conv3d":
+        if self._resolved_tokenizer_type(dates) == "conv3d":
             raise ValueError("ensemble extraction is not supported for conv3d tubelet tokenizers")
         T = dates.shape[1]
         num_visible = max(1, T // 2)
@@ -974,13 +1092,20 @@ class EarthWorldModel(nn.Module):
             visible_hls = hls[:, visible_idx_t] if hls is not None else None
             visible_s2_present = s2_present[:, visible_idx_t] if s2_present is not None else None
             visible_s1_present = s1_present[:, visible_idx_t] if s1_present is not None else None
+            visible_s2_dates = s2_dates[:, visible_idx_t] if s2_dates is not None else None
+            visible_s1_dates = s1_dates[:, visible_idx_t] if s1_dates is not None else None
             visible_dates = dates[:, visible_idx_t]
             visible_mask = mask[:, visible_idx_t] if mask is not None else None
             masked_dates = dates[:, masked_idx_t]
 
             visible_emb = self.encode_timeline(
                 s2=visible_s2, s1=visible_s1, dates=visible_dates,
-                mask=visible_mask, hls=visible_hls, s2_present=visible_s2_present, s1_present=visible_s1_present,
+                mask=visible_mask,
+                hls=visible_hls,
+                s2_present=visible_s2_present,
+                s1_present=visible_s1_present,
+                s2_dates=visible_s2_dates,
+                s1_dates=visible_s1_dates,
             )
 
             # Run predictor with visible + mask tokens (training distribution)

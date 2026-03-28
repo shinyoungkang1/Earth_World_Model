@@ -42,6 +42,7 @@ from ewm.data.dataset import (
 from ewm.losses import (
     adaptive_lambda,
     cramer_wold_sigreg,
+    cross_correlation_loss,
     cross_covariance_loss,
     vicreg_regularization,
 )
@@ -133,6 +134,18 @@ class DistributedContext:
 class EmbeddingMetadata:
     token_mode: str
     tokens_per_timestep: int
+
+
+@dataclass(frozen=True)
+class GradBalanceProbeConfig:
+    every_steps: int = 0
+    max_events: int = 0
+
+
+@dataclass(frozen=True)
+class RegularizationProbeConfig:
+    every_steps: int = 0
+    max_events: int = 0
 
 
 def should_use_ssl4eo_shard_sampler(dataset: torch.utils.data.Dataset, data_cfg: dict[str, Any], batch_size: int) -> bool:
@@ -239,6 +252,26 @@ def resolve_int_config(value: Any, *, default: int | None = None) -> int | None:
             return default
         return int(stripped)
     return int(value)
+
+
+def resolve_grad_balance_probe_config(config: dict) -> GradBalanceProbeConfig:
+    training_cfg = config.get("training", {})
+    every_steps = resolve_int_config(training_cfg.get("grad_balance_probe_every_steps"), default=0) or 0
+    max_events = resolve_int_config(training_cfg.get("grad_balance_probe_max_events"), default=0) or 0
+    return GradBalanceProbeConfig(
+        every_steps=max(0, int(every_steps)),
+        max_events=max(0, int(max_events)),
+    )
+
+
+def resolve_regularization_probe_config(config: dict) -> RegularizationProbeConfig:
+    training_cfg = config.get("training", {})
+    every_steps = resolve_int_config(training_cfg.get("regularization_probe_every_steps"), default=0) or 0
+    max_events = resolve_int_config(training_cfg.get("regularization_probe_max_events"), default=0) or 0
+    return RegularizationProbeConfig(
+        every_steps=max(0, int(every_steps)),
+        max_events=max(0, int(max_events)),
+    )
 
 
 def resolve_target_mode(config: dict) -> str:
@@ -750,6 +783,278 @@ def reduce_scalar_max(value: float, device: torch.device, distributed: Distribut
     if distributed.enabled:
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
     return float(tensor.item())
+
+
+def _detach_scalar(value: torch.Tensor | float | int | None) -> float | None:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        detached = value.detach()
+        if detached.numel() != 1:
+            detached = detached.reshape(-1)[0]
+        return float(detached.cpu().item())
+    return float(value)
+
+
+def _nonfinite_debug_keys(payload: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for key, value in payload.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+            keys.append(key)
+    return keys
+
+
+def _embedding_health_stats(rows: torch.Tensor, prefix: str) -> dict[str, float]:
+    if rows.ndim != 2 or rows.shape[0] == 0 or rows.shape[1] == 0:
+        return {
+            f"{prefix}_mean_row_norm": 0.0,
+            f"{prefix}_mean_feature_std": 0.0,
+            f"{prefix}_min_feature_std": 0.0,
+            f"{prefix}_max_feature_std": 0.0,
+            f"{prefix}_max_abs": 0.0,
+        }
+    row_norm = rows.norm(dim=1)
+    centered = rows - rows.mean(dim=0, keepdim=True)
+    feature_std = centered.std(dim=0, unbiased=False)
+    return {
+        f"{prefix}_mean_row_norm": _detach_scalar(row_norm.mean()) or 0.0,
+        f"{prefix}_mean_feature_std": _detach_scalar(feature_std.mean()) or 0.0,
+        f"{prefix}_min_feature_std": _detach_scalar(feature_std.min()) or 0.0,
+        f"{prefix}_max_feature_std": _detach_scalar(feature_std.max()) or 0.0,
+        f"{prefix}_max_abs": _detach_scalar(rows.abs().max()) or 0.0,
+    }
+
+
+def _regularization_weight_stats(
+    weights: torch.Tensor | None,
+    valid_row_indices: torch.Tensor,
+    sampled_row_indices: torch.Tensor,
+) -> dict[str, float]:
+    if weights is None:
+        return {
+            "regularization_weight_mean_valid": 1.0,
+            "regularization_weight_min_valid": 1.0,
+            "regularization_weight_max_valid": 1.0,
+            "regularization_weight_mean_sampled": 1.0,
+            "regularization_weight_min_sampled": 1.0,
+            "regularization_weight_max_sampled": 1.0,
+        }
+    flat_weights = weights.reshape(-1).to(dtype=torch.float32)
+    valid_weights = (
+        flat_weights.index_select(0, valid_row_indices)
+        if valid_row_indices.numel() > 0
+        else flat_weights.new_zeros((0,))
+    )
+    sampled_weights = (
+        flat_weights.index_select(0, sampled_row_indices)
+        if sampled_row_indices.numel() > 0
+        else flat_weights.new_zeros((0,))
+    )
+
+    def summarize(prefix: str, values: torch.Tensor) -> dict[str, float]:
+        if values.numel() == 0:
+            return {
+                f"regularization_weight_mean_{prefix}": 0.0,
+                f"regularization_weight_min_{prefix}": 0.0,
+                f"regularization_weight_max_{prefix}": 0.0,
+            }
+        return {
+            f"regularization_weight_mean_{prefix}": _detach_scalar(values.mean()) or 0.0,
+            f"regularization_weight_min_{prefix}": _detach_scalar(values.min()) or 0.0,
+            f"regularization_weight_max_{prefix}": _detach_scalar(values.max()) or 0.0,
+        }
+
+    stats = summarize("valid", valid_weights)
+    stats.update(summarize("sampled", sampled_weights))
+    return stats
+
+
+def _regularization_anomaly_flags(debug: dict[str, Any]) -> list[str]:
+    flags = _nonfinite_debug_keys(debug)
+    if flags:
+        return [f"nonfinite:{key}" for key in flags]
+
+    sampled_rows = int(debug.get("regularization_sampled_row_count", 0))
+    valid_rows = int(debug.get("regularization_valid_row_count", 0))
+    crosscov_rows = int(debug.get("regularization_crosscov_row_count", sampled_rows))
+    pre_crosscov = float(debug.get("regularization_pre_crosscov_loss", 0.0))
+    crosscov_penalty = float(debug.get("crosscov_penalty", 0.0))
+    max_lambda = float(debug.get("regularization_max_lambda", 0.0))
+    min_feature_std = float(debug.get("regularization_min_feature_std", 0.0))
+    max_feature_std = float(debug.get("regularization_max_feature_std", 0.0))
+
+    anomaly_flags: list[str] = []
+    if valid_rows > 0 and sampled_rows < min(valid_rows, 64):
+        anomaly_flags.append("few_regularization_rows")
+    if sampled_rows > 0 and valid_rows > sampled_rows and sampled_rows / valid_rows < 0.1:
+        anomaly_flags.append("heavy_regularization_subsampling")
+    if crosscov_rows > 0 and valid_rows > crosscov_rows and crosscov_rows / valid_rows < 0.1:
+        anomaly_flags.append("heavy_crosscov_subsampling")
+    if pre_crosscov > 0.0 and crosscov_penalty > pre_crosscov:
+        anomaly_flags.append("crosscov_dominates_regularizer")
+    if max_lambda > 1.5:
+        anomaly_flags.append("adaptive_lambda_high")
+    if min_feature_std > 0.0 and min_feature_std < 1.0e-4:
+        anomaly_flags.append("subspace_low_std")
+    if max_feature_std > 10.0:
+        anomaly_flags.append("subspace_high_std")
+    return anomaly_flags
+
+
+def _grad_probe_parameter_groups(model: torch.nn.Module) -> dict[str, list[tuple[str, torch.nn.Parameter]]]:
+    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    groups = {"all": named_params}
+    reg_head_named_params = [
+        (name, param) for name, param in named_params if "regularization_subspace_heads." in name
+    ]
+    if reg_head_named_params:
+        groups["regularization_heads"] = reg_head_named_params
+        groups["backbone"] = [
+            (name, param) for name, param in named_params if "regularization_subspace_heads." not in name
+        ]
+    return groups
+
+
+def _grad_probe_norm(loss: torch.Tensor, params: list[torch.nn.Parameter]) -> float:
+    if not torch.is_tensor(loss) or not loss.requires_grad or not params:
+        return 0.0
+    grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+    total_sq = None
+    for grad in grads:
+        if grad is None:
+            continue
+        grad_value = grad.detach()
+        if grad_value.is_sparse:
+            grad_value = grad_value.coalesce().values()
+        grad_sq = grad_value.to(dtype=torch.float32).pow(2).sum()
+        total_sq = grad_sq if total_sq is None else total_sq + grad_sq
+    if total_sq is None:
+        return 0.0
+    return float(torch.sqrt(total_sq).item())
+
+
+def maybe_collect_grad_balance_probe(
+    *,
+    model: torch.nn.Module,
+    loss_terms: dict[str, torch.Tensor],
+    probe_cfg: GradBalanceProbeConfig,
+    probe_events_emitted: int,
+    global_step: int,
+    epoch: int,
+    step_in_epoch: int,
+    steps_per_epoch: int,
+    data_source: str,
+    train_started_at: float,
+    current_lr: float,
+    current_wd: float,
+    device: torch.device,
+    distributed: DistributedContext,
+) -> dict[str, Any] | None:
+    if probe_cfg.every_steps <= 0 or probe_cfg.max_events <= 0:
+        return None
+    if probe_events_emitted >= probe_cfg.max_events:
+        return None
+    probe_step = int(global_step) + 1
+    if probe_step % probe_cfg.every_steps != 0:
+        return None
+
+    probe_started_at = time.time()
+    param_groups = _grad_probe_parameter_groups(model)
+    payload: dict[str, Any] = {
+        "event": "grad_balance_probe",
+        "timestamp": time.time(),
+        "elapsed_sec": time.time() - train_started_at,
+        "epoch": int(epoch) + 1,
+        "step_in_epoch": int(step_in_epoch),
+        "steps_per_epoch": int(steps_per_epoch),
+        "global_step": probe_step,
+        "data_source": data_source,
+        "lr": float(current_lr),
+        "weight_decay": float(current_wd),
+        "masked_loss": float(loss_terms["masked_loss"].detach().cpu().item()),
+        "regularization_loss": float(loss_terms["regularization_loss"].detach().cpu().item()),
+        "total_loss": float(loss_terms["total_loss"].detach().cpu().item()),
+        "crosscov_penalty": float(loss_terms["crosscov_penalty"].detach().cpu().item()),
+    }
+
+    masked_loss_value = abs(payload["masked_loss"])
+    regularization_loss_value = abs(payload["regularization_loss"])
+    payload["regularization_to_masked_loss_ratio"] = (
+        regularization_loss_value / masked_loss_value if masked_loss_value > 0.0 else None
+    )
+
+    for group_name, named_params in param_groups.items():
+        params = [param for _name, param in named_params]
+        masked_grad_norm = _grad_probe_norm(loss_terms["masked_loss"], params)
+        regularization_grad_norm = _grad_probe_norm(loss_terms["regularization_loss"], params)
+        total_grad_norm = _grad_probe_norm(loss_terms["total_loss"], params)
+
+        masked_grad_norm_tensor = reduce_scalar_mean(masked_grad_norm, distributed=distributed, device=device)
+        regularization_grad_norm_tensor = reduce_scalar_mean(
+            regularization_grad_norm,
+            distributed=distributed,
+            device=device,
+        )
+        total_grad_norm_tensor = reduce_scalar_mean(total_grad_norm, distributed=distributed, device=device)
+
+        masked_grad_norm_value = float(masked_grad_norm_tensor.cpu().item())
+        regularization_grad_norm_value = float(regularization_grad_norm_tensor.cpu().item())
+        total_grad_norm_value = float(total_grad_norm_tensor.cpu().item())
+
+        payload[f"{group_name}_masked_grad_norm"] = masked_grad_norm_value
+        payload[f"{group_name}_regularization_grad_norm"] = regularization_grad_norm_value
+        payload[f"{group_name}_total_grad_norm"] = total_grad_norm_value
+        payload[f"{group_name}_regularization_to_masked_grad_ratio"] = (
+            regularization_grad_norm_value / masked_grad_norm_value if masked_grad_norm_value > 0.0 else None
+        )
+
+    payload["probe_duration_sec"] = time.time() - probe_started_at
+    return payload
+
+
+def maybe_collect_regularization_probe(
+    *,
+    debug: dict[str, Any] | None,
+    probe_cfg: RegularizationProbeConfig,
+    probe_events_emitted: int,
+    global_step: int,
+    epoch: int,
+    step_in_epoch: int,
+    steps_per_epoch: int,
+    data_source: str,
+    train_started_at: float,
+    current_lr: float,
+    current_wd: float,
+) -> dict[str, Any] | None:
+    if debug is None:
+        return None
+    if probe_cfg.every_steps <= 0 or probe_cfg.max_events <= 0:
+        return None
+    if probe_events_emitted >= probe_cfg.max_events:
+        return None
+    probe_step = int(global_step) + 1
+    if probe_step % probe_cfg.every_steps != 0:
+        return None
+
+    payload: dict[str, Any] = {
+        "event": "regularization_probe",
+        "timestamp": time.time(),
+        "elapsed_sec": time.time() - train_started_at,
+        "epoch": int(epoch) + 1,
+        "step_in_epoch": int(step_in_epoch),
+        "steps_per_epoch": int(steps_per_epoch),
+        "global_step": probe_step,
+        "data_source": data_source,
+        "lr": float(current_lr),
+        "weight_decay": float(current_wd),
+    }
+    payload.update(debug)
+    payload["anomaly_flags"] = _regularization_anomaly_flags(payload)
+    return payload
 
 
 def set_loader_epoch(loader: DataLoader, epoch: int) -> None:
@@ -1658,19 +1963,21 @@ def _regularization_row_indices(
     weights: torch.Tensor | None,
     *,
     max_samples: int = 0,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     flat = embeddings.reshape(-1, embeddings.shape[-1])
     if weights is None:
-        row_indices = torch.arange(flat.shape[0], device=flat.device, dtype=torch.long)
+        valid_row_indices = torch.arange(flat.shape[0], device=flat.device, dtype=torch.long)
     else:
         valid = weights.reshape(-1) > 0
         if not torch.any(valid):
-            return torch.zeros((0,), device=flat.device, dtype=torch.long)
-        row_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
-    if max_samples > 0 and row_indices.shape[0] > max_samples:
-        sample_idx = torch.randperm(row_indices.shape[0], device=row_indices.device)[:max_samples]
-        row_indices = row_indices[sample_idx]
-    return row_indices
+            empty = torch.zeros((0,), device=flat.device, dtype=torch.long)
+            return empty, empty
+        valid_row_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+    sampled_row_indices = valid_row_indices
+    if max_samples > 0 and sampled_row_indices.shape[0] > max_samples:
+        sample_idx = torch.randperm(sampled_row_indices.shape[0], device=sampled_row_indices.device)[:max_samples]
+        sampled_row_indices = sampled_row_indices[sample_idx]
+    return valid_row_indices, sampled_row_indices
 
 
 def _gather_regularization_rows(
@@ -1689,27 +1996,57 @@ def compute_regularization_losses(
     embedding_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     config: dict,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any] | None]:
     if embeddings is None or embedding_metadata is None:
         reference = next(reference_model.parameters())
         zero = reference.new_zeros(())
-        return zero, zero
+        return zero, zero, None
 
     reg_cfg = config.get("regularization", {})
     method = resolve_regularization_method(config)
     if method == "none":
         zero = embeddings.new_zeros(())
-        return zero, zero
+        return zero, zero, None
 
     mode = resolve_regularization_mode(config)
 
     max_samples = int(reg_cfg.get("max_samples", 0))
+    crosscov_max_samples = int(reg_cfg.get("crosscov_max_samples", 0))
     token_weights = _all_embedding_weights(reference_model, batch, embedding_metadata)
-    row_indices = _regularization_row_indices(embeddings, token_weights, max_samples=max_samples)
+    valid_row_indices, row_indices = _regularization_row_indices(embeddings, token_weights, max_samples=max_samples)
     rows = _gather_regularization_rows(embeddings, row_indices)
     zero = embeddings.new_zeros(())
+    crosscov_row_indices = valid_row_indices
+    if crosscov_max_samples > 0 and crosscov_row_indices.shape[0] > crosscov_max_samples:
+        crosscov_sample_idx = torch.randperm(
+            crosscov_row_indices.shape[0],
+            device=crosscov_row_indices.device,
+        )[:crosscov_max_samples]
+        crosscov_row_indices = crosscov_row_indices[crosscov_sample_idx]
+    debug: dict[str, Any] = {
+        "regularization_method": method,
+        "regularization_mode": mode,
+        "regularization_valid_row_count": int(valid_row_indices.shape[0]),
+        "regularization_sampled_row_count": int(row_indices.shape[0]),
+        "regularization_sample_fraction": (
+            float(row_indices.shape[0] / valid_row_indices.shape[0]) if valid_row_indices.shape[0] > 0 else 0.0
+        ),
+        "regularization_crosscov_row_count": int(crosscov_row_indices.shape[0]),
+        "regularization_crosscov_sample_fraction": (
+            float(crosscov_row_indices.shape[0] / valid_row_indices.shape[0])
+            if valid_row_indices.shape[0] > 0
+            else 0.0
+        ),
+    }
+    debug.update(_regularization_weight_stats(token_weights, valid_row_indices, row_indices))
+    debug.update(_embedding_health_stats(rows, "regularization_source"))
     if rows.shape[0] < 2:
-        return zero, zero
+        debug["regularization_pre_crosscov_loss"] = 0.0
+        debug["regularization_max_lambda"] = 0.0
+        debug["regularization_mean_ep"] = 0.0
+        debug["regularization_min_feature_std"] = debug["regularization_source_min_feature_std"]
+        debug["regularization_max_feature_std"] = debug["regularization_source_max_feature_std"]
+        return zero, zero, debug
 
     base_lambda = float(reg_cfg.get("base_lambda", 1.0))
     adaptive_alpha = float(reg_cfg.get("adaptive_alpha", 1.0))
@@ -1720,13 +2057,30 @@ def compute_regularization_losses(
     vicreg_variance_weight = float(reg_cfg.get("vicreg_variance_weight", 25.0))
     vicreg_covariance_weight = float(reg_cfg.get("vicreg_covariance_weight", 1.0))
 
-    def regularize_subspace(z: torch.Tensor) -> torch.Tensor:
+    lambda_values: list[float] = []
+    ep_values: list[float] = []
+    feature_std_values: list[float] = []
+
+    def regularize_subspace(name: str, z: torch.Tensor) -> torch.Tensor:
+        debug.update(_embedding_health_stats(z, f"regularization_{name}"))
+        feature_std_values.append(float(debug[f"regularization_{name}_mean_feature_std"]))
         if z.shape[1] < 1:
+            debug[f"regularization_{name}_weighted_loss"] = 0.0
+            debug[f"regularization_{name}_base_loss"] = 0.0
             return zero
         if method == "sigreg":
             reg_loss, ep_statistic = cramer_wold_sigreg(z, n_projections=n_projections)
             lambda_value = adaptive_lambda(base_lambda, adaptive_alpha, ep_statistic)
-            return lambda_value * reg_loss
+            weighted_loss = lambda_value * reg_loss
+            detached_ep = _detach_scalar(ep_statistic) or 0.0
+            detached_lambda = _detach_scalar(lambda_value) or 0.0
+            ep_values.append(detached_ep)
+            lambda_values.append(detached_lambda)
+            debug[f"regularization_{name}_ep"] = detached_ep
+            debug[f"regularization_{name}_lambda"] = detached_lambda
+            debug[f"regularization_{name}_base_loss"] = _detach_scalar(reg_loss) or 0.0
+            debug[f"regularization_{name}_weighted_loss"] = _detach_scalar(weighted_loss) or 0.0
+            return weighted_loss
         reg_loss, _variance_loss, _covariance_loss = vicreg_regularization(
             z,
             variance_target=vicreg_variance_target,
@@ -1734,38 +2088,66 @@ def compute_regularization_losses(
             variance_weight=vicreg_variance_weight,
             covariance_weight=vicreg_covariance_weight,
         )
-        return reg_loss * rows.new_tensor(base_lambda)
+        weighted_loss = reg_loss * rows.new_tensor(base_lambda)
+        lambda_values.append(base_lambda)
+        debug[f"regularization_{name}_lambda"] = base_lambda
+        debug[f"regularization_{name}_base_loss"] = _detach_scalar(reg_loss) or 0.0
+        debug[f"regularization_{name}_weighted_loss"] = _detach_scalar(weighted_loss) or 0.0
+        return weighted_loss
 
     if mode == "global":
-        return regularize_subspace(rows), zero
+        global_loss = regularize_subspace("global", rows)
+        debug["regularization_pre_crosscov_loss"] = _detach_scalar(global_loss) or 0.0
+        debug["regularization_mean_ep"] = sum(ep_values) / max(len(ep_values), 1)
+        debug["regularization_max_lambda"] = max(lambda_values) if lambda_values else 0.0
+        debug["regularization_min_feature_std"] = min(feature_std_values) if feature_std_values else 0.0
+        debug["regularization_max_feature_std"] = max(feature_std_values) if feature_std_values else 0.0
+        return global_loss, zero, debug
 
     s1_private_dim, shared_dim, s2_private_dim = resolve_regularization_subspace_dims(config)
     projected = project_regularization_subspaces(reference_model, embeddings)
     s1_private = _gather_regularization_rows(projected["s1_private"], row_indices)
     shared = _gather_regularization_rows(projected["shared"], row_indices)
     s2_private = _gather_regularization_rows(projected["s2_private"], row_indices)
+    s1_private_crosscov = _gather_regularization_rows(projected["s1_private"], crosscov_row_indices)
+    shared_crosscov = _gather_regularization_rows(projected["shared"], crosscov_row_indices)
+    s2_private_crosscov = _gather_regularization_rows(projected["s2_private"], crosscov_row_indices)
 
     weighted_subspace_terms: list[tuple[int, torch.Tensor]] = []
     if s1_private_dim > 0:
-        weighted_subspace_terms.append((s1_private_dim, regularize_subspace(s1_private)))
+        weighted_subspace_terms.append((s1_private_dim, regularize_subspace("s1_private", s1_private)))
     if shared_dim > 0:
-        weighted_subspace_terms.append((shared_dim, regularize_subspace(shared)))
+        weighted_subspace_terms.append((shared_dim, regularize_subspace("shared", shared)))
     if s2_private_dim > 0:
-        weighted_subspace_terms.append((s2_private_dim, regularize_subspace(s2_private)))
+        weighted_subspace_terms.append((s2_private_dim, regularize_subspace("s2_private", s2_private)))
     total_subspace_dim = sum(dim for dim, _loss in weighted_subspace_terms)
     if total_subspace_dim > 0:
         weighted_sum = sum((loss * float(dim) for dim, loss in weighted_subspace_terms), zero)
         regularization_loss = weighted_sum / float(total_subspace_dim)
     else:
         regularization_loss = zero
+    debug["regularization_pre_crosscov_loss"] = _detach_scalar(regularization_loss) or 0.0
 
     crosscov_penalty = zero
     if crosscov_mu > 0.0 and shared_dim > 0:
         if s1_private_dim > 0:
-            crosscov_penalty = crosscov_penalty + (crosscov_mu * cross_covariance_loss(shared, s1_private))
+            shared_s1_crosscov = cross_covariance_loss(shared_crosscov, s1_private_crosscov)
+            shared_s1_crosscorr = cross_correlation_loss(shared_crosscov, s1_private_crosscov)
+            debug["regularization_crosscov_shared_s1_raw"] = _detach_scalar(shared_s1_crosscov) or 0.0
+            debug["regularization_crosscorr_shared_s1_raw"] = _detach_scalar(shared_s1_crosscorr) or 0.0
+            crosscov_penalty = crosscov_penalty + (crosscov_mu * shared_s1_crosscov)
         if s2_private_dim > 0:
-            crosscov_penalty = crosscov_penalty + (crosscov_mu * cross_covariance_loss(shared, s2_private))
-    return regularization_loss + crosscov_penalty, crosscov_penalty
+            shared_s2_crosscov = cross_covariance_loss(shared_crosscov, s2_private_crosscov)
+            shared_s2_crosscorr = cross_correlation_loss(shared_crosscov, s2_private_crosscov)
+            debug["regularization_crosscov_shared_s2_raw"] = _detach_scalar(shared_s2_crosscov) or 0.0
+            debug["regularization_crosscorr_shared_s2_raw"] = _detach_scalar(shared_s2_crosscorr) or 0.0
+            crosscov_penalty = crosscov_penalty + (crosscov_mu * shared_s2_crosscov)
+    debug["crosscov_penalty"] = _detach_scalar(crosscov_penalty) or 0.0
+    debug["regularization_mean_ep"] = sum(ep_values) / max(len(ep_values), 1)
+    debug["regularization_max_lambda"] = max(lambda_values) if lambda_values else 0.0
+    debug["regularization_min_feature_std"] = min(feature_std_values) if feature_std_values else 0.0
+    debug["regularization_max_feature_std"] = max(feature_std_values) if feature_std_values else 0.0
+    return regularization_loss + crosscov_penalty, crosscov_penalty, debug
 
 
 def compute_dynamics_rollout_loss(
@@ -2084,7 +2466,7 @@ def compute_prediction_losses(
             if maybe_cross_sensor_loss is not None:
                 cross_sensor_loss = maybe_cross_sensor_loss
 
-        regularization_loss, crosscov_penalty = compute_regularization_losses(
+        regularization_loss, crosscov_penalty, regularization_debug = compute_regularization_losses(
             student,
             regularization_source_embeddings,
             regularization_source_metadata,
@@ -2107,6 +2489,7 @@ def compute_prediction_losses(
         "cross_sensor_loss": cross_sensor_loss.detach(),
         "regularization_loss": regularization_loss.detach(),
         "crosscov_penalty": crosscov_penalty.detach(),
+        "regularization_debug": regularization_debug,
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "dynamics_loss_weight": torch.tensor(dynamics_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "cross_sensor_loss_weight": torch.tensor(
@@ -2374,6 +2757,8 @@ def main() -> None:
         log_every = int(config["training"].get("log_every_steps", 10))
         save_every = int(config["training"].get("save_every_epochs", 1))
         max_steps_per_epoch = int(config["training"].get("max_steps_per_epoch", 0))
+        grad_balance_probe_cfg = resolve_grad_balance_probe_config(config)
+        regularization_probe_cfg = resolve_regularization_probe_config(config)
         ema_start = float(config["training"].get("ema_momentum_start", 0.996))
         ema_end = float(config["training"].get("ema_momentum_end", 0.999))
         steps_schedule = training_steps_schedule(loader, auxiliary_loader, config["training"], epochs)
@@ -2383,6 +2768,8 @@ def main() -> None:
         global_step = 0
         epoch_summaries: list[dict] = []
         eval_summaries: list[dict] = []
+        grad_balance_probe_events = 0
+        regularization_probe_events = 0
         best_validation_mean_loss = None
         best_validation_mean_masked_loss = None
         best_validation_metric_name = checkpoint_metric_name
@@ -2613,6 +3000,35 @@ def main() -> None:
                     config,
                 )
                 loss = loss_terms["total_loss"]
+                grad_balance_probe = maybe_collect_grad_balance_probe(
+                    model=student,
+                    loss_terms=loss_terms,
+                    probe_cfg=grad_balance_probe_cfg,
+                    probe_events_emitted=grad_balance_probe_events,
+                    global_step=global_step,
+                    epoch=epoch,
+                    step_in_epoch=step,
+                    steps_per_epoch=epoch_target_steps,
+                    data_source=data_source,
+                    train_started_at=train_started_at,
+                    current_lr=current_lr,
+                    current_wd=current_wd,
+                    device=device,
+                    distributed=distributed,
+                )
+                regularization_probe = maybe_collect_regularization_probe(
+                    debug=loss_terms.get("regularization_debug"),
+                    probe_cfg=regularization_probe_cfg,
+                    probe_events_emitted=regularization_probe_events,
+                    global_step=global_step,
+                    epoch=epoch,
+                    step_in_epoch=step,
+                    steps_per_epoch=epoch_target_steps,
+                    data_source=data_source,
+                    train_started_at=train_started_at,
+                    current_lr=current_lr,
+                    current_wd=current_wd,
+                )
 
                 optimizer.zero_grad(set_to_none=True)
                 if grad_scaler is not None:
@@ -2687,6 +3103,37 @@ def main() -> None:
                 epoch_crosscov_penalty_total += float(detached_crosscov_penalty.cpu().item())
                 epoch_step_count += 1
                 global_step += 1
+                if grad_balance_probe is not None:
+                    grad_balance_probe_events += 1
+                    if distributed.is_main_process:
+                        append_jsonl(metrics_path, grad_balance_probe)
+                        print(
+                            " ".join(
+                                [
+                                    f"grad_probe step={grad_balance_probe['global_step']}",
+                                    f"loss_ratio={grad_balance_probe['regularization_to_masked_loss_ratio']}",
+                                    f"all_grad_ratio={grad_balance_probe.get('all_regularization_to_masked_grad_ratio')}",
+                                    f"backbone_grad_ratio={grad_balance_probe.get('backbone_regularization_to_masked_grad_ratio')}",
+                                ]
+                            )
+                        )
+                if regularization_probe is not None:
+                    regularization_probe_events += 1
+                    if distributed.is_main_process:
+                        append_jsonl(metrics_path, regularization_probe)
+                        anomaly_flags = regularization_probe.get("anomaly_flags") or []
+                        print(
+                            " ".join(
+                                [
+                                    f"reg_probe step={regularization_probe['global_step']}",
+                                    f"rows={regularization_probe.get('regularization_sampled_row_count')}/{regularization_probe.get('regularization_valid_row_count')}",
+                                    f"pre_crosscov={regularization_probe.get('regularization_pre_crosscov_loss')}",
+                                    f"crosscov={regularization_probe.get('crosscov_penalty')}",
+                                    f"max_lambda={regularization_probe.get('regularization_max_lambda')}",
+                                    f"anomalies={','.join(anomaly_flags) if anomaly_flags else 'none'}",
+                                ]
+                            )
+                        )
 
                 if step % log_every == 0:
                     mean_loss = reduce_scalar_mean(running_loss / log_every, distributed=distributed, device=device)

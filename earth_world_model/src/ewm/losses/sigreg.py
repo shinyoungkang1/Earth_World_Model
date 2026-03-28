@@ -178,6 +178,27 @@ def cross_covariance_loss(z1: Tensor, z2: Tensor) -> Tensor:
     return cov.pow(2).sum() / d
 
 
+def cross_correlation_loss(z1: Tensor, z2: Tensor, *, eps: float = 1.0e-6) -> Tensor:
+    """Diagnose cross-subspace entanglement after per-dimension standardization.
+
+    This is not currently used in the training objective. It exists to separate
+    scale-driven cross-covariance spikes from genuinely correlated subspaces.
+    """
+    batch_size = z1.shape[0]
+    if batch_size < 2:
+        return z1.new_tensor(0.0)
+
+    z1_c = z1 - z1.mean(dim=0, keepdim=True)
+    z2_c = z2 - z2.mean(dim=0, keepdim=True)
+    z1_std = z1_c.std(dim=0, unbiased=True).clamp_min(eps)
+    z2_std = z2_c.std(dim=0, unbiased=True).clamp_min(eps)
+    z1_z = z1_c / z1_std
+    z2_z = z2_c / z2_std
+    corr = (z1_z.T @ z2_z) / (batch_size - 1)
+    d = max(z1.shape[1], z2.shape[1])
+    return corr.pow(2).sum() / d
+
+
 def adaptive_lambda(
     base_lambda: float,
     alpha: float,

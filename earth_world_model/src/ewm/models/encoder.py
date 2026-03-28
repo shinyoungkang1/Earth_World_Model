@@ -82,6 +82,8 @@ class SpatialEncoder(nn.Module):
         use_patch_positional_encoding: bool = False,
         use_missing_modality_embeddings: bool = False,
         tokenizer_type: str = "linear",
+        tokenizer_mode: str | None = None,
+        auto_2d_max_timesteps: int = 4,
         tubelet_size: int = 2,
         separate_sensor_encoders: bool = True,
     ):
@@ -93,34 +95,77 @@ class SpatialEncoder(nn.Module):
         self.use_modality_embeddings = bool(use_modality_embeddings)
         self.use_patch_positional_encoding = bool(use_patch_positional_encoding)
         self.use_missing_modality_embeddings = bool(use_missing_modality_embeddings)
-        self.tokenizer_type = str(tokenizer_type).lower()
+        raw_tokenizer_type = str(tokenizer_type).lower()
+        self.tokenizer_type = raw_tokenizer_type
+        self.tokenizer_mode = None if tokenizer_mode is None else str(tokenizer_mode).lower()
+        self.auto_2d_max_timesteps = max(1, int(auto_2d_max_timesteps))
         self.tubelet_size = max(1, int(tubelet_size))
         self.separate_sensor_encoders = bool(separate_sensor_encoders)
         if self.fusion_mode not in {"early_mean", "late_concat", "cross_attend"}:
             raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
-        if self.tokenizer_type not in {"linear", "conv2d", "conv3d"}:
+        if raw_tokenizer_type not in {"linear", "conv2d", "conv3d"}:
             raise ValueError(f"Unsupported tokenizer_type: {self.tokenizer_type}")
+        if self.tokenizer_mode not in {None, "auto", "force_2d", "force_3d"}:
+            raise ValueError(f"Unsupported tokenizer_mode: {self.tokenizer_mode}")
+        if self.tokenizer_mode is not None and raw_tokenizer_type == "linear":
+            raise ValueError("tokenizer_mode routing is not supported with tokenizer_type=linear")
+        effective_fixed_tokenizer = raw_tokenizer_type
+        if self.tokenizer_mode == "force_2d":
+            effective_fixed_tokenizer = "conv2d"
+        elif self.tokenizer_mode == "force_3d":
+            effective_fixed_tokenizer = "conv3d"
+        if self.tokenizer_mode in {"force_2d", "force_3d"}:
+            self.tokenizer_type = effective_fixed_tokenizer
 
         self.embed_dim = int(embed_dim)
         self.s2_proj: nn.Module | None = None
         self.s1_proj: nn.Module | None = None
         self.hls_proj: nn.Module | None = None
         self.joint_proj: nn.Module | None = None
-        if self.tokenizer_type == "linear":
+        self.s2_proj_2d: nn.Module | None = None
+        self.s1_proj_2d: nn.Module | None = None
+        self.hls_proj_2d: nn.Module | None = None
+        self.joint_proj_2d: nn.Module | None = None
+        self.s2_proj_3d: nn.Module | None = None
+        self.s1_proj_3d: nn.Module | None = None
+        self.hls_proj_3d: nn.Module | None = None
+        self.joint_proj_3d: nn.Module | None = None
+        if self.tokenizer_mode == "auto":
+            self.s2_proj_2d = ConvPatchEmbed2D(12, embed_dim, self.patch_px)
+            self.s1_proj_2d = ConvPatchEmbed2D(2, embed_dim, self.patch_px)
+            self.joint_proj_2d = ConvPatchEmbed2D(14, embed_dim, self.patch_px)
+            self.hls_proj_2d = ConvPatchEmbed2D(6, embed_dim, self.patch_px)
+            self.s2_proj_3d = ConvPatchEmbed3D(12, embed_dim, self.patch_px, self.tubelet_size)
+            self.s1_proj_3d = ConvPatchEmbed3D(2, embed_dim, self.patch_px, self.tubelet_size)
+            self.joint_proj_3d = ConvPatchEmbed3D(14, embed_dim, self.patch_px, self.tubelet_size)
+            self.hls_proj_3d = ConvPatchEmbed3D(6, embed_dim, self.patch_px, self.tubelet_size)
+            self.s2_proj = self.s2_proj_2d
+            self.s1_proj = self.s1_proj_2d
+            self.joint_proj = self.joint_proj_2d
+            self.hls_proj = self.hls_proj_2d
+        elif effective_fixed_tokenizer == "linear":
             self.s2_proj = SensorProjector(12 * self.patch_px * self.patch_px, embed_dim)
             self.s1_proj = SensorProjector(2 * self.patch_px * self.patch_px, embed_dim)
             self.joint_proj = SensorProjector(14 * self.patch_px * self.patch_px, embed_dim)
             self.hls_proj = SensorProjector(6 * self.patch_px * self.patch_px, embed_dim)
-        elif self.tokenizer_type == "conv2d":
+        elif effective_fixed_tokenizer == "conv2d":
             self.s2_proj = ConvPatchEmbed2D(12, embed_dim, self.patch_px)
             self.s1_proj = ConvPatchEmbed2D(2, embed_dim, self.patch_px)
             self.joint_proj = ConvPatchEmbed2D(14, embed_dim, self.patch_px)
             self.hls_proj = ConvPatchEmbed2D(6, embed_dim, self.patch_px)
+            self.s2_proj_2d = self.s2_proj
+            self.s1_proj_2d = self.s1_proj
+            self.joint_proj_2d = self.joint_proj
+            self.hls_proj_2d = self.hls_proj
         else:
             self.s2_proj = ConvPatchEmbed3D(12, embed_dim, self.patch_px, self.tubelet_size)
             self.s1_proj = ConvPatchEmbed3D(2, embed_dim, self.patch_px, self.tubelet_size)
             self.joint_proj = ConvPatchEmbed3D(14, embed_dim, self.patch_px, self.tubelet_size)
             self.hls_proj = ConvPatchEmbed3D(6, embed_dim, self.patch_px, self.tubelet_size)
+            self.s2_proj_3d = self.s2_proj
+            self.s1_proj_3d = self.s1_proj
+            self.joint_proj_3d = self.joint_proj
+            self.hls_proj_3d = self.hls_proj
 
         self.norm = nn.LayerNorm(embed_dim)
         self.s2_mod_embed = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -145,6 +190,47 @@ class SpatialEncoder(nn.Module):
                 mlp_ratio=2.0,
                 dropout=0.1,
             )
+
+    def resolve_tokenizer_type(self, timesteps: int | None = None) -> str:
+        if self.tokenizer_mode == "force_2d":
+            return "conv2d"
+        if self.tokenizer_mode == "force_3d":
+            return "conv3d"
+        if self.tokenizer_mode == "auto":
+            if timesteps is None:
+                raise ValueError("timesteps are required when tokenizer_mode=auto")
+            return "conv2d" if int(timesteps) <= self.auto_2d_max_timesteps else "conv3d"
+        return self.tokenizer_type
+
+    def _projector_for(self, modality: str, tokenizer_type: str) -> nn.Module:
+        tokenizer_type = str(tokenizer_type).lower()
+        if tokenizer_type == "linear":
+            projector_map = {
+                "s2": self.s2_proj,
+                "s1": self.s1_proj,
+                "joint": self.joint_proj,
+                "hls": self.hls_proj,
+            }
+        elif tokenizer_type == "conv2d":
+            projector_map = {
+                "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_2d,
+                "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_2d,
+                "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_2d,
+                "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_2d,
+            }
+        elif tokenizer_type == "conv3d":
+            projector_map = {
+                "s2": self.s2_proj if self.tokenizer_mode is None else self.s2_proj_3d,
+                "s1": self.s1_proj if self.tokenizer_mode is None else self.s1_proj_3d,
+                "joint": self.joint_proj if self.tokenizer_mode is None else self.joint_proj_3d,
+                "hls": self.hls_proj if self.tokenizer_mode is None else self.hls_proj_3d,
+            }
+        else:
+            raise ValueError(f"Unsupported tokenizer_type: {tokenizer_type}")
+        projector = projector_map.get(modality)
+        if projector is None:
+            raise ValueError(f"Unsupported modality {modality!r} for tokenizer_type={tokenizer_type}")
+        return projector
 
     def patchify(self, inputs: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = inputs.shape
@@ -203,47 +289,28 @@ class SpatialEncoder(nn.Module):
             missing = missing.unsqueeze(1)
         return missing
 
-    def _project_step_tokens(self, inputs: torch.Tensor, *, modality: str) -> torch.Tensor:
-        if self.tokenizer_type == "linear":
-            if modality == "s2":
-                tokens = self.s2_proj(self.patchify(inputs))
-            elif modality == "s1":
-                tokens = self.s1_proj(self.patchify(inputs))
-            elif modality == "joint":
-                tokens = self.joint_proj(self.patchify(inputs))
-            elif modality == "hls":
-                tokens = self.hls_proj(self.patchify(inputs))
-            else:
-                raise ValueError(f"Unsupported modality {modality!r}")
-        elif self.tokenizer_type == "conv2d":
-            if modality == "s2":
-                tokens = self.s2_proj(inputs)
-            elif modality == "s1":
-                tokens = self.s1_proj(inputs)
-            elif modality == "joint":
-                tokens = self.joint_proj(inputs)
-            elif modality == "hls":
-                tokens = self.hls_proj(inputs)
-            else:
-                raise ValueError(f"Unsupported modality {modality!r}")
+    def _project_step_tokens(self, inputs: torch.Tensor, *, modality: str, tokenizer_type: str | None = None) -> torch.Tensor:
+        if tokenizer_type is None:
+            resolved_tokenizer = self.tokenizer_type if self.tokenizer_mode is None else "conv2d"
+        else:
+            resolved_tokenizer = str(tokenizer_type).lower()
+        if resolved_tokenizer == "linear":
+            tokens = self._projector_for(modality, resolved_tokenizer)(self.patchify(inputs))
+        elif resolved_tokenizer == "conv2d":
+            tokens = self._projector_for(modality, resolved_tokenizer)(inputs)
         else:
             raise ValueError("Per-step token projection is not supported for conv3d tokenizers")
         return self._apply_token_enrichments(tokens, modality=modality)
 
-    def _project_sequence_tokens(self, inputs: torch.Tensor, *, modality: str) -> torch.Tensor:
-        if self.tokenizer_type != "conv3d":
+    def _project_sequence_tokens(self, inputs: torch.Tensor, *, modality: str, tokenizer_type: str | None = None) -> torch.Tensor:
+        if tokenizer_type is None:
+            resolved_tokenizer = self.tokenizer_type if self.tokenizer_mode is None else "conv3d"
+        else:
+            resolved_tokenizer = str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
             raise ValueError("Sequence token projection is only supported for conv3d tokenizers")
         inputs = inputs.permute(0, 2, 1, 3, 4).contiguous()
-        if modality == "s2":
-            tokens = self.s2_proj(inputs)
-        elif modality == "s1":
-            tokens = self.s1_proj(inputs)
-        elif modality == "joint":
-            tokens = self.joint_proj(inputs)
-        elif modality == "hls":
-            tokens = self.hls_proj(inputs)
-        else:
-            raise ValueError(f"Unsupported modality {modality!r}")
+        tokens = self._projector_for(modality, resolved_tokenizer)(inputs)
         return self._apply_token_enrichments(tokens, modality=modality)
 
     @staticmethod
@@ -260,9 +327,10 @@ class SpatialEncoder(nn.Module):
         present_mask = present.to(dtype=inputs.dtype, device=inputs.device).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         return inputs * present_mask
 
-    def _group_count(self, timesteps: int) -> int:
+    def _group_count(self, timesteps: int, tokenizer_type: str | None = None) -> int:
         timesteps = int(timesteps)
-        if self.tokenizer_type != "conv3d":
+        resolved_tokenizer = self.resolve_tokenizer_type(timesteps) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
             return timesteps
         if timesteps % self.tubelet_size != 0:
             raise ValueError(
@@ -270,25 +338,41 @@ class SpatialEncoder(nn.Module):
             )
         return timesteps // self.tubelet_size
 
-    def aggregate_temporal_dates(self, dates: torch.Tensor) -> torch.Tensor:
-        if self.tokenizer_type != "conv3d":
+    def aggregate_temporal_dates(self, dates: torch.Tensor, tokenizer_type: str | None = None) -> torch.Tensor:
+        resolved_tokenizer = self.resolve_tokenizer_type(dates.shape[1]) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
             return dates
-        groups = self._group_count(dates.shape[1])
-        return dates.to(torch.float32).reshape(dates.shape[0], groups, self.tubelet_size).mean(dim=2).round().to(torch.int64)
+        groups = self._group_count(dates.shape[1], tokenizer_type=resolved_tokenizer)
+        reshaped = dates.to(torch.float32).reshape(dates.shape[0], groups, self.tubelet_size)
+        valid = reshaped > 0
+        counts = valid.sum(dim=2)
+        summed = torch.where(valid, reshaped, torch.zeros_like(reshaped)).sum(dim=2)
+        averaged = torch.where(
+            counts > 0,
+            summed / counts.clamp_min(1).to(torch.float32),
+            torch.full_like(summed, -1.0),
+        )
+        return averaged.round().to(torch.int64)
 
-    def aggregate_temporal_boolean(self, value: torch.Tensor | None) -> torch.Tensor | None:
-        if value is None or self.tokenizer_type != "conv3d":
+    def aggregate_temporal_boolean(self, value: torch.Tensor | None, tokenizer_type: str | None = None) -> torch.Tensor | None:
+        if value is None:
             return value
-        groups = self._group_count(value.shape[1])
+        resolved_tokenizer = self.resolve_tokenizer_type(value.shape[1]) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
+            return value
+        groups = self._group_count(value.shape[1], tokenizer_type=resolved_tokenizer)
         return value.to(torch.bool).reshape(value.shape[0], groups, self.tubelet_size).any(dim=2)
 
-    def aggregate_temporal_presence(self, value: torch.Tensor | None) -> torch.Tensor | None:
-        return self.aggregate_temporal_boolean(value)
+    def aggregate_temporal_presence(self, value: torch.Tensor | None, tokenizer_type: str | None = None) -> torch.Tensor | None:
+        return self.aggregate_temporal_boolean(value, tokenizer_type=tokenizer_type)
 
-    def aggregate_temporal_valid_mask(self, value: torch.Tensor | None) -> torch.Tensor | None:
-        if value is None or self.tokenizer_type != "conv3d":
+    def aggregate_temporal_valid_mask(self, value: torch.Tensor | None, tokenizer_type: str | None = None) -> torch.Tensor | None:
+        if value is None:
             return value
-        groups = self._group_count(value.shape[1])
+        resolved_tokenizer = self.resolve_tokenizer_type(value.shape[1]) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
+            return value
+        groups = self._group_count(value.shape[1], tokenizer_type=resolved_tokenizer)
         reshaped = value.to(torch.float32).reshape(value.shape[0], groups, self.tubelet_size, value.shape[2], value.shape[3])
         return reshaped.mean(dim=2)
 
@@ -344,10 +428,11 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
     ) -> list[torch.Tensor]:
         pieces: list[torch.Tensor] = []
         if hls is not None:
-            pieces.append(self._project_step_tokens(hls, modality="hls"))
+            pieces.append(self._project_step_tokens(hls, modality="hls", tokenizer_type=tokenizer_type))
             return pieces
 
         if s2 is None or s1 is None:
@@ -360,10 +445,10 @@ class SpatialEncoder(nn.Module):
                 ],
                 dim=1,
             )
-            pieces.append(self._project_step_tokens(joint_inputs, modality="joint"))
+            pieces.append(self._project_step_tokens(joint_inputs, modality="joint", tokenizer_type=tokenizer_type))
             return pieces
-        s2_tokens = self._project_step_tokens(s2, modality="s2")
-        s1_tokens = self._project_step_tokens(s1, modality="s1")
+        s2_tokens = self._project_step_tokens(s2, modality="s2", tokenizer_type=tokenizer_type)
+        s1_tokens = self._project_step_tokens(s1, modality="s1", tokenizer_type=tokenizer_type)
         if self.use_missing_modality_embeddings and s2_present is not None:
             missing = (~s2_present.to(torch.bool)).view(-1, 1, 1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
             s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
@@ -381,12 +466,14 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
     ) -> list[torch.Tensor]:
-        if self.tokenizer_type != "conv3d":
+        resolved_tokenizer = self.resolve_tokenizer_type(s2.shape[1] if s2 is not None else hls.shape[1],) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
             raise ValueError("encode_sequence_modalities is only supported for conv3d tokenizers")
         pieces: list[torch.Tensor] = []
         if hls is not None:
-            pieces.append(self._project_sequence_tokens(hls, modality="hls"))
+            pieces.append(self._project_sequence_tokens(hls, modality="hls", tokenizer_type=resolved_tokenizer))
             return pieces
 
         if s2 is None or s1 is None:
@@ -399,12 +486,12 @@ class SpatialEncoder(nn.Module):
                 ],
                 dim=2,
             )
-            pieces.append(self._project_sequence_tokens(joint_inputs, modality="joint"))
+            pieces.append(self._project_sequence_tokens(joint_inputs, modality="joint", tokenizer_type=resolved_tokenizer))
             return pieces
-        s2_tokens = self._project_sequence_tokens(s2, modality="s2")
-        s1_tokens = self._project_sequence_tokens(s1, modality="s1")
-        grouped_s2_present = self.aggregate_temporal_presence(s2_present)
-        grouped_s1_present = self.aggregate_temporal_presence(s1_present)
+        s2_tokens = self._project_sequence_tokens(s2, modality="s2", tokenizer_type=resolved_tokenizer)
+        s1_tokens = self._project_sequence_tokens(s1, modality="s1", tokenizer_type=resolved_tokenizer)
+        grouped_s2_present = self.aggregate_temporal_presence(s2_present, tokenizer_type=resolved_tokenizer)
+        grouped_s1_present = self.aggregate_temporal_presence(s1_present, tokenizer_type=resolved_tokenizer)
         if self.use_missing_modality_embeddings and grouped_s2_present is not None:
             missing = (~grouped_s2_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=s2_tokens.device, dtype=s2_tokens.dtype)
             s2_tokens = s2_tokens + (missing * self._missing_embed("s2", device=s2_tokens.device, dtype=s2_tokens.dtype, ndims=s2_tokens.ndim))
@@ -473,11 +560,22 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
     ) -> torch.Tensor:
-        if self.tokenizer_type == "conv3d":
+        resolved_tokenizer = self.tokenizer_type if tokenizer_type is None else str(tokenizer_type).lower()
+        if self.tokenizer_mode is not None and tokenizer_type is None:
+            resolved_tokenizer = "conv2d"
+        if resolved_tokenizer == "conv3d":
             raise ValueError("encode_step_tokens is not supported for conv3d tokenizers")
         combined = self.fuse_tokens(
-            self.encode_step_modalities(s2=s2, s1=s1, hls=hls, s2_present=s2_present, s1_present=s1_present)
+            self.encode_step_modalities(
+                s2=s2,
+                s1=s1,
+                hls=hls,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                tokenizer_type=resolved_tokenizer,
+            )
         )
         return self.norm(combined)
 
@@ -488,11 +586,20 @@ class SpatialEncoder(nn.Module):
         hls: torch.Tensor | None = None,
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
     ) -> torch.Tensor:
-        if self.tokenizer_type != "conv3d":
+        resolved_tokenizer = self.resolve_tokenizer_type(s2.shape[1] if s2 is not None else hls.shape[1]) if tokenizer_type is None else str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
             raise ValueError("encode_sequence_tokens is only supported for conv3d tokenizers")
         combined = self.fuse_tokens(
-            self.encode_sequence_modalities(s2=s2, s1=s1, hls=hls, s2_present=s2_present, s1_present=s1_present)
+            self.encode_sequence_modalities(
+                s2=s2,
+                s1=s1,
+                hls=hls,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                tokenizer_type=resolved_tokenizer,
+            )
         )
         return self.norm(combined)
 
@@ -504,8 +611,12 @@ class SpatialEncoder(nn.Module):
         s2_present: torch.Tensor | None = None,
         s1_present: torch.Tensor | None = None,
         return_tokens: bool = False,
+        tokenizer_type: str | None = None,
     ) -> torch.Tensor:
-        if self.tokenizer_type == "conv3d":
+        resolved_tokenizer = self.tokenizer_type if tokenizer_type is None else str(tokenizer_type).lower()
+        if self.tokenizer_mode is not None and tokenizer_type is None:
+            resolved_tokenizer = "conv2d"
+        if resolved_tokenizer == "conv3d":
             raise ValueError("SpatialEncoder.forward is only supported for per-step tokenizers; use encode_sequence_tokens for conv3d")
         combined = self.encode_step_tokens(
             s2=s2,
@@ -513,6 +624,7 @@ class SpatialEncoder(nn.Module):
             hls=hls,
             s2_present=s2_present,
             s1_present=s1_present,
+            tokenizer_type=resolved_tokenizer,
         )
         if return_tokens:
             return combined
