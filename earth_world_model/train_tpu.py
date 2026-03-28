@@ -148,6 +148,31 @@ class RegularizationProbeConfig:
     max_events: int = 0
 
 
+@dataclass(frozen=True)
+class TrainingTargetBundle:
+    target_embeddings: torch.Tensor | None
+    target_state_sequence: torch.Tensor | None
+    target_factorized: dict[str, torch.Tensor] | None
+    target_metadata: EmbeddingMetadata | None
+    regularization_source_embeddings: torch.Tensor | None
+    regularization_source_metadata: EmbeddingMetadata | None
+
+
+@dataclass(frozen=True)
+class PredictionBranchOutputs:
+    masked_loss: torch.Tensor
+    context_loss: torch.Tensor
+    student_factorized_partial: dict[str, torch.Tensor] | None
+
+
+@dataclass(frozen=True)
+class FactorizedAuxLossOutputs:
+    state_loss: torch.Tensor
+    scene_loss: torch.Tensor
+    delta_loss: torch.Tensor
+    delta_horizon: torch.Tensor
+
+
 def should_use_ssl4eo_shard_sampler(dataset: torch.utils.data.Dataset, data_cfg: dict[str, Any], batch_size: int) -> bool:
     mode = str(data_cfg.get("batch_sampler", "auto")).strip().lower()
     if mode in {"off", "none", "disabled", "false", "0"}:
@@ -310,6 +335,23 @@ def resolve_regularization_subspace_dims(config: dict) -> tuple[int, int, int]:
 
 def resolve_detach_self_target(config: dict) -> bool:
     return resolve_bool_config(config.get("training", {}).get("detach_self_target", True), default=True)
+
+
+def resolve_factorized_latent_version(config: dict) -> str:
+    version = str(config.get("model", {}).get("factorized_latent_version", "none")).strip().lower()
+    if version not in {"none", "v1", "v2"}:
+        raise ValueError(f"Unsupported model.factorized_latent_version: {version}")
+    return version
+
+
+def maybe_detach_value(value: Any, *, detach: bool) -> Any:
+    if not detach:
+        return value
+    if torch.is_tensor(value):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: maybe_detach_value(item, detach=True) for key, item in value.items()}
+    return value
 
 
 def resolve_eval_checkpoint_metric(config: dict) -> str:
@@ -585,6 +627,10 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         use_sensor_timing_features=resolve_bool_config(model_cfg.get("use_sensor_timing_features", False), default=False),
         enable_latent_dynamics=resolve_bool_config(model_cfg.get("enable_latent_dynamics", True), default=True),
         dynamics_hidden_dim=model_cfg.get("dynamics_hidden_dim"),
+        factorized_latent_version=model_cfg.get("factorized_latent_version", "none"),
+        scene_latent_dim=model_cfg.get("scene_latent_dim"),
+        state_latent_dim=model_cfg.get("state_latent_dim"),
+        delta_hidden_dim=model_cfg.get("delta_hidden_dim"),
     )
     if resolve_regularization_method(config) != "none" and resolve_regularization_mode(config) == "per_subspace":
         subspace_dims = resolve_regularization_subspace_dims(config)
@@ -657,6 +703,7 @@ class StudentStepModule(torch.nn.Module):
         batch: dict[str, torch.Tensor],
         target_embeddings: torch.Tensor | None,
         target_state_sequence: torch.Tensor | None,
+        target_factorized: dict[str, torch.Tensor] | None,
         target_metadata: EmbeddingMetadata | None,
         mask_spec: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
@@ -665,6 +712,7 @@ class StudentStepModule(torch.nn.Module):
             self.student,
             target_embeddings,
             target_state_sequence,
+            target_factorized,
             target_metadata,
             batch,
             mask_spec,
@@ -1583,12 +1631,11 @@ def dense_block_mask_spec(
     masked_idx = torch.nonzero(~visible_mask, as_tuple=False).squeeze(1)
     visible_idx = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
     if masked_idx.numel() == 0 or visible_idx.numel() == 0:
-        visible_idx, masked_idx = temporal_mask_indices(timesteps, float(training_cfg.get("mask_ratio", 0.5)), device)
-        return {
-            "mode": "temporal",
-            "visible_idx": visible_idx,
-            "masked_idx": masked_idx,
-        }
+        mask_ratio = float(training_cfg.get("mask_ratio", 0.5))
+        num_masked = min(max(1, int(round(total_tokens * mask_ratio))), max(total_tokens - 1, 1))
+        permutation = torch.randperm(total_tokens)
+        masked_idx = permutation[:num_masked].sort().values
+        visible_idx = permutation[num_masked:].sort().values
 
     position_ids = _dense_token_position_ids(grouped_dates, tokens_per_timestep)
     return {
@@ -1688,6 +1735,46 @@ def compute_target_state_sequence(
     )[0]
 
 
+def compute_target_factorized_latents(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> dict[str, torch.Tensor] | None:
+    if resolve_factorized_latent_version(config) == "none":
+        return None
+    return model.encode_factorized_latents(
+        batch.get("s2"),
+        batch.get("s1"),
+        batch["dates"],
+        batch["mask"],
+        hls=batch.get("hls"),
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
+    )
+
+
+def compute_online_factorized_latents(
+    model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    *,
+    token_indices: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    return model.encode_factorized_latents(
+        batch.get("s2"),
+        batch.get("s1"),
+        batch["dates"],
+        batch["mask"],
+        hls=batch.get("hls"),
+        s2_present=batch.get("s2_present"),
+        s1_present=batch.get("s1_present"),
+        s2_dates=batch.get("s2_dates"),
+        s1_dates=batch.get("s1_dates"),
+        token_indices=token_indices,
+    )
+
+
 def compute_online_embeddings(
     model: EarthWorldModel,
     batch: dict[str, torch.Tensor],
@@ -1709,10 +1796,146 @@ def compute_online_embeddings(
     return embeddings, current_embedding_metadata(model)
 
 
+def _dense_masked_state_weights(
+    reference_model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    *,
+    masked_token_idx: torch.Tensor,
+    tokens_per_timestep: int,
+) -> torch.Tensor:
+    grouped_dates = reference_model.spatial.aggregate_temporal_dates(
+        batch["dates"],
+        tokenizer_type=reference_model.spatial.resolve_tokenizer_type(int(batch["dates"].shape[1])),
+    )
+    grouped_steps = int(grouped_dates.shape[1])
+    if grouped_steps <= 0:
+        return batch["dates"].new_zeros((batch["dates"].shape[0], 0), dtype=torch.float32)
+    token_weights = _dense_all_token_target_weights(reference_model, batch, tokens_per_timestep)
+    if token_weights is None:
+        token_weights = torch.ones(
+            (batch["dates"].shape[0], grouped_steps * tokens_per_timestep),
+            device=batch["dates"].device,
+            dtype=torch.float32,
+        )
+    token_weights = token_weights.reshape(batch["dates"].shape[0], grouped_steps, tokens_per_timestep)
+    masked_token_mask = torch.zeros(
+        (grouped_steps * tokens_per_timestep,),
+        device=token_weights.device,
+        dtype=token_weights.dtype,
+    )
+    masked_token_mask[masked_token_idx.to(device=token_weights.device, dtype=torch.long)] = 1.0
+    masked_token_mask = masked_token_mask.view(1, grouped_steps, tokens_per_timestep)
+    numerator = (token_weights * masked_token_mask).sum(dim=2)
+    denominator = masked_token_mask.sum(dim=2).clamp_min(1.0e-6)
+    return numerator / denominator
+
+
+def masked_state_step_weights(
+    reference_model: EarthWorldModel,
+    batch: dict[str, torch.Tensor],
+    mask_spec: dict[str, Any],
+) -> torch.Tensor:
+    if mask_spec.get("mode") == "dense_block3d":
+        return _dense_masked_state_weights(
+            reference_model,
+            batch,
+            masked_token_idx=mask_spec["masked_idx"],
+            tokens_per_timestep=reference_model.last_tokens_per_timestep,
+        )
+    grouped_dates = reference_model.spatial.aggregate_temporal_dates(
+        batch["dates"],
+        tokenizer_type=reference_model.spatial.resolve_tokenizer_type(int(batch["dates"].shape[1])),
+    )
+    grouped_steps = int(grouped_dates.shape[1])
+    weights = torch.zeros(
+        (batch["dates"].shape[0], grouped_steps),
+        device=batch["dates"].device,
+        dtype=torch.float32,
+    )
+    masked_idx = mask_spec["masked_idx"].to(device=weights.device, dtype=torch.long)
+    weights[:, masked_idx] = 1.0
+    grouped_mask = reference_model.spatial.aggregate_temporal_boolean(
+        batch.get("mask"),
+        tokenizer_type=reference_model.spatial.resolve_tokenizer_type(int(batch["dates"].shape[1])),
+    )
+    if grouped_mask is not None:
+        weights = weights * grouped_mask.to(dtype=weights.dtype)
+    return weights
+
+
+def build_training_targets(
+    student: EarthWorldModel,
+    target_embeddings: torch.Tensor | None,
+    target_state_sequence: torch.Tensor | None,
+    target_factorized: dict[str, torch.Tensor] | None,
+    target_metadata: EmbeddingMetadata | None,
+    batch: dict[str, torch.Tensor],
+    config: dict,
+) -> TrainingTargetBundle:
+    training_cfg = config["training"]
+    target_mode = resolve_target_mode(config)
+    regularization_method = resolve_regularization_method(config)
+    factorized_latent_version = resolve_factorized_latent_version(config)
+    detach_self_target = resolve_detach_self_target(config)
+    dynamics_loss_weight = float(training_cfg.get("dynamics_loss_weight", 0.0))
+    return_hierarchical_targets = bool(config["model"].get("hierarchical_layers"))
+
+    target_embeddings_local = target_embeddings
+    target_state_sequence_local = target_state_sequence
+    target_factorized_local = target_factorized
+    target_metadata_local = target_metadata
+    regularization_source_embeddings = None
+    regularization_source_metadata = None
+
+    if target_mode == "self":
+        online_target_embeddings, target_metadata_local = compute_online_embeddings(
+            student,
+            batch,
+            return_hierarchical=return_hierarchical_targets,
+        )
+        target_embeddings_local = maybe_detach_value(online_target_embeddings, detach=detach_self_target)
+        if regularization_method != "none" and not return_hierarchical_targets:
+            regularization_source_embeddings = online_target_embeddings
+            regularization_source_metadata = target_metadata_local
+
+        if factorized_latent_version != "none":
+            online_target_factorized = compute_online_factorized_latents(student, batch)
+            target_factorized_local = maybe_detach_value(online_target_factorized, detach=detach_self_target)
+            target_state_sequence_local = target_factorized_local["state_sequence"]
+
+        if dynamics_loss_weight > 0.0:
+            online_state_sequence = compute_target_state_sequence(student, batch, config)
+            target_state_sequence_local = (
+                None
+                if online_state_sequence is None
+                else maybe_detach_value(online_state_sequence, detach=detach_self_target)
+            )
+
+    if regularization_method != "none" and regularization_source_embeddings is None:
+        regularization_source_embeddings, regularization_source_metadata = compute_online_embeddings(
+            student,
+            batch,
+            return_hierarchical=False,
+        )
+
+    if factorized_latent_version != "none" and target_factorized_local is not None and target_state_sequence_local is None:
+        target_state_sequence_local = target_factorized_local["state_sequence"]
+
+    return TrainingTargetBundle(
+        target_embeddings=target_embeddings_local,
+        target_state_sequence=target_state_sequence_local,
+        target_factorized=target_factorized_local,
+        target_metadata=target_metadata_local,
+        regularization_source_embeddings=regularization_source_embeddings,
+        regularization_source_metadata=regularization_source_metadata,
+    )
+
+
 def compute_masked_prediction_loss(
     student: EarthWorldModel,
     target_embeddings: torch.Tensor | None,
     target_state_sequence: torch.Tensor | None,
+    target_factorized: dict[str, torch.Tensor] | None,
     target_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
@@ -1724,6 +1947,7 @@ def compute_masked_prediction_loss(
         student,
         target_embeddings,
         target_state_sequence,
+        target_factorized,
         target_metadata,
         batch,
         mask_spec,
@@ -2155,23 +2379,28 @@ def compute_dynamics_rollout_loss(
     teacher_state_sequence: torch.Tensor | None,
     batch: dict[str, torch.Tensor],
     config: dict,
+    *,
+    student_states: torch.Tensor | None = None,
+    grouped_dates: torch.Tensor | None = None,
+    student_state_weights: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if teacher_state_sequence is None or student.latent_rollout_head is None:
         return None
     horizon = int(config["training"].get("dynamics_rollout_horizon", 4))
     if horizon <= 0:
         return None
-    student_states, grouped_dates = student.encode_state_sequence(
-        batch.get("s2"),
-        batch.get("s1"),
-        batch["dates"],
-        batch["mask"],
-        hls=batch.get("hls"),
-        s2_present=batch.get("s2_present"),
-        s1_present=batch.get("s1_present"),
-        s2_dates=batch.get("s2_dates"),
-        s1_dates=batch.get("s1_dates"),
-    )
+    if student_states is None or grouped_dates is None:
+        student_states, grouped_dates = student.encode_state_sequence(
+            batch.get("s2"),
+            batch.get("s1"),
+            batch["dates"],
+            batch["mask"],
+            hls=batch.get("hls"),
+            s2_present=batch.get("s2_present"),
+            s1_present=batch.get("s1_present"),
+            s2_dates=batch.get("s2_dates"),
+            s1_dates=batch.get("s1_dates"),
+        )
     rollout_horizon = min(int(horizon), student_states.shape[1] - 1)
     if rollout_horizon <= 0:
         return None
@@ -2200,6 +2429,9 @@ def compute_dynamics_rollout_loss(
             [grouped_mask[:, step + 1 : step + 1 + start_count].to(torch.float32) for step in range(rollout_horizon)],
             dim=2,
         )
+    if student_state_weights is not None:
+        source_weights = student_state_weights[:, :start_count].to(dtype=torch.float32).unsqueeze(2).expand(-1, -1, rollout_horizon)
+        target_weights = source_weights if target_weights is None else (target_weights * source_weights)
     return weighted_embedding_mse(
         predicted.reshape(predicted.shape[0], -1, predicted.shape[-1]),
         target.reshape(target.shape[0], -1, target.shape[-1]),
@@ -2269,87 +2501,48 @@ def compute_cross_sensor_alignment_loss(
     return weighted_embedding_mse(s2_only_states, s1_only_states, weights=paired_weights)
 
 
-def compute_prediction_losses(
+def compute_masked_context_losses(
     student: EarthWorldModel,
-    target_embeddings: torch.Tensor | None,
-    target_state_sequence: torch.Tensor | None,
-    target_metadata: EmbeddingMetadata | None,
+    target_embeddings: torch.Tensor,
+    target_metadata: EmbeddingMetadata,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
-    backend: str,
-    device: torch.device,
     config: dict,
-) -> dict[str, torch.Tensor]:
+    *,
+    factorized_latent_version: str,
+) -> PredictionBranchOutputs:
     dates = batch["dates"]
     training_cfg = config["training"]
-    target_mode = resolve_target_mode(config)
-    regularization_method = resolve_regularization_method(config)
-    detach_self_target = resolve_detach_self_target(config)
     predict_visible_context = bool(training_cfg.get("predict_visible_context", False))
     context_loss_weight = float(training_cfg.get("context_loss_weight", 0.0))
     context_loss_distance_weighted = bool(training_cfg.get("context_loss_distance_weighted", False))
     context_loss_sqrt_distance = bool(training_cfg.get("context_loss_sqrt_distance", True))
-    dynamics_loss_weight = float(training_cfg.get("dynamics_loss_weight", 0.0))
-    cross_sensor_loss_weight = float(training_cfg.get("cross_sensor_loss_weight", 0.0))
     mask_mode = str(mask_spec.get("mode", "temporal")).lower()
 
-    with maybe_autocast(backend, device, config):
-        target_embeddings_local = target_embeddings
-        target_state_sequence_local = target_state_sequence
-        target_metadata_local = target_metadata
-        regularization_source_embeddings = None
-        regularization_source_metadata = None
-        return_hierarchical_targets = bool(config["model"].get("hierarchical_layers"))
+    if mask_mode == "dense_block3d":
+        visible_token_idx = mask_spec["visible_idx"]
+        masked_token_idx = mask_spec["masked_idx"]
+        visible_position_ids = mask_spec["visible_position_ids"]
+        masked_position_ids = mask_spec["masked_position_ids"]
+        masked_local_token_indices = mask_spec["masked_local_token_indices"]
+        predicted_visible = None
+        student_factorized_partial = None
 
-        if target_mode == "self":
-            if return_hierarchical_targets:
-                online_target_embeddings, target_metadata_local = compute_online_embeddings(
-                    student,
-                    batch,
-                    return_hierarchical=True,
-                )
-                target_embeddings_local = (
-                    online_target_embeddings.detach() if detach_self_target else online_target_embeddings
-                )
-            else:
-                online_target_embeddings, target_metadata_local = compute_online_embeddings(
-                    student,
-                    batch,
-                    return_hierarchical=False,
-                )
-                target_embeddings_local = (
-                    online_target_embeddings.detach() if detach_self_target else online_target_embeddings
-                )
-                if regularization_method != "none":
-                    regularization_source_embeddings = online_target_embeddings
-                    regularization_source_metadata = target_metadata_local
-            if dynamics_loss_weight > 0.0:
-                online_state_sequence = compute_target_state_sequence(student, batch, config)
-                target_state_sequence_local = (
-                    None
-                    if online_state_sequence is None
-                    else (online_state_sequence.detach() if detach_self_target else online_state_sequence)
-                )
-
-        if regularization_method != "none" and regularization_source_embeddings is None:
-            regularization_source_embeddings, regularization_source_metadata = compute_online_embeddings(
+        if factorized_latent_version != "none":
+            student_factorized_partial = compute_online_factorized_latents(
                 student,
                 batch,
-                return_hierarchical=False,
+                token_indices=visible_token_idx,
             )
-
-        if target_embeddings_local is None or target_metadata_local is None:
-            raise ValueError(
-                f"Missing target embeddings for training.target_mode={target_mode}. "
-                "EMA runs must provide target embeddings; self runs should synthesize them."
+            masked_step_indices = torch.div(masked_token_idx, student.last_tokens_per_timestep, rounding_mode="floor")
+            predicted_masked = student.decode_masked_tokens_from_latents(
+                student_factorized_partial["scene_latent"],
+                student_factorized_partial["state_sequence"],
+                masked_position_ids=masked_position_ids,
+                masked_local_token_indices=masked_local_token_indices,
+                masked_step_indices=masked_step_indices,
             )
-
-        if mask_mode == "dense_block3d":
-            visible_token_idx = mask_spec["visible_idx"]
-            masked_token_idx = mask_spec["masked_idx"]
-            visible_position_ids = mask_spec["visible_position_ids"]
-            masked_position_ids = mask_spec["masked_position_ids"]
-            masked_local_token_indices = mask_spec["masked_local_token_indices"]
+        else:
             visible_embeddings = student.encode_timeline(
                 batch.get("s2"),
                 batch.get("s1"),
@@ -2370,92 +2563,285 @@ def compute_prediction_losses(
                 visible_token_indices=visible_token_idx,
                 masked_token_indices=masked_token_idx,
             )
-            masked_target = select_target_embeddings(
+
+        masked_target = select_target_embeddings(
+            student,
+            target_embeddings,
+            target_metadata,
+            token_idx=masked_token_idx,
+        ).detach()
+        masked_weights = select_target_weights(
+            student,
+            batch,
+            target_metadata,
+            token_idx=masked_token_idx,
+        )
+        masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
+
+        context_loss = torch.zeros_like(masked_loss)
+        if (
+            factorized_latent_version == "none"
+            and predict_visible_context
+            and visible_token_idx.numel() > 0
+            and context_loss_weight > 0.0
+        ):
+            context_target = select_target_embeddings(
                 student,
-                target_embeddings_local,
-                target_metadata_local,
-                token_idx=masked_token_idx,
+                target_embeddings,
+                target_metadata,
+                token_idx=visible_token_idx,
             ).detach()
-            masked_weights = select_target_weights(
+            context_weights = None
+            if context_loss_distance_weighted:
+                context_weights = dense_token_temporal_context_weights(
+                    visible_position_ids,
+                    masked_position_ids,
+                    device=predicted_visible.device,
+                    dtype=predicted_visible.dtype,
+                    sqrt_distance=context_loss_sqrt_distance,
+                )
+            context_target_weights = select_target_weights(
                 student,
                 batch,
-                target_metadata_local,
-                token_idx=masked_token_idx,
+                target_metadata,
+                token_idx=visible_token_idx,
             )
-            masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
+            context_weights = _combine_loss_weights(context_target_weights, context_weights)
+            context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
 
-            context_loss = torch.zeros_like(masked_loss)
-            if predict_visible_context and visible_token_idx.numel() > 0 and context_loss_weight > 0.0:
-                context_target = select_target_embeddings(
-                    student,
-                    target_embeddings_local,
-                    target_metadata_local,
-                    token_idx=visible_token_idx,
-                ).detach()
-                context_weights = None
-                if context_loss_distance_weighted:
-                    context_weights = dense_token_temporal_context_weights(
-                        visible_position_ids,
-                        masked_position_ids,
-                        device=predicted_visible.device,
-                        dtype=predicted_visible.dtype,
-                        sqrt_distance=context_loss_sqrt_distance,
-                    )
-                context_target_weights = select_target_weights(
-                    student,
-                    batch,
-                    target_metadata_local,
-                    token_idx=visible_token_idx,
+        return PredictionBranchOutputs(
+            masked_loss=masked_loss,
+            context_loss=context_loss,
+            student_factorized_partial=student_factorized_partial,
+        )
+
+    if factorized_latent_version != "none":
+        raise ValueError("Factorized latent training currently expects dense_block3d masking")
+
+    visible_idx = mask_spec["visible_idx"]
+    masked_idx = mask_spec["masked_idx"]
+    visible_embeddings = student_visible_embeddings(student, batch, visible_idx)
+    predicted_visible, predicted_masked = student.predict_with_context(
+        visible_embeddings,
+        dates[:, visible_idx],
+        dates[:, masked_idx],
+    )
+    masked_target = select_target_embeddings(
+        student,
+        target_embeddings,
+        target_metadata,
+        step_idx=masked_idx,
+    ).detach()
+    masked_weights = select_target_weights(student, batch, target_metadata, step_idx=masked_idx)
+    masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
+
+    context_loss = torch.zeros_like(masked_loss)
+    if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
+        context_target = select_target_embeddings(
+            student,
+            target_embeddings,
+            target_metadata,
+            step_idx=visible_idx,
+        ).detach()
+        context_weights = None
+        if context_loss_distance_weighted:
+            context_weights = temporal_context_weights(
+                visible_idx,
+                masked_idx,
+                device=predicted_visible.device,
+                dtype=predicted_visible.dtype,
+                sqrt_distance=context_loss_sqrt_distance,
+            )
+            context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
+        context_target_weights = select_target_weights(student, batch, target_metadata, step_idx=visible_idx)
+        context_weights = _combine_loss_weights(context_target_weights, context_weights)
+        context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
+
+    return PredictionBranchOutputs(
+        masked_loss=masked_loss,
+        context_loss=context_loss,
+        student_factorized_partial=None,
+    )
+
+
+def compute_factorized_auxiliary_losses(
+    student: EarthWorldModel,
+    target_factorized: dict[str, torch.Tensor] | None,
+    target_state_sequence: torch.Tensor | None,
+    student_factorized_partial: dict[str, torch.Tensor] | None,
+    batch: dict[str, torch.Tensor],
+    mask_spec: dict[str, Any],
+    config: dict,
+    *,
+    factorized_latent_version: str,
+    device: torch.device,
+    reference_dtype: torch.dtype,
+) -> FactorizedAuxLossOutputs:
+    zero = torch.zeros((), device=device, dtype=reference_dtype)
+    zero_horizon = torch.zeros((), device=device, dtype=torch.long)
+    if factorized_latent_version == "none":
+        return FactorizedAuxLossOutputs(
+            state_loss=zero,
+            scene_loss=zero,
+            delta_loss=zero,
+            delta_horizon=zero_horizon,
+        )
+    if target_factorized is None or target_state_sequence is None or student_factorized_partial is None:
+        raise ValueError("Factorized latent training requires both target and student partial factorized latents")
+
+    training_cfg = config["training"]
+    delta_loss_weight = float(training_cfg.get("delta_loss_weight", 0.0))
+    delta_random_horizon_max = int(training_cfg.get("delta_random_horizon_max", 0))
+
+    target_scene_latent = target_factorized["scene_latent"].detach()
+    state_weights = masked_state_step_weights(student, batch, mask_spec)
+    state_loss = weighted_embedding_mse(
+        student_factorized_partial["state_sequence"],
+        target_state_sequence.detach(),
+        weights=state_weights,
+    )
+    scene_loss = weighted_embedding_mse(
+        student_factorized_partial["scene_latent"],
+        target_scene_latent,
+    )
+    delta_loss = torch.zeros_like(state_loss)
+    delta_horizon = zero_horizon
+
+    if factorized_latent_version == "v2" and delta_loss_weight > 0.0:
+        max_horizon = min(
+            max(0, int(delta_random_horizon_max)),
+            max(0, int(student_factorized_partial["state_sequence"].shape[1]) - 1),
+        )
+        if max_horizon > 0:
+            horizon = int(torch.randint(1, max_horizon + 1, (1,), device=device).item())
+            predicted_delta = student.predict_state_deltas(
+                student_factorized_partial["scene_latent"],
+                student_factorized_partial["state_sequence"],
+                student_factorized_partial["grouped_dates"],
+                horizon=horizon,
+            )
+            if predicted_delta.shape[1] > 0:
+                teacher_states = target_state_sequence.detach()
+                target_delta = teacher_states[:, horizon:, :] - teacher_states[:, :-horizon, :]
+                teacher_state_weights = target_factorized["state_weights"].to(
+                    device=teacher_states.device,
+                    dtype=teacher_states.dtype,
                 )
-                context_weights = _combine_loss_weights(context_target_weights, context_weights)
-                context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
-        else:
-            visible_idx = mask_spec["visible_idx"]
-            masked_idx = mask_spec["masked_idx"]
-            visible_embeddings = student_visible_embeddings(student, batch, visible_idx)
-            predicted_visible, predicted_masked = student.predict_with_context(
-                visible_embeddings,
-                dates[:, visible_idx],
-                dates[:, masked_idx],
-            )
-            masked_target = select_target_embeddings(
-                student,
-                target_embeddings_local,
-                target_metadata_local,
-                step_idx=masked_idx,
-            ).detach()
-            masked_weights = select_target_weights(student, batch, target_metadata_local, step_idx=masked_idx)
-            masked_loss = weighted_embedding_mse(predicted_masked, masked_target, weights=masked_weights)
+                source_state_weights = student_factorized_partial["state_weights"].to(
+                    device=teacher_states.device,
+                    dtype=teacher_states.dtype,
+                )
+                delta_weights = (
+                    teacher_state_weights[:, horizon:]
+                    * teacher_state_weights[:, :-horizon]
+                    * source_state_weights[:, :-horizon]
+                )
+                delta_loss = weighted_embedding_mse(predicted_delta, target_delta, weights=delta_weights)
+                delta_horizon = torch.tensor(horizon, device=device, dtype=torch.long)
 
-            context_loss = torch.zeros_like(masked_loss)
-            if predict_visible_context and visible_idx.numel() > 0 and context_loss_weight > 0.0:
-                context_target = select_target_embeddings(
-                    student,
-                    target_embeddings_local,
-                    target_metadata_local,
-                    step_idx=visible_idx,
-                ).detach()
-                context_weights = None
-                if context_loss_distance_weighted:
-                    context_weights = temporal_context_weights(
-                        visible_idx,
-                        masked_idx,
-                        device=predicted_visible.device,
-                        dtype=predicted_visible.dtype,
-                        sqrt_distance=context_loss_sqrt_distance,
-                    )
-                    context_weights = expand_context_weights_for_tokens(context_weights, student.last_tokens_per_timestep)
-                context_target_weights = select_target_weights(student, batch, target_metadata_local, step_idx=visible_idx)
-                context_weights = _combine_loss_weights(context_target_weights, context_weights)
-                context_loss = weighted_embedding_mse(predicted_visible, context_target, weights=context_weights)
+    return FactorizedAuxLossOutputs(
+        state_loss=state_loss,
+        scene_loss=scene_loss,
+        delta_loss=delta_loss,
+        delta_horizon=delta_horizon,
+    )
+
+
+def compute_prediction_losses(
+    student: EarthWorldModel,
+    target_embeddings: torch.Tensor | None,
+    target_state_sequence: torch.Tensor | None,
+    target_factorized: dict[str, torch.Tensor] | None,
+    target_metadata: EmbeddingMetadata | None,
+    batch: dict[str, torch.Tensor],
+    mask_spec: dict[str, Any],
+    backend: str,
+    device: torch.device,
+    config: dict,
+) -> dict[str, torch.Tensor]:
+    training_cfg = config["training"]
+    regularization_method = resolve_regularization_method(config)
+    factorized_latent_version = resolve_factorized_latent_version(config)
+    predict_visible_context = bool(training_cfg.get("predict_visible_context", False))
+    context_loss_weight = float(training_cfg.get("context_loss_weight", 0.0))
+    dynamics_loss_weight = float(training_cfg.get("dynamics_loss_weight", 0.0))
+    cross_sensor_loss_weight = float(training_cfg.get("cross_sensor_loss_weight", 0.0))
+    mask_state_loss_weight = float(training_cfg.get("mask_state_loss_weight", 0.0))
+    scene_consistency_weight = float(training_cfg.get("scene_consistency_weight", 0.0))
+    delta_loss_weight = float(training_cfg.get("delta_loss_weight", 0.0))
+
+    with maybe_autocast(backend, device, config):
+        targets = build_training_targets(
+            student,
+            target_embeddings,
+            target_state_sequence,
+            target_factorized,
+            target_metadata,
+            batch,
+            config,
+        )
+
+        if targets.target_embeddings is None or targets.target_metadata is None:
+            raise ValueError(
+                f"Missing target embeddings for training.target_mode={resolve_target_mode(config)}. "
+                "EMA runs must provide target embeddings; self runs should synthesize them."
+            )
+        if factorized_latent_version != "none" and targets.target_factorized is None:
+            raise ValueError("Factorized latent training requires target factorized latents")
+        if factorized_latent_version != "none" and student.token_mode != "dense":
+            raise ValueError("Factorized latent training currently requires token_mode=dense")
+        branch_outputs = compute_masked_context_losses(
+            student,
+            targets.target_embeddings,
+            targets.target_metadata,
+            batch,
+            mask_spec,
+            config,
+            factorized_latent_version=factorized_latent_version,
+        )
+        masked_loss = branch_outputs.masked_loss
+        context_loss = branch_outputs.context_loss
+        student_factorized_partial = branch_outputs.student_factorized_partial
+
+        factorized_outputs = compute_factorized_auxiliary_losses(
+            student,
+            targets.target_factorized,
+            targets.target_state_sequence,
+            student_factorized_partial,
+            batch,
+            mask_spec,
+            config,
+            factorized_latent_version=factorized_latent_version,
+            device=device,
+            reference_dtype=targets.target_embeddings.dtype,
+        )
+        state_loss = factorized_outputs.state_loss
+        scene_loss = factorized_outputs.scene_loss
+        delta_loss = factorized_outputs.delta_loss
+        factorized_masked_horizon = factorized_outputs.delta_horizon
 
         dynamics_loss = torch.zeros_like(masked_loss)
         if dynamics_loss_weight > 0.0:
             maybe_dynamics_loss = compute_dynamics_rollout_loss(
                 student,
-                target_state_sequence_local,
+                targets.target_state_sequence,
                 batch,
                 config,
+                student_states=(
+                    student_factorized_partial["state_sequence"]
+                    if student_factorized_partial is not None
+                    else None
+                ),
+                grouped_dates=(
+                    student_factorized_partial["grouped_dates"]
+                    if student_factorized_partial is not None
+                    else None
+                ),
+                student_state_weights=(
+                    student_factorized_partial["state_weights"]
+                    if student_factorized_partial is not None
+                    else None
+                ),
             )
             if maybe_dynamics_loss is not None:
                 dynamics_loss = maybe_dynamics_loss
@@ -2468,28 +2854,40 @@ def compute_prediction_losses(
 
         regularization_loss, crosscov_penalty, regularization_debug = compute_regularization_losses(
             student,
-            regularization_source_embeddings,
-            regularization_source_metadata,
+            targets.regularization_source_embeddings,
+            targets.regularization_source_metadata,
             batch,
             config,
         )
         total_loss = (
             masked_loss
+            + (mask_state_loss_weight * state_loss)
+            + (scene_consistency_weight * scene_loss)
             + (context_loss_weight * context_loss)
             + (dynamics_loss_weight * dynamics_loss)
             + (cross_sensor_loss_weight * cross_sensor_loss)
+            + (delta_loss_weight * delta_loss)
             + regularization_loss
         )
 
     return {
         "total_loss": total_loss,
         "masked_loss": masked_loss.detach(),
+        "state_loss": state_loss.detach(),
+        "scene_loss": scene_loss.detach(),
         "context_loss": context_loss.detach(),
         "dynamics_loss": dynamics_loss.detach(),
         "cross_sensor_loss": cross_sensor_loss.detach(),
+        "delta_loss": delta_loss.detach(),
         "regularization_loss": regularization_loss.detach(),
         "crosscov_penalty": crosscov_penalty.detach(),
         "regularization_debug": regularization_debug,
+        "mask_state_loss_weight": torch.tensor(mask_state_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "scene_consistency_weight": torch.tensor(
+            scene_consistency_weight,
+            device=total_loss.device,
+            dtype=total_loss.dtype,
+        ),
         "context_loss_weight": torch.tensor(context_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "dynamics_loss_weight": torch.tensor(dynamics_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
         "cross_sensor_loss_weight": torch.tensor(
@@ -2497,6 +2895,9 @@ def compute_prediction_losses(
             device=total_loss.device,
             dtype=total_loss.dtype,
         ),
+        "delta_loss_weight": torch.tensor(delta_loss_weight, device=total_loss.device, dtype=total_loss.dtype),
+        "factorized_latent_version": factorized_latent_version,
+        "factorized_delta_horizon": factorized_masked_horizon,
         "predict_visible_context": torch.tensor(1 if predict_visible_context else 0, device=total_loss.device),
     }
 
@@ -2506,6 +2907,7 @@ def compute_student_loss_terms(
     student_stepper: torch.nn.Module | None,
     target_embeddings: torch.Tensor | None,
     target_state_sequence: torch.Tensor | None,
+    target_factorized: dict[str, torch.Tensor] | None,
     target_metadata: EmbeddingMetadata | None,
     batch: dict[str, torch.Tensor],
     mask_spec: dict[str, Any],
@@ -2514,11 +2916,12 @@ def compute_student_loss_terms(
     config: dict,
 ) -> dict[str, torch.Tensor]:
     if student_stepper is not None:
-        return student_stepper(batch, target_embeddings, target_state_sequence, target_metadata, mask_spec)
+        return student_stepper(batch, target_embeddings, target_state_sequence, target_factorized, target_metadata, mask_spec)
     return compute_prediction_losses(
         student,
         target_embeddings,
         target_state_sequence,
+        target_factorized,
         target_metadata,
         batch,
         mask_spec,
@@ -2565,9 +2968,12 @@ def evaluate(
 
     loss_total = 0.0
     masked_loss_total = 0.0
+    state_loss_total = 0.0
+    scene_loss_total = 0.0
     context_loss_total = 0.0
     dynamics_loss_total = 0.0
     cross_sensor_loss_total = 0.0
+    delta_loss_total = 0.0
     regularization_loss_total = 0.0
     crosscov_penalty_total = 0.0
     step_count = 0
@@ -2578,11 +2984,13 @@ def evaluate(
             batch = move_batch(batch, device, backend)
             target_embeddings = None
             target_state_sequence = None
+            target_factorized = None
             target_metadata = None
             if teacher is not None:
                 target_embeddings = compute_target_embeddings(teacher, batch, config)
                 target_metadata = current_embedding_metadata(teacher)
                 target_state_sequence = compute_target_state_sequence(teacher, batch, config)
+                target_factorized = compute_target_factorized_latents(teacher, batch, config)
 
             if mask_mode == "all":
                 masking_mode = str(config["training"].get("masking_mode", "temporal_random")).lower()
@@ -2607,6 +3015,7 @@ def evaluate(
                     student_stepper,
                     target_embeddings,
                     target_state_sequence,
+                    target_factorized,
                     target_metadata,
                     batch,
                     mask_spec,
@@ -2618,16 +3027,22 @@ def evaluate(
             ]
             batch_loss = torch.stack([loss_terms["total_loss"] for loss_terms in batch_losses]).mean()
             batch_masked_loss = torch.stack([loss_terms["masked_loss"] for loss_terms in batch_losses]).mean()
+            batch_state_loss = torch.stack([loss_terms["state_loss"] for loss_terms in batch_losses]).mean()
+            batch_scene_loss = torch.stack([loss_terms["scene_loss"] for loss_terms in batch_losses]).mean()
             batch_context_loss = torch.stack([loss_terms["context_loss"] for loss_terms in batch_losses]).mean()
             batch_dynamics_loss = torch.stack([loss_terms["dynamics_loss"] for loss_terms in batch_losses]).mean()
             batch_cross_sensor_loss = torch.stack([loss_terms["cross_sensor_loss"] for loss_terms in batch_losses]).mean()
+            batch_delta_loss = torch.stack([loss_terms["delta_loss"] for loss_terms in batch_losses]).mean()
             batch_regularization_loss = torch.stack([loss_terms["regularization_loss"] for loss_terms in batch_losses]).mean()
             batch_crosscov_penalty = torch.stack([loss_terms["crosscov_penalty"] for loss_terms in batch_losses]).mean()
             loss_total += float(batch_loss.cpu().item())
             masked_loss_total += float(batch_masked_loss.cpu().item())
+            state_loss_total += float(batch_state_loss.cpu().item())
+            scene_loss_total += float(batch_scene_loss.cpu().item())
             context_loss_total += float(batch_context_loss.cpu().item())
             dynamics_loss_total += float(batch_dynamics_loss.cpu().item())
             cross_sensor_loss_total += float(batch_cross_sensor_loss.cpu().item())
+            delta_loss_total += float(batch_delta_loss.cpu().item())
             regularization_loss_total += float(batch_regularization_loss.cpu().item())
             crosscov_penalty_total += float(batch_crosscov_penalty.cpu().item())
             step_count += 1
@@ -2638,9 +3053,12 @@ def evaluate(
     if distributed.enabled:
         loss_total = reduce_scalar_sum(loss_total, device, distributed)
         masked_loss_total = reduce_scalar_sum(masked_loss_total, device, distributed)
+        state_loss_total = reduce_scalar_sum(state_loss_total, device, distributed)
+        scene_loss_total = reduce_scalar_sum(scene_loss_total, device, distributed)
         context_loss_total = reduce_scalar_sum(context_loss_total, device, distributed)
         dynamics_loss_total = reduce_scalar_sum(dynamics_loss_total, device, distributed)
         cross_sensor_loss_total = reduce_scalar_sum(cross_sensor_loss_total, device, distributed)
+        delta_loss_total = reduce_scalar_sum(delta_loss_total, device, distributed)
         regularization_loss_total = reduce_scalar_sum(regularization_loss_total, device, distributed)
         crosscov_penalty_total = reduce_scalar_sum(crosscov_penalty_total, device, distributed)
         step_count = int(round(reduce_scalar_sum(step_count, device, distributed)))
@@ -2648,9 +3066,12 @@ def evaluate(
     return {
         "mean_loss": loss_total / max(step_count, 1),
         "mean_masked_loss": masked_loss_total / max(step_count, 1),
+        "mean_state_loss": state_loss_total / max(step_count, 1),
+        "mean_scene_loss": scene_loss_total / max(step_count, 1),
         "mean_context_loss": context_loss_total / max(step_count, 1),
         "mean_dynamics_loss": dynamics_loss_total / max(step_count, 1),
         "mean_cross_sensor_loss": cross_sensor_loss_total / max(step_count, 1),
+        "mean_delta_loss": delta_loss_total / max(step_count, 1),
         "mean_regularization_loss": regularization_loss_total / max(step_count, 1),
         "mean_crosscov_penalty": crosscov_penalty_total / max(step_count, 1),
         "step_count": step_count,
@@ -2937,16 +3358,22 @@ def main() -> None:
                 student_stepper.train()
             running_loss = None
             running_masked_loss = None
+            running_state_loss = None
+            running_scene_loss = None
             running_context_loss = None
             running_dynamics_loss = None
             running_cross_sensor_loss = None
+            running_delta_loss = None
             running_regularization_loss = None
             running_crosscov_penalty = None
             epoch_loss_total = 0.0
             epoch_masked_loss_total = 0.0
+            epoch_state_loss_total = 0.0
+            epoch_scene_loss_total = 0.0
             epoch_context_loss_total = 0.0
             epoch_dynamics_loss_total = 0.0
             epoch_cross_sensor_loss_total = 0.0
+            epoch_delta_loss_total = 0.0
             epoch_regularization_loss_total = 0.0
             epoch_crosscov_penalty_total = 0.0
             epoch_primary_batch_count = 0
@@ -2980,18 +3407,21 @@ def main() -> None:
 
                 target_embeddings = None
                 target_state_sequence = None
+                target_factorized = None
                 target_metadata = None
                 if teacher is not None:
                     with torch.no_grad():
                         target_embeddings = compute_target_embeddings(teacher, batch, config)
                         target_metadata = current_embedding_metadata(teacher)
                         target_state_sequence = compute_target_state_sequence(teacher, batch, config)
+                        target_factorized = compute_target_factorized_latents(teacher, batch, config)
 
                 loss_terms = compute_student_loss_terms(
                     student,
                     student_stepper,
                     target_embeddings,
                     target_state_sequence,
+                    target_factorized,
                     target_metadata,
                     batch,
                     mask_spec,
@@ -3058,9 +3488,12 @@ def main() -> None:
 
                 detached_loss = loss.detach()
                 detached_masked_loss = loss_terms["masked_loss"]
+                detached_state_loss = loss_terms["state_loss"]
+                detached_scene_loss = loss_terms["scene_loss"]
                 detached_context_loss = loss_terms["context_loss"]
                 detached_dynamics_loss = loss_terms["dynamics_loss"]
                 detached_cross_sensor_loss = loss_terms["cross_sensor_loss"]
+                detached_delta_loss = loss_terms["delta_loss"]
                 detached_regularization_loss = loss_terms["regularization_loss"]
                 detached_crosscov_penalty = loss_terms["crosscov_penalty"]
                 running_loss = detached_loss if running_loss is None else running_loss + detached_loss
@@ -3068,6 +3501,16 @@ def main() -> None:
                     detached_masked_loss
                     if running_masked_loss is None
                     else running_masked_loss + detached_masked_loss
+                )
+                running_state_loss = (
+                    detached_state_loss
+                    if running_state_loss is None
+                    else running_state_loss + detached_state_loss
+                )
+                running_scene_loss = (
+                    detached_scene_loss
+                    if running_scene_loss is None
+                    else running_scene_loss + detached_scene_loss
                 )
                 running_context_loss = (
                     detached_context_loss
@@ -3084,6 +3527,11 @@ def main() -> None:
                     if running_cross_sensor_loss is None
                     else running_cross_sensor_loss + detached_cross_sensor_loss
                 )
+                running_delta_loss = (
+                    detached_delta_loss
+                    if running_delta_loss is None
+                    else running_delta_loss + detached_delta_loss
+                )
                 running_regularization_loss = (
                     detached_regularization_loss
                     if running_regularization_loss is None
@@ -3096,9 +3544,12 @@ def main() -> None:
                 )
                 epoch_loss_total += float(detached_loss.cpu().item())
                 epoch_masked_loss_total += float(detached_masked_loss.cpu().item())
+                epoch_state_loss_total += float(detached_state_loss.cpu().item())
+                epoch_scene_loss_total += float(detached_scene_loss.cpu().item())
                 epoch_context_loss_total += float(detached_context_loss.cpu().item())
                 epoch_dynamics_loss_total += float(detached_dynamics_loss.cpu().item())
                 epoch_cross_sensor_loss_total += float(detached_cross_sensor_loss.cpu().item())
+                epoch_delta_loss_total += float(detached_delta_loss.cpu().item())
                 epoch_regularization_loss_total += float(detached_regularization_loss.cpu().item())
                 epoch_crosscov_penalty_total += float(detached_crosscov_penalty.cpu().item())
                 epoch_step_count += 1
@@ -3142,6 +3593,16 @@ def main() -> None:
                         distributed=distributed,
                         device=device,
                     )
+                    mean_state_loss = reduce_scalar_mean(
+                        running_state_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    mean_scene_loss = reduce_scalar_mean(
+                        running_scene_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
                     mean_context_loss = reduce_scalar_mean(
                         running_context_loss / log_every,
                         distributed=distributed,
@@ -3154,6 +3615,11 @@ def main() -> None:
                     )
                     mean_cross_sensor_loss = reduce_scalar_mean(
                         running_cross_sensor_loss / log_every,
+                        distributed=distributed,
+                        device=device,
+                    )
+                    mean_delta_loss = reduce_scalar_mean(
+                        running_delta_loss / log_every,
                         distributed=distributed,
                         device=device,
                     )
@@ -3178,9 +3644,12 @@ def main() -> None:
                             "steps_per_epoch": steps_per_epoch,
                             "loss": float(mean_loss.cpu().item()),
                             "masked_loss": float(mean_masked_loss.cpu().item()),
+                            "state_loss": float(mean_state_loss.cpu().item()),
+                            "scene_loss": float(mean_scene_loss.cpu().item()),
                             "context_loss": float(mean_context_loss.cpu().item()),
                             "dynamics_loss": float(mean_dynamics_loss.cpu().item()),
                             "cross_sensor_loss": float(mean_cross_sensor_loss.cpu().item()),
+                            "delta_loss": float(mean_delta_loss.cpu().item()),
                             "regularization_loss": float(mean_regularization_loss.cpu().item()),
                             "crosscov_penalty": float(mean_crosscov_penalty.cpu().item()),
                             "lr": float(current_lr),
@@ -3196,9 +3665,12 @@ def main() -> None:
                                 f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
+                                f"state_loss={mean_state_loss.cpu().item():.6f} "
+                                f"scene_loss={mean_scene_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
+                                f"delta_loss={mean_delta_loss.cpu().item():.6f} "
                                 f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
                                 f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f}"
@@ -3211,9 +3683,12 @@ def main() -> None:
                                 f"epoch={epoch + 1} step={step}/{epoch_target_steps} "
                                 f"loss={mean_loss.cpu().item():.6f} "
                                 f"masked_loss={mean_masked_loss.cpu().item():.6f} "
+                                f"state_loss={mean_state_loss.cpu().item():.6f} "
+                                f"scene_loss={mean_scene_loss.cpu().item():.6f} "
                                 f"context_loss={mean_context_loss.cpu().item():.6f} "
                                 f"dynamics_loss={mean_dynamics_loss.cpu().item():.6f} "
                                 f"cross_sensor_loss={mean_cross_sensor_loss.cpu().item():.6f} "
+                                f"delta_loss={mean_delta_loss.cpu().item():.6f} "
                                 f"regularization_loss={mean_regularization_loss.cpu().item():.6f} "
                                 f"crosscov_penalty={mean_crosscov_penalty.cpu().item():.6f} "
                                 f"lr={current_lr:.6e} wd={current_wd:.6f}"
@@ -3224,9 +3699,12 @@ def main() -> None:
                         append_jsonl(metrics_path, train_step_metrics)
                     running_loss = None
                     running_masked_loss = None
+                    running_state_loss = None
+                    running_scene_loss = None
                     running_context_loss = None
                     running_dynamics_loss = None
                     running_cross_sensor_loss = None
+                    running_delta_loss = None
                     running_regularization_loss = None
                     running_crosscov_penalty = None
 
@@ -3236,9 +3714,12 @@ def main() -> None:
             epoch_duration_sec = time.time() - epoch_started_at
             epoch_loss_total = reduce_scalar_sum(epoch_loss_total, device, distributed)
             epoch_masked_loss_total = reduce_scalar_sum(epoch_masked_loss_total, device, distributed)
+            epoch_state_loss_total = reduce_scalar_sum(epoch_state_loss_total, device, distributed)
+            epoch_scene_loss_total = reduce_scalar_sum(epoch_scene_loss_total, device, distributed)
             epoch_context_loss_total = reduce_scalar_sum(epoch_context_loss_total, device, distributed)
             epoch_dynamics_loss_total = reduce_scalar_sum(epoch_dynamics_loss_total, device, distributed)
             epoch_cross_sensor_loss_total = reduce_scalar_sum(epoch_cross_sensor_loss_total, device, distributed)
+            epoch_delta_loss_total = reduce_scalar_sum(epoch_delta_loss_total, device, distributed)
             epoch_regularization_loss_total = reduce_scalar_sum(epoch_regularization_loss_total, device, distributed)
             epoch_crosscov_penalty_total = reduce_scalar_sum(epoch_crosscov_penalty_total, device, distributed)
             epoch_primary_batch_count = int(round(reduce_scalar_sum(epoch_primary_batch_count, device, distributed)))
@@ -3254,9 +3735,12 @@ def main() -> None:
                 "step_count": epoch_step_count,
                 "mean_loss": epoch_mean_loss,
                 "mean_masked_loss": epoch_masked_loss_total / max(epoch_step_count, 1),
+                "mean_state_loss": epoch_state_loss_total / max(epoch_step_count, 1),
+                "mean_scene_loss": epoch_scene_loss_total / max(epoch_step_count, 1),
                 "mean_context_loss": epoch_context_loss_total / max(epoch_step_count, 1),
                 "mean_dynamics_loss": epoch_dynamics_loss_total / max(epoch_step_count, 1),
                 "mean_cross_sensor_loss": epoch_cross_sensor_loss_total / max(epoch_step_count, 1),
+                "mean_delta_loss": epoch_delta_loss_total / max(epoch_step_count, 1),
                 "mean_regularization_loss": epoch_regularization_loss_total / max(epoch_step_count, 1),
                 "mean_crosscov_penalty": epoch_crosscov_penalty_total / max(epoch_step_count, 1),
                 "primary_batch_count": epoch_primary_batch_count,
@@ -3283,9 +3767,12 @@ def main() -> None:
                     eval_summaries.append(eval_summary)
                 epoch_summary["validation_mean_loss"] = eval_summary["mean_loss"]
                 epoch_summary["validation_mean_masked_loss"] = eval_summary["mean_masked_loss"]
+                epoch_summary["validation_mean_state_loss"] = eval_summary["mean_state_loss"]
+                epoch_summary["validation_mean_scene_loss"] = eval_summary["mean_scene_loss"]
                 epoch_summary["validation_mean_context_loss"] = eval_summary["mean_context_loss"]
                 epoch_summary["validation_mean_dynamics_loss"] = eval_summary["mean_dynamics_loss"]
                 epoch_summary["validation_mean_cross_sensor_loss"] = eval_summary["mean_cross_sensor_loss"]
+                epoch_summary["validation_mean_delta_loss"] = eval_summary["mean_delta_loss"]
                 epoch_summary["validation_mean_regularization_loss"] = eval_summary["mean_regularization_loss"]
                 epoch_summary["validation_mean_crosscov_penalty"] = eval_summary["mean_crosscov_penalty"]
                 epoch_summary["validation_step_count"] = eval_summary["step_count"]
@@ -3301,9 +3788,12 @@ def main() -> None:
                     print(
                         f"epoch={epoch + 1} validation_loss={eval_summary['mean_loss']:.6f} "
                         f"validation_masked_loss={eval_summary['mean_masked_loss']:.6f} "
+                        f"validation_state_loss={eval_summary['mean_state_loss']:.6f} "
+                        f"validation_scene_loss={eval_summary['mean_scene_loss']:.6f} "
                         f"validation_context_loss={eval_summary['mean_context_loss']:.6f} "
                         f"validation_dynamics_loss={eval_summary['mean_dynamics_loss']:.6f} "
                         f"validation_cross_sensor_loss={eval_summary['mean_cross_sensor_loss']:.6f} "
+                        f"validation_delta_loss={eval_summary['mean_delta_loss']:.6f} "
                         f"validation_regularization_loss={eval_summary['mean_regularization_loss']:.6f} "
                         f"validation_crosscov_penalty={eval_summary['mean_crosscov_penalty']:.6f} "
                         f"checkpoint_metric={checkpoint_metric_name}:{validation_checkpoint_metric_value:.6f} "

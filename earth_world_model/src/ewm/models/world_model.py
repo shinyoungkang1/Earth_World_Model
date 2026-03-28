@@ -185,6 +185,10 @@ class EarthWorldModel(nn.Module):
         use_sensor_timing_features: bool = False,
         enable_latent_dynamics: bool = True,
         dynamics_hidden_dim: int | None = None,
+        factorized_latent_version: str | None = None,
+        scene_latent_dim: int | None = None,
+        state_latent_dim: int | None = None,
+        delta_hidden_dim: int | None = None,
     ):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -200,6 +204,13 @@ class EarthWorldModel(nn.Module):
         self.token_mode = str(token_mode)
         if self.token_mode not in {"pooled", "dense"}:
             raise ValueError(f"Unsupported token_mode: {self.token_mode}")
+        self.factorized_latent_version = "none" if factorized_latent_version is None else str(factorized_latent_version).strip().lower()
+        if self.factorized_latent_version not in {"none", "v1", "v2"}:
+            raise ValueError(f"Unsupported factorized_latent_version: {self.factorized_latent_version}")
+        self.use_factorized_latents = self.factorized_latent_version in {"v1", "v2"}
+        self.use_explicit_delta_latent = self.factorized_latent_version == "v2"
+        self.scene_latent_dim = int(scene_latent_dim or embed_dim)
+        self.state_latent_dim = int(state_latent_dim or embed_dim)
         self.enable_latent_dynamics = bool(enable_latent_dynamics)
         self.spatial = SpatialEncoder(
             embed_dim=embed_dim,
@@ -312,8 +323,45 @@ class EarthWorldModel(nn.Module):
         target_levels = max(1, len(self.hierarchical_layers))
         self.pred_head = nn.Linear(embed_dim, embed_dim * target_levels)
         self.mask_token = nn.Parameter(torch.randn(embed_dim) * 0.02)
+        self.state_latent_head = None
+        self.scene_latent_head = None
+        self.scene_to_token = None
+        self.state_to_token = None
+        self.factorized_token_decoder = None
+        self.delta_transition_head = None
+        if self.use_factorized_latents:
+            self.state_latent_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, self.state_latent_dim),
+            )
+            self.scene_latent_head = nn.Sequential(
+                nn.LayerNorm(self.state_latent_dim),
+                nn.Linear(self.state_latent_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, self.scene_latent_dim),
+            )
+            self.scene_to_token = nn.Linear(self.scene_latent_dim, embed_dim, bias=False)
+            self.state_to_token = nn.Linear(self.state_latent_dim, embed_dim, bias=False)
+            self.factorized_token_decoder = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.GELU(),
+                nn.Linear(embed_dim * 2, embed_dim),
+            )
+            if self.use_explicit_delta_latent:
+                delta_hidden = int(delta_hidden_dim or self.state_latent_dim)
+                self.delta_transition_head = nn.Sequential(
+                    nn.Linear(self.state_latent_dim + self.scene_latent_dim + 1, delta_hidden),
+                    nn.GELU(),
+                    nn.Linear(delta_hidden, self.state_latent_dim),
+                )
         self.latent_rollout_head = (
-            LatentRolloutHead(embed_dim=embed_dim, hidden_dim=dynamics_hidden_dim)
+            LatentRolloutHead(
+                embed_dim=(self.state_latent_dim if self.use_factorized_latents else embed_dim),
+                hidden_dim=dynamics_hidden_dim,
+            )
             if self.enable_latent_dynamics
             else None
         )
@@ -877,6 +925,99 @@ class EarthWorldModel(nn.Module):
         timesteps = embeddings.shape[1] // tokens_per_step
         return embeddings.reshape(embeddings.shape[0], timesteps, tokens_per_step, embeddings.shape[-1]).mean(dim=2)
 
+    @staticmethod
+    def _weighted_mean(values: torch.Tensor, weights: torch.Tensor, *, dim: int) -> torch.Tensor:
+        if values.shape[: weights.ndim] != weights.shape:
+            raise ValueError(
+                f"values/weights shape mismatch for weighted mean: values={tuple(values.shape)} weights={tuple(weights.shape)}"
+            )
+        weighted = values * weights.unsqueeze(-1)
+        denom = weights.sum(dim=dim, keepdim=True).clamp_min(1.0e-6)
+        return weighted.sum(dim=dim) / denom
+
+    def encode_factorized_latents(
+        self,
+        s2: torch.Tensor | None,
+        s1: torch.Tensor | None,
+        dates: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        *,
+        hls: torch.Tensor | None = None,
+        s2_present: torch.Tensor | None = None,
+        s1_present: torch.Tensor | None = None,
+        s2_dates: torch.Tensor | None = None,
+        s1_dates: torch.Tensor | None = None,
+        token_indices: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.use_factorized_latents:
+            raise RuntimeError("Factorized latent encoding requested, but factorized latents are disabled")
+
+        if self.token_mode == "dense":
+            if self.temporal_block_type != "factorized_rope":
+                raise ValueError("Factorized latent encoding currently requires token_mode=dense with temporal_block_type=factorized_rope")
+            timeline, grouped_dates, visibility_mask = self._build_structured_timeline_inputs(
+                s2=s2,
+                s1=s1,
+                dates=dates,
+                mask=mask,
+                hls=hls,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
+                visible_token_indices=token_indices,
+            )
+            encoded_structured = self._run_temporal_encoder(
+                timeline,
+                position_ids=grouped_dates,
+                visibility_mask=visibility_mask,
+                return_hierarchical=False,
+            )
+            token_weights = (
+                visibility_mask.to(device=encoded_structured.device, dtype=encoded_structured.dtype)
+                if visibility_mask is not None
+                else encoded_structured.new_ones(encoded_structured.shape[:3])
+            )
+            state_weights = token_weights.mean(dim=2)
+            state_inputs = self._weighted_mean(encoded_structured, token_weights, dim=2)
+        else:
+            encoded = self.encode_timeline(
+                s2=s2,
+                s1=s1,
+                dates=dates,
+                mask=mask,
+                hls=hls,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
+            )
+            tokenizer_type = self._resolved_tokenizer_type(dates)
+            grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type)
+            grouped_mask = self.spatial.aggregate_temporal_boolean(mask, tokenizer_type=tokenizer_type)
+            state_inputs = encoded
+            state_weights = (
+                grouped_mask.to(device=encoded.device, dtype=encoded.dtype)
+                if grouped_mask is not None
+                else encoded.new_ones(encoded.shape[:2])
+            )
+            token_weights = state_weights.unsqueeze(-1)
+            encoded_structured = encoded.unsqueeze(2)
+
+        if self.state_latent_head is None or self.scene_latent_head is None:
+            raise RuntimeError("Factorized latent heads are not initialized on the model")
+        state_sequence = self.state_latent_head(state_inputs)
+        scene_input = self._weighted_mean(state_sequence, state_weights, dim=1)
+        scene_latent = self.scene_latent_head(scene_input)
+        return {
+            "state_sequence": state_sequence,
+            "scene_latent": scene_latent,
+            "grouped_dates": grouped_dates.to(dtype=torch.long),
+            "state_weights": state_weights,
+            "token_weights": token_weights,
+            "structured_embeddings": encoded_structured,
+        }
+
     def encode_state_sequence(
         self,
         s2: torch.Tensor | None,
@@ -890,6 +1031,19 @@ class EarthWorldModel(nn.Module):
         s2_dates: torch.Tensor | None = None,
         s1_dates: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_factorized_latents:
+            factorized = self.encode_factorized_latents(
+                s2=s2,
+                s1=s1,
+                dates=dates,
+                mask=mask,
+                hls=hls,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
+            )
+            return factorized["state_sequence"], factorized["grouped_dates"]
         if self.token_mode == "dense":
             if self.temporal_block_type == "factorized_rope":
                 structured = self.encode_timeline(
@@ -931,6 +1085,63 @@ class EarthWorldModel(nn.Module):
             s1_dates=s1_dates,
         )
         return pooled, dates
+
+    def decode_masked_tokens_from_latents(
+        self,
+        scene_latent: torch.Tensor,
+        state_sequence: torch.Tensor,
+        *,
+        masked_position_ids: torch.Tensor,
+        masked_local_token_indices: torch.Tensor,
+        masked_step_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.use_factorized_latents:
+            raise RuntimeError("Factorized token decoding requested, but factorized latents are disabled")
+        if self.token_mode != "dense":
+            raise ValueError("Factorized token decoding is only supported in dense token mode")
+        if self.factorized_token_decoder is None or self.scene_to_token is None or self.state_to_token is None:
+            raise RuntimeError("Factorized token decoder heads are not initialized")
+
+        batch = scene_latent.shape[0]
+        tokens_per_step = self.last_tokens_per_timestep
+        template = self.spatial.step_token_template(
+            tokens_per_step,
+            device=scene_latent.device,
+            dtype=scene_latent.dtype,
+        ).expand(batch, -1, -1)
+        gather_index = masked_local_token_indices.to(device=scene_latent.device, dtype=torch.long)
+        gather_index = gather_index.view(1, -1, 1).expand(batch, -1, template.shape[-1])
+        local_template = torch.gather(template, dim=1, index=gather_index)
+        query = self.mask_token.view(1, 1, -1).to(device=scene_latent.device, dtype=scene_latent.dtype)
+        query = query + local_template + self.temporal_pos(masked_position_ids)
+        masked_steps = masked_step_indices.to(device=state_sequence.device, dtype=torch.long)
+        state_tokens = state_sequence.index_select(1, masked_steps)
+        scene_tokens = scene_latent.unsqueeze(1).expand(-1, state_tokens.shape[1], -1)
+        hidden = query + self.scene_to_token(scene_tokens) + self.state_to_token(state_tokens)
+        hidden = self.factorized_token_decoder(hidden)
+        return self.pred_head(hidden)
+
+    def predict_state_deltas(
+        self,
+        scene_latent: torch.Tensor,
+        state_sequence: torch.Tensor,
+        grouped_dates: torch.Tensor,
+        *,
+        horizon: int,
+    ) -> torch.Tensor:
+        if self.delta_transition_head is None:
+            raise RuntimeError("Explicit delta prediction is disabled for this model")
+        if state_sequence.ndim != 3:
+            raise ValueError(f"state_sequence must be [B, T, D], got {tuple(state_sequence.shape)}")
+        rollout_horizon = max(0, min(int(horizon), state_sequence.shape[1] - 1))
+        if rollout_horizon == 0:
+            return state_sequence.new_zeros((state_sequence.shape[0], 0, state_sequence.shape[-1]))
+        start_count = state_sequence.shape[1] - rollout_horizon
+        source_states = state_sequence[:, :start_count, :]
+        scene_expand = scene_latent.unsqueeze(1).expand(-1, start_count, -1)
+        delta_days = grouped_dates[:, rollout_horizon : rollout_horizon + start_count].to(torch.float32) - grouped_dates[:, :start_count].to(torch.float32)
+        delta_inputs = torch.cat([source_states, scene_expand, (delta_days / 366.0).unsqueeze(-1)], dim=-1)
+        return self.delta_transition_head(delta_inputs)
 
     def rollout_state_predictions(
         self,

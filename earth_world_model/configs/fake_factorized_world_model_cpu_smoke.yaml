@@ -1,0 +1,107 @@
+runtime:
+  backend: cpu
+  seed: 42
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_fake_factorized_world_model_cpu_smoke}
+
+data:
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 52
+  num_workers: 0
+  temporal_subclip_mode: random
+  temporal_subclip_schedule:
+    - start_epoch: ${EWM_SUBCLIP_16_START:-0}
+      length: 16
+    - start_epoch: ${EWM_SUBCLIP_32_START:-1}
+      length: 32
+    - start_epoch: ${EWM_SUBCLIP_52_START:-2}
+      length: 52
+
+auxiliary_data:
+  enabled: true
+  kind: fake
+  num_samples: 24
+  patch_size: 64
+  max_timestamps: 4
+  num_workers: 0
+  batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-2}
+
+model:
+  input_mode: s2s1
+  tokenizer_type: conv3d
+  tokenizer_mode: auto
+  auto_2d_max_timesteps: 4
+  tubelet_size: 1
+  embed_dim: 64
+  patch_px: 16
+  temporal_depth: 2
+  predictor_depth: 1
+  num_heads: 4
+  hierarchical_layers: []
+  token_mode: dense
+  spatial_fusion: cross_attend
+  fusion_num_heads: 2
+  separate_sensor_encoders: true
+  use_modality_embeddings: true
+  use_patch_positional_encoding: true
+  use_missing_modality_embeddings: true
+  use_time_gap_features: true
+  use_sensor_timing_features: true
+  temporal_block_type: factorized_rope
+  use_rope_temporal_attention: true
+  rope_base: 10000.0
+  use_activation_checkpointing: false
+  enable_latent_dynamics: true
+  factorized_latent_version: ${EWM_FACTORIZED_LATENT_VERSION:-v1}
+  scene_latent_dim: 64
+  state_latent_dim: 64
+  delta_hidden_dim: 64
+
+training:
+  batch_size: ${EWM_BATCH_SIZE:-2}
+  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-2}
+  epochs: 2
+  mixed_stage_epochs: 1
+  mixed_stage_auxiliary_fraction: 0.5
+  lr_schedule: fixed
+  lr: 3.0e-4
+  weight_decay: 0.05
+  final_weight_decay: 0.05
+  mask_ratio: 0.5
+  masking_mode: dense_block3d
+  block_mask_cfgs:
+    - num_blocks: 2
+      spatial_scale: [0.10, 0.20]
+      temporal_scale: [0.125, 0.25]
+      aspect_ratio: [0.75, 1.5]
+  target_mode: ema
+  detach_self_target: false
+  ema_momentum_start: 0.996
+  ema_momentum_end: 0.999
+  log_every_steps: 1
+  grad_balance_probe_every_steps: ${EWM_GRAD_BALANCE_PROBE_EVERY_STEPS:-0}
+  grad_balance_probe_max_events: ${EWM_GRAD_BALANCE_PROBE_MAX_EVENTS:-0}
+  regularization_probe_every_steps: ${EWM_REGULARIZATION_PROBE_EVERY_STEPS:-0}
+  regularization_probe_max_events: ${EWM_REGULARIZATION_PROBE_MAX_EVENTS:-0}
+  save_every_epochs: 1
+  max_steps_per_epoch: 2
+  predict_visible_context: false
+  context_loss_weight: 0.0
+  cross_sensor_loss_weight: 0.0
+  dynamics_loss_weight: ${EWM_DYNAMICS_LOSS_WEIGHT:-0.25}
+  dynamics_rollout_horizon: 2
+  mask_state_loss_weight: ${EWM_MASK_STATE_LOSS_WEIGHT:-1.0}
+  scene_consistency_weight: ${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}
+  delta_loss_weight: ${EWM_DELTA_LOSS_WEIGHT:-0.0}
+  delta_random_horizon_max: ${EWM_DELTA_RANDOM_HORIZON_MAX:-0}
+
+regularization:
+  method: none
+  mode: global
+
+eval:
+  enabled: false
+  checkpoint_metric: mean_masked_loss
+  checkpoint_min_epoch: 1
+  mask_mode: random

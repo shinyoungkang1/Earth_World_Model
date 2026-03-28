@@ -1,0 +1,167 @@
+runtime:
+  backend: ${EWM_BACKEND:-cuda}
+  seed: 42
+  checkpoint_dir: ${EWM_CHECKPOINT_DIR:-/tmp/ewm_paper2_factorized_world_model_1024_gpu/checkpoints/dense_temporal_index_pilot400_vjepa21_factorized_world_model_1024_mixed_ssl4eo_cuda}
+  autocast_dtype: float16
+
+data:
+  kind: dense_temporal_index
+  index_path: ${EWM_YEARLY_TRAIN_INDEX_PATH:-/mnt/ewm-data-disk/ewm_prelim_400_v1/yearly_400/train/dense_temporal_index.parquet}
+  patch_size: 256
+  max_samples: ${EWM_YEARLY_TRAIN_MAX_SAMPLES:-400}
+  min_paired_frames: 4
+  min_paired_fraction: 0.0
+  sample_offset: 0
+  crop_mode: random
+  repeat_factor: 1
+  num_workers: ${EWM_NUM_WORKERS:-8}
+  prefetch_factor: ${EWM_PREFETCH_FACTOR:-2}
+  temporal_subclip_mode: random
+  temporal_subclip_schedule:
+    - start_epoch: ${EWM_SUBCLIP_16_START:-0}
+      length: 16
+    - start_epoch: ${EWM_SUBCLIP_32_START:-2}
+      length: 32
+    - start_epoch: ${EWM_SUBCLIP_52_START:-4}
+      length: 52
+
+auxiliary_data:
+  enabled: ${EWM_AUX_ENABLED:-true}
+  kind: ssl4eo_zarr
+  root_dir: ${EWM_SSL4EO_ROOT_DIR:-/mnt/ewm-data-disk/ewm_prelim_400_v1/ssl4eo_400}
+  split: train
+  patch_size: 128
+  max_shards: 0
+  sample_offset: 0
+  max_samples: ${EWM_SSL4EO_TRAIN_MAX_SAMPLES:-400}
+  min_clear_fraction: 0.8
+  crop_mode: random
+  repeat_factor: 1
+  num_workers: ${EWM_NUM_WORKERS:-8}
+  prefetch_factor: ${EWM_PREFETCH_FACTOR:-2}
+  assume_single_sample_per_shard: false
+  max_open_shards: 16
+  batch_sampler: auto
+  batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
+
+model:
+  input_mode: s2s1
+  tokenizer_type: ${EWM_TOKENIZER_TYPE:-conv2d}
+  tokenizer_mode: ${EWM_TOKENIZER_MODE:-auto}
+  auto_2d_max_timesteps: ${EWM_AUTO_2D_MAX_TIMESTEPS:-4}
+  tubelet_size: ${EWM_TUBELET_SIZE:-1}
+  embed_dim: ${EWM_EMBED_DIM:-1024}
+  patch_px: 16
+  temporal_depth: ${EWM_TEMPORAL_DEPTH:-6}
+  predictor_depth: ${EWM_PREDICTOR_DEPTH:-3}
+  num_heads: ${EWM_NUM_HEADS:-16}
+  hierarchical_layers: [1, 3, 5]
+  token_mode: dense
+  spatial_fusion: cross_attend
+  fusion_num_heads: ${EWM_FUSION_NUM_HEADS:-8}
+  separate_sensor_encoders: ${EWM_SEPARATE_SENSOR_ENCODERS:-true}
+  use_modality_embeddings: ${EWM_USE_MODALITY_EMBEDDINGS:-true}
+  use_patch_positional_encoding: ${EWM_USE_PATCH_POSITIONAL_ENCODING:-true}
+  use_missing_modality_embeddings: ${EWM_USE_MISSING_MODALITY_EMBEDDINGS:-true}
+  use_time_gap_features: ${EWM_USE_TIME_GAP_FEATURES:-true}
+  use_sensor_timing_features: ${EWM_USE_SENSOR_TIMING_FEATURES:-true}
+  temporal_block_type: factorized_rope
+  use_rope_temporal_attention: ${EWM_USE_ROPE_TEMPORAL_ATTENTION:-true}
+  rope_base: 10000.0
+  use_activation_checkpointing: ${EWM_USE_ACTIVATION_CHECKPOINTING:-true}
+  enable_latent_dynamics: ${EWM_ENABLE_LATENT_DYNAMICS:-true}
+  factorized_latent_version: ${EWM_FACTORIZED_LATENT_VERSION:-v1}
+  scene_latent_dim: ${EWM_SCENE_LATENT_DIM:-1024}
+  state_latent_dim: ${EWM_STATE_LATENT_DIM:-1024}
+  delta_hidden_dim: ${EWM_DELTA_HIDDEN_DIM:-1024}
+
+training:
+  batch_size: ${EWM_BATCH_SIZE:-8}
+  auxiliary_batch_size: ${EWM_AUXILIARY_BATCH_SIZE:-8}
+  epochs: ${EWM_EPOCHS:-8}
+  mixed_stage_epochs: ${EWM_MIXED_STAGE_EPOCHS:-4}
+  mixed_stage_auxiliary_fraction: ${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}
+  lr_schedule: ${EWM_LR_SCHEDULE:-warmup_hold_cosine}
+  warmup_fraction: ${EWM_WARMUP_FRACTION:-0.05}
+  hold_fraction: ${EWM_HOLD_FRACTION:-0.10}
+  warmup_steps: ${EWM_WARMUP_STEPS:-0}
+  hold_steps: ${EWM_HOLD_STEPS:-0}
+  start_lr: ${EWM_START_LR:-3.0e-5}
+  lr: ${EWM_LR:-3.0e-4}
+  final_lr: ${EWM_FINAL_LR:-3.0e-5}
+  weight_decay: ${EWM_WEIGHT_DECAY:-0.05}
+  final_weight_decay: ${EWM_FINAL_WEIGHT_DECAY:-0.04}
+  mask_ratio: 0.5
+  masking_mode: dense_block3d
+  block_mask_cfgs:
+    - num_blocks: 8
+      spatial_scale: [0.10, 0.20]
+      temporal_scale: [0.125, 0.25]
+      aspect_ratio: [0.75, 1.5]
+    - num_blocks: 2
+      spatial_scale: [0.50, 0.70]
+      temporal_scale: [0.25, 0.50]
+      aspect_ratio: [0.75, 1.5]
+  target_mode: ${EWM_TARGET_MODE:-ema}
+  detach_self_target: ${EWM_DETACH_SELF_TARGET:-false}
+  ema_momentum_start: ${EWM_EMA_MOMENTUM_START:-0.996}
+  ema_momentum_end: ${EWM_EMA_MOMENTUM_END:-0.999}
+  log_every_steps: 10
+  grad_balance_probe_every_steps: ${EWM_GRAD_BALANCE_PROBE_EVERY_STEPS:-0}
+  grad_balance_probe_max_events: ${EWM_GRAD_BALANCE_PROBE_MAX_EVENTS:-0}
+  regularization_probe_every_steps: ${EWM_REGULARIZATION_PROBE_EVERY_STEPS:-0}
+  regularization_probe_max_events: ${EWM_REGULARIZATION_PROBE_MAX_EVENTS:-0}
+  save_every_epochs: 1
+  max_steps_per_epoch: 0
+  predict_visible_context: false
+  context_loss_weight: 0.0
+  context_loss_distance_weighted: true
+  context_loss_sqrt_distance: true
+  cross_sensor_loss_weight: ${EWM_CROSS_SENSOR_LOSS_WEIGHT:-0.0}
+  cross_sensor_time_proximity: ${EWM_CROSS_SENSOR_TIME_PROXIMITY:-true}
+  cross_sensor_time_scale_days: ${EWM_CROSS_SENSOR_TIME_SCALE_DAYS:-7.0}
+  dynamics_loss_weight: ${EWM_DYNAMICS_LOSS_WEIGHT:-0.25}
+  dynamics_rollout_horizon: ${EWM_DYNAMICS_ROLLOUT_HORIZON:-4}
+  mask_state_loss_weight: ${EWM_MASK_STATE_LOSS_WEIGHT:-1.0}
+  scene_consistency_weight: ${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}
+  delta_loss_weight: ${EWM_DELTA_LOSS_WEIGHT:-0.0}
+  delta_random_horizon_max: ${EWM_DELTA_RANDOM_HORIZON_MAX:-0}
+
+regularization:
+  method: ${EWM_REG_METHOD:-none}
+  mode: ${EWM_REG_MODE:-global}
+  n_projections: ${EWM_SIGREG_N_PROJECTIONS:-128}
+  max_samples: ${EWM_REG_MAX_SAMPLES:-256}
+  crosscov_max_samples: ${EWM_REG_CROSSCOV_MAX_SAMPLES:-0}
+  base_lambda: ${EWM_REG_BASE_LAMBDA:-0.0}
+  adaptive_alpha: ${EWM_REG_ADAPTIVE_ALPHA:-0.0}
+  crosscov_mu: ${EWM_REG_CROSSCOV_MU:-0.0}
+  split_dims:
+    s1_private: ${EWM_REG_S1_PRIVATE_DIM:-1024}
+    shared: ${EWM_REG_SHARED_DIM:-1024}
+    s2_private: ${EWM_REG_S2_PRIVATE_DIM:-1024}
+  vicreg_variance_target: ${EWM_VICREG_VARIANCE_TARGET:-1.0}
+  vicreg_variance_epsilon: ${EWM_VICREG_VARIANCE_EPSILON:-1.0e-4}
+  vicreg_variance_weight: ${EWM_VICREG_VARIANCE_WEIGHT:-1.0}
+  vicreg_covariance_weight: ${EWM_VICREG_COVARIANCE_WEIGHT:-1.0}
+
+eval:
+  enabled: true
+  every_epochs: 1
+  checkpoint_metric: ${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}
+  checkpoint_min_epoch: ${EWM_EVAL_CHECKPOINT_MIN_EPOCH:-1}
+  batch_size: ${EWM_EVAL_BATCH_SIZE:-8}
+  max_batches: 0
+  mask_mode: random
+  data:
+    index_path: ${EWM_YEARLY_VAL_INDEX_PATH:-/mnt/ewm-data-disk/ewm_prelim_400_v1/yearly_400/val/dense_temporal_index.parquet}
+    max_samples: ${EWM_YEARLY_VAL_MAX_SAMPLES:-32}
+    min_paired_frames: 4
+    min_paired_fraction: 0.0
+    sample_offset: 0
+    crop_mode: center
+    repeat_factor: 1
+    num_workers: ${EWM_EVAL_NUM_WORKERS:-8}
+    prefetch_factor: ${EWM_EVAL_PREFETCH_FACTOR:-2}
+    temporal_subclip_length: 52
+    temporal_subclip_mode: center

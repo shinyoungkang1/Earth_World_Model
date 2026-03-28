@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DATA_ROOT_BASE="${DATA_ROOT_BASE:-/mnt/ewm-data-disk/ewm_prelim_500_1000_v1}"
+DEFAULT_RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
+GCS_RUNS_ROOT="${GCS_RUNS_ROOT:-gs://omois-earth-world-model-phase2-20260320-11728/earth_world_model/runs/paper2_factorized_world_model_${DEFAULT_RUN_STAMP}}"
+SKIP_SETUP_GPU="${SKIP_SETUP_GPU:-0}"
+YEARLY_NAME="${YEARLY_NAME:-yearly_500}"
+SSL4EO_NAME="${SSL4EO_NAME:-ssl4eo_1000}"
+YEARLY_TRAIN_MAX_SAMPLES="${YEARLY_TRAIN_MAX_SAMPLES:-500}"
+YEARLY_VAL_MAX_SAMPLES="${YEARLY_VAL_MAX_SAMPLES:-32}"
+SSL4EO_TRAIN_MAX_SAMPLES="${SSL4EO_TRAIN_MAX_SAMPLES:-1000}"
+SSL4EO_VAL_MAX_SAMPLES="${SSL4EO_VAL_MAX_SAMPLES:-128}"
+EWM_BATCH_SIZE="${EWM_BATCH_SIZE:-16}"
+EWM_AUXILIARY_BATCH_SIZE="${EWM_AUXILIARY_BATCH_SIZE:-16}"
+EWM_EVAL_BATCH_SIZE="${EWM_EVAL_BATCH_SIZE:-16}"
+EWM_EPOCHS="${EWM_EPOCHS:-8}"
+EWM_MIXED_STAGE_EPOCHS="${EWM_MIXED_STAGE_EPOCHS:-4}"
+EWM_MIXED_STAGE_AUXILIARY_FRACTION="${EWM_MIXED_STAGE_AUXILIARY_FRACTION:-0.5}"
+LOCAL_RUNS_ROOT="${LOCAL_RUNS_ROOT:-/tmp/${GCS_RUNS_ROOT##*/}}"
+EWM_SUBCLIP_16_START="${EWM_SUBCLIP_16_START:-0}"
+EWM_SUBCLIP_32_START="${EWM_SUBCLIP_32_START:-2}"
+EWM_SUBCLIP_52_START="${EWM_SUBCLIP_52_START:-4}"
+RUN_ID_FILTER="${RUN_ID_FILTER:-}"
+FORCE_RERUN="${FORCE_RERUN:-0}"
+EWM_TUBELET_SIZE="${EWM_TUBELET_SIZE:-1}"
+EWM_EVAL_CHECKPOINT_METRIC="${EWM_EVAL_CHECKPOINT_METRIC:-mean_masked_loss}"
+EWM_EVAL_CHECKPOINT_MIN_EPOCH="${EWM_EVAL_CHECKPOINT_MIN_EPOCH:-5}"
+BASE_CONFIG_PATH="${BASE_CONFIG_PATH:-$PROJECT_ROOT/earth_world_model/configs/dense_temporal_index_pilot400_vjepa21_factorized_world_model_1024_mixed_ssl4eo_cuda_gpu_vm.yaml}"
+
+should_run_id() {
+  local run_id="$1"
+  if [[ -z "$RUN_ID_FILTER" ]]; then
+    return 0
+  fi
+  [[ "$run_id" == *"$RUN_ID_FILTER"* ]]
+}
+
+run_is_complete() {
+  local run_id="$1"
+  local gcs_run_uri="${GCS_RUNS_ROOT%/}/${run_id}"
+  if [[ "$FORCE_RERUN" == "1" ]]; then
+    return 1
+  fi
+  gcloud storage ls "${gcs_run_uri}/training_summary.json" >/dev/null 2>&1
+}
+
+run_one() {
+  local run_id="$1"
+  shift
+  local local_data_root="$DATA_ROOT_BASE/$YEARLY_NAME"
+  local local_run_root="${LOCAL_RUNS_ROOT%/}/${run_id}"
+  local local_checkpoint_dir="${local_run_root}/checkpoints/${run_id}"
+  local gcs_run_uri="${GCS_RUNS_ROOT%/}/${run_id}"
+
+  if ! should_run_id "$run_id"; then
+    echo "Skipping filtered run: ${run_id}"
+    return 0
+  fi
+
+  if run_is_complete "$run_id"; then
+    echo "Skipping completed run: ${run_id}"
+    return 0
+  fi
+
+  env \
+    "$@" \
+    GCS_RUN_URI="$gcs_run_uri" \
+    GCS_DATA_URI="gs://placeholder/localdisk_unused" \
+    DATA_ACCESS_MODE="localdisk" \
+    LOCAL_RUN_ROOT="$local_run_root" \
+    LOCAL_DATA_ROOT="$local_data_root" \
+    LOCAL_CHECKPOINT_DIR="$local_checkpoint_dir" \
+    RUN_LOG_PATH="$local_run_root/train.log" \
+    CONFIG_PATH="$BASE_CONFIG_PATH" \
+    SKIP_SETUP_GPU="$SKIP_SETUP_GPU" \
+    EWM_RUN_LABEL="$run_id" \
+    EWM_EXPERIMENT_ID="$run_id" \
+    EWM_AUX_ENABLED=true \
+    EWM_BATCH_SIZE="$EWM_BATCH_SIZE" \
+    EWM_AUXILIARY_BATCH_SIZE="$EWM_AUXILIARY_BATCH_SIZE" \
+    EWM_EVAL_BATCH_SIZE="$EWM_EVAL_BATCH_SIZE" \
+    EWM_EPOCHS="$EWM_EPOCHS" \
+    EWM_MIXED_STAGE_EPOCHS="$EWM_MIXED_STAGE_EPOCHS" \
+    EWM_MIXED_STAGE_AUXILIARY_FRACTION="$EWM_MIXED_STAGE_AUXILIARY_FRACTION" \
+    EWM_SUBCLIP_16_START="$EWM_SUBCLIP_16_START" \
+    EWM_SUBCLIP_32_START="$EWM_SUBCLIP_32_START" \
+    EWM_SUBCLIP_52_START="$EWM_SUBCLIP_52_START" \
+    EWM_TUBELET_SIZE="$EWM_TUBELET_SIZE" \
+    EWM_EVAL_CHECKPOINT_METRIC="$EWM_EVAL_CHECKPOINT_METRIC" \
+    EWM_EVAL_CHECKPOINT_MIN_EPOCH="$EWM_EVAL_CHECKPOINT_MIN_EPOCH" \
+    EWM_YEARLY_TRAIN_INDEX_PATH="$DATA_ROOT_BASE/$YEARLY_NAME/train/dense_temporal_index.parquet" \
+    EWM_YEARLY_VAL_INDEX_PATH="$DATA_ROOT_BASE/$YEARLY_NAME/val/dense_temporal_index.parquet" \
+    EWM_YEARLY_TRAIN_MAX_SAMPLES="$YEARLY_TRAIN_MAX_SAMPLES" \
+    EWM_YEARLY_VAL_MAX_SAMPLES="$YEARLY_VAL_MAX_SAMPLES" \
+    EWM_SSL4EO_ROOT_DIR="$DATA_ROOT_BASE/$SSL4EO_NAME" \
+    EWM_SSL4EO_TRAIN_MAX_SAMPLES="$SSL4EO_TRAIN_MAX_SAMPLES" \
+    EWM_SSL4EO_VAL_MAX_SAMPLES="$SSL4EO_VAL_MAX_SAMPLES" \
+    SKIP_DATA_SYNC="1" \
+    USE_GCSFUSE_MOUNT="0" \
+    USE_GCS_DATA_DIRECT="0" \
+    bash "$PROJECT_ROOT/earth_world_model/scripts/run_phase2_gpu_vm_localdisk.sh"
+}
+
+run_one \
+  "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_ema_single_latent" \
+  EWM_TARGET_MODE=ema \
+  EWM_FACTORIZED_LATENT_VERSION=none \
+  EWM_DYNAMICS_LOSS_WEIGHT=0.0 \
+  EWM_MASK_STATE_LOSS_WEIGHT=0.0 \
+  EWM_SCENE_CONSISTENCY_WEIGHT=0.0 \
+  EWM_DELTA_LOSS_WEIGHT=0.0 \
+  EWM_DELTA_RANDOM_HORIZON_MAX=0 \
+  EWM_REG_METHOD=none
+
+run_one \
+  "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_factorized_z_zt_v1" \
+  EWM_TARGET_MODE=ema \
+  EWM_FACTORIZED_LATENT_VERSION=v1 \
+  EWM_DYNAMICS_LOSS_WEIGHT="${EWM_DYNAMICS_LOSS_WEIGHT:-0.25}" \
+  EWM_MASK_STATE_LOSS_WEIGHT="${EWM_MASK_STATE_LOSS_WEIGHT:-1.0}" \
+  EWM_SCENE_CONSISTENCY_WEIGHT="${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}" \
+  EWM_DELTA_LOSS_WEIGHT=0.0 \
+  EWM_DELTA_RANDOM_HORIZON_MAX=0 \
+  EWM_REG_METHOD=none
+
+run_one \
+  "mixed_ssl4eo_yearly_${YEARLY_TRAIN_MAX_SAMPLES}_factorized_z_zt_delta_v2" \
+  EWM_TARGET_MODE=ema \
+  EWM_FACTORIZED_LATENT_VERSION=v2 \
+  EWM_DYNAMICS_LOSS_WEIGHT="${EWM_DYNAMICS_LOSS_WEIGHT:-0.25}" \
+  EWM_MASK_STATE_LOSS_WEIGHT="${EWM_MASK_STATE_LOSS_WEIGHT:-1.0}" \
+  EWM_SCENE_CONSISTENCY_WEIGHT="${EWM_SCENE_CONSISTENCY_WEIGHT:-0.1}" \
+  EWM_DELTA_LOSS_WEIGHT="${EWM_DELTA_LOSS_WEIGHT:-0.25}" \
+  EWM_DELTA_RANDOM_HORIZON_MAX="${EWM_DELTA_RANDOM_HORIZON_MAX:-4}" \
+  EWM_REG_METHOD=none
