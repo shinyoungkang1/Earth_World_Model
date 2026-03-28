@@ -1,0 +1,53 @@
+benchmark:
+  name: decoder_target_benchmark_v1
+  join: outer
+  required_sources:
+    - modis
+    - chirps
+    - smap
+  forecast_horizons_days:
+    - 7
+    - 14
+    - 30
+
+sources:
+  modis:
+    role: primary_target
+    path: data/targets/modis_lst_daily.parquet
+    expected_columns:
+      - sample_id
+      - date
+      - surface_temp_c
+      - qc_day
+  chirps:
+    role: primary_target
+    path: data/targets/chirps_daily.parquet
+    expected_columns:
+      - sample_id
+      - date
+      - precip_mm
+  smap:
+    role: primary_target
+    path: data/targets/smap_daily.parquet
+    expected_columns:
+      - sample_id
+      - date
+      - soil_moisture_surface
+      - soil_moisture_rootzone
+  era5:
+    role: forcing
+    path: data/targets/era5_land_daily.parquet
+    expected_columns:
+      - sample_id
+      - date
+      - temperature_2m_c
+      - total_precip_mm
+      - soil_temperature_c
+      - surface_pressure_pa
+      - shortwave_radiation_j_m2
+      - wind_u_10m_m_s
+      - wind_v_10m_m_s
+
+outputs:
+  parquet: data/benchmarks/decoder_target_benchmark_v1.parquet
+  metadata_json: data/benchmarks/decoder_target_benchmark_v1_metadata.json

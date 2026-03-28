@@ -648,6 +648,7 @@ def make_model(config: dict, device: torch.device) -> EarthWorldModel:
         scene_latent_dim=model_cfg.get("scene_latent_dim"),
         state_latent_dim=model_cfg.get("state_latent_dim"),
         delta_hidden_dim=model_cfg.get("delta_hidden_dim"),
+        async_sensor_events=resolve_bool_config(model_cfg.get("async_sensor_events", False), default=False),
         enable_observation_planning=resolve_bool_config(planning_cfg.get("enabled", False), default=False),
         planning_hidden_dim=planning_cfg.get("hidden_dim"),
         planning_action_dim=planning_cfg.get("action_dim"),

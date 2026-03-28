@@ -74,6 +74,7 @@ model:
   scene_latent_dim: ${EWM_SCENE_LATENT_DIM:-1024}
   state_latent_dim: ${EWM_STATE_LATENT_DIM:-1024}
   delta_hidden_dim: ${EWM_DELTA_HIDDEN_DIM:-1024}
+  async_sensor_events: ${EWM_ASYNC_SENSOR_EVENTS:-false}
   observation_planning:
     enabled: ${EWM_OBSERVATION_PLANNING_ENABLED:-false}
     hidden_dim: ${EWM_OBSERVATION_PLANNING_HIDDEN_DIM:-1024}

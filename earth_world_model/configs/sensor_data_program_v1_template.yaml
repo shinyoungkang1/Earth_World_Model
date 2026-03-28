@@ -1,0 +1,56 @@
+program:
+  name: sensor_data_program_v1
+  description: >
+    Combined data program for HLS observation events plus daily decoder targets
+    and the aligned decoder benchmark.
+
+stages:
+  - core_check
+  - hls
+  - decoder
+
+inputs:
+  yearly_root: /mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/yearly_10000
+  ssl4eo_root: /mnt/ewm-data-disk/ewm_prelim_yearly10k_ssl4eo50k_v1/ssl4eo_50000
+  hls_index_path: data/features/swpa_core_washington_greene/hls_chip_index_v1.parquet
+  locations_path: data/locations/world_model_sample_locations.parquet
+  requests_path: data/requests/world_model_decoder_requests.parquet
+
+outputs:
+  root: data/programs/sensor_data_program_v1
+  status_json: data/programs/sensor_data_program_v1/status/core_observation_status.json
+  obs_events:
+    parquet: data/programs/sensor_data_program_v1/obs_events/hls_obs_events_v1.parquet
+    metadata_json: data/programs/sensor_data_program_v1/obs_events/hls_obs_events_v1_metadata.json
+  state_targets_daily:
+    dir: data/programs/sensor_data_program_v1/state_targets_daily
+    files:
+      - modis_daily.parquet
+      - chirps_daily.parquet
+      - smap_daily.parquet
+      - era5_daily.parquet
+  benchmark:
+    parquet: data/programs/sensor_data_program_v1/benchmarks/decoder_target_benchmark_v1.parquet
+    metadata_json: data/programs/sensor_data_program_v1/benchmarks/decoder_target_benchmark_v1_metadata.json
+
+defaults:
+  aggregation: point
+  batch_size: 256
+  products:
+    - modis
+    - chirps
+    - smap
+    - era5
+  require_sources:
+    - modis
+    - chirps
+    - smap
+  forecast_horizons_days:
+    - 7
+    - 14
+    - 30
+  hls:
+    sensor_id: hls
+    band_schema: hls6
+    spatial_resolution_m: 30
+    min_quality_score: 0.0

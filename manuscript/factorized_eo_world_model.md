@@ -450,6 +450,199 @@ and toward:
 
 That is much more compelling for a top conference.
 
+### 7.2 Sensor and Supervision Program
+
+Not every external EO or geophysical product should be treated as a peer image sensor.
+
+The clean taxonomy is:
+
+- observation sensors that update the latent world state
+- decoder targets that are predicted from the latent state
+- forcing variables that condition forecasting but do not need to be encoded as chip-level visual inputs
+- static context layers that provide persistent geographic priors
+
+For the current paper, the intended program is:
+
+- observation sensors:
+  - Sentinel-2 surface reflectance
+  - Sentinel-1 GRD
+  - HLS as the next added optical sensor family
+- decoder targets:
+  - land-surface temperature
+  - precipitation
+  - soil moisture
+- forcing variables:
+  - ERA5-Land daily aggregates
+- static context:
+  - DEM / terrain
+  - land cover
+  - tree cover
+
+This is a stronger scientific framing than treating all datasets as interchangeable "modalities." The world state should be updated by direct observations of the surface, while coarse environmental products are decoded from or conditioned on that state.
+
+### 7.3 Planned Dataset Roles
+
+#### A. Core Observation Sensors
+
+These are the sensors that should enter the latent world model as observation events.
+
+- Sentinel-2 SR Harmonized
+  - high-resolution optical surface state
+  - already part of the main weekly dense-temporal pipeline
+- Sentinel-1 GRD
+  - all-weather radar observation of structure and moisture-sensitive backscatter
+  - already part of the main weekly dense-temporal pipeline
+- HLS
+  - harmonized Landsat plus Sentinel optical observations
+  - should be the next new input sensor because it is still imagery-like and relatively close to the current encoder design
+
+HLS is the main non-S1/S2 input to prioritize. It increases temporal density and broadens optical coverage without forcing a completely different training target.
+
+#### B. Decoder Targets
+
+These should be aligned by `sample_id` and date, then predicted from `z_t` or future rolled-out states.
+
+- temperature:
+  - MODIS land surface temperature is the first target to prioritize
+- precipitation:
+  - CHIRPS daily precipitation is the first target to prioritize
+- soil moisture:
+  - SMAP L4 surface and root-zone soil moisture is the first target to prioritize
+
+These products are scientifically valuable, but they are generally too coarse to act like peer image sensors at the current chip size. They should be modeled as decoded environmental variables, not as first-class spatial backbones.
+
+#### C. Forcing Variables
+
+- ERA5-Land daily aggregates
+
+ERA5-Land is useful as a coarse forcing source for:
+
+- daily temperature context
+- precipitation context
+- radiation
+- wind
+- pressure
+- additional land-surface variables
+
+This is especially useful for future-state forecasting and decoder supervision, even when the spatial resolution is much coarser than the chip.
+
+#### D. Optional Context Products
+
+- VIIRS monthly nighttime lights
+- future static or slow-moving socioeconomic layers
+
+These are useful for downstream experiments, but they are not the first priority for the world-model paper.
+
+### 7.4 Why HLS Is Different From Temperature / Precipitation / Soil Moisture
+
+HLS should be treated as a sensor because:
+
+- it is still a multi-band surface reflectance observation
+- it has chip-like spatial structure
+- it can be aligned naturally with the current adapter-based encoder story
+
+The geophysical targets should not be treated the same way because:
+
+- they are much coarser in space
+- they are often better interpreted as state variables than direct visual evidence
+- several of them are effectively scalar or very low-resolution targets at the current chip size
+
+So the intended paper structure is:
+
+- `S1 + S2 + HLS` update the latent world state
+- temperature, precipitation, and soil moisture are decoded from the latent world state
+- ERA5-Land conditions or evaluates the forecasted state
+
+### 7.5 Data Packaging Plan
+
+The long-term training data should be organized into four aligned stores:
+
+- `obs_events`
+  - `sample_id`
+  - `sensor_id`
+  - `timestamp`
+  - observation tensor path
+  - quality / mask metadata
+  - spatial resolution metadata
+- `state_targets_daily`
+  - `sample_id`
+  - `date`
+  - target values for temperature, precipitation, and soil moisture
+  - target quality flags
+- `forcing_daily`
+  - `sample_id`
+  - `date`
+  - ERA5-Land variables
+- `static_context`
+  - persistent covariates such as terrain, land cover, and tree cover
+
+This is the correct interface between the world model and the new environmental target program.
+
+### 7.6 Decoder Benchmark Definition
+
+Yes, this implies building our own aligned decoder benchmark rather than relying on a pre-existing one.
+
+The reason is simple:
+
+- the world model is organized by `sample_id`
+- observations are asynchronous and multi-sensor
+- the benchmark needs date-aligned targets for the same spatial units used by pretraining
+
+An off-the-shelf benchmark usually does not match:
+
+- our chip geometry
+- our `sample_id` indexing
+- our event-time organization
+- our train / validation / test split logic
+
+So the intended first benchmark is a repo-defined aligned target dataset.
+
+Recommended first benchmark version:
+
+- primary decoder targets:
+  - MODIS land-surface temperature
+  - CHIRPS daily precipitation
+  - SMAP daily soil moisture
+- auxiliary forcing:
+  - ERA5-Land daily variables
+
+This means the first benchmark should explicitly track:
+
+- 3 primary target datasets
+- 1 forcing dataset
+
+The primary benchmark questions are:
+
+- can `z_t` decode current temperature, precipitation, and soil moisture?
+- can rolled-out future states decode future temperature, precipitation, and soil moisture?
+- how much does forcing help forecast quality?
+
+The benchmark should be packaged as aligned daily records keyed by:
+
+- `sample_id`
+- `date`
+
+with:
+
+- target values
+- target quality flags
+- forcing variables
+- coverage metadata
+
+The first benchmark should be treated as:
+
+- a new aligned evaluation dataset built for this world-model program
+- not as a borrowed benchmark with mismatched geometry and timing assumptions
+
+Operationally, the data-program runner should stage work in this order:
+
+1. verify the existing core `S1/S2` corpus is already present,
+2. build `HLS` observation events into `obs_events`,
+3. extract daily decoder targets into `state_targets_daily`,
+4. assemble the aligned benchmark in `benchmarks`.
+
+This avoids re-collecting the base `S1/S2` corpus when it already exists, while still making missing pieces explicit.
+
 ## 8. Forecasting vs Planning
 
 ### 8.1 What We Have Without Actions
@@ -821,6 +1014,18 @@ That is the most defensible and ambitious version of the idea.
 7. Implement the latent heads and state prediction path in the codebase.
 8. Design the first downstream decoder task:
    - temperature is a good candidate if aligned supervision is available.
+9. Unify the sensor and target program:
+   - keep `S1 + S2` as the main observation backbone
+   - add HLS as the next real input sensor
+   - add temperature, precipitation, and soil moisture as aligned decoder targets
+   - use ERA5-Land as coarse forcing / supervision rather than a peer image sensor
+10. Build the first aligned decoder benchmark:
+   - 3 primary targets:
+     - MODIS land-surface temperature
+     - CHIRPS precipitation
+     - SMAP soil moisture
+   - 1 auxiliary forcing source:
+     - ERA5-Land
 
 ## 16. Planned Training Runs
 
@@ -867,6 +1072,12 @@ For the `yearly_10000 + ssl4eo_50000` study, the intended run order is:
      - random delta horizon max `2`
      - delta target gap normalization enabled
      - delta warmup starts after the mixed stage and ramps for `2` epochs
+
+7. `factorized_z_zt_delta_v2_sensor_dropout_gapnorm_warmup_async_sensor_events`
+   - run `#6` plus asynchronous sensor-event modeling for `S2` and `S1`
+   - instead of collapsing both sensors into one grouped timestep with timing metadata, the model emits separate `S2` and `S1` event tokens at their actual acquisition dates
+   - the temporal encoder processes the interleaved sensor-event stream, then pools those event states back to the grouped timestep state sequence used by the rest of the factorized losses
+   - intended to test whether explicit asynchronous event ordering is a better inductive bias than paired-week fusion when `S1` and `S2` have nontrivial within-bin timing offsets
 
 The observation-planning training signal is self-supervised. For a sampled horizon, the model uses the current latent state and scene latent, then:
 

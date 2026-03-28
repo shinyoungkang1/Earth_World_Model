@@ -721,6 +721,34 @@ class SpatialEncoder(nn.Module):
         )
         return self.norm(combined)
 
+    def encode_single_sensor_step_tokens(
+        self,
+        sensor_name: str,
+        sensor_inputs: torch.Tensor,
+        *,
+        present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
+    ) -> torch.Tensor:
+        sensor_key = str(sensor_name).strip().lower()
+        if not self.has_sensor_adapter(sensor_key):
+            raise ValueError(f"Unknown sensor adapter {sensor_key!r}")
+        resolved_tokenizer = self.tokenizer_type if tokenizer_type is None else str(tokenizer_type).lower()
+        if self.tokenizer_mode is not None and tokenizer_type is None:
+            resolved_tokenizer = "conv2d"
+        if resolved_tokenizer == "conv3d":
+            raise ValueError("encode_single_sensor_step_tokens is not supported for conv3d tokenizers")
+        tokens = self._project_step_tokens(sensor_inputs, modality=sensor_key, tokenizer_type=resolved_tokenizer)
+        if (
+            self.use_missing_modality_embeddings
+            and present is not None
+            and self._sensor_specs[sensor_key].supports_missing_embedding
+        ):
+            missing = (~present.to(torch.bool)).view(-1, 1, 1).to(device=tokens.device, dtype=tokens.dtype)
+            tokens = tokens + (
+                missing * self._missing_embed(sensor_key, device=tokens.device, dtype=tokens.dtype, ndims=tokens.ndim)
+            )
+        return self.norm(tokens)
+
     def encode_sequence_tokens(
         self,
         s2: torch.Tensor | None = None,
@@ -759,6 +787,36 @@ class SpatialEncoder(nn.Module):
             )
         )
         return self.norm(combined)
+
+    def encode_single_sensor_sequence_tokens(
+        self,
+        sensor_name: str,
+        sensor_inputs: torch.Tensor,
+        *,
+        present: torch.Tensor | None = None,
+        tokenizer_type: str | None = None,
+    ) -> torch.Tensor:
+        sensor_key = str(sensor_name).strip().lower()
+        if not self.has_sensor_adapter(sensor_key):
+            raise ValueError(f"Unknown sensor adapter {sensor_key!r}")
+        if tokenizer_type is None:
+            resolved_tokenizer = self.resolve_tokenizer_type(sensor_inputs.shape[1])
+        else:
+            resolved_tokenizer = str(tokenizer_type).lower()
+        if resolved_tokenizer != "conv3d":
+            raise ValueError("encode_single_sensor_sequence_tokens is only supported for conv3d tokenizers")
+        tokens = self._project_sequence_tokens(sensor_inputs, modality=sensor_key, tokenizer_type=resolved_tokenizer)
+        grouped_present = self.aggregate_temporal_presence(present, tokenizer_type=resolved_tokenizer)
+        if (
+            self.use_missing_modality_embeddings
+            and grouped_present is not None
+            and self._sensor_specs[sensor_key].supports_missing_embedding
+        ):
+            missing = (~grouped_present.to(torch.bool)).unsqueeze(-1).unsqueeze(-1).to(device=tokens.device, dtype=tokens.dtype)
+            tokens = tokens + (
+                missing * self._missing_embed(sensor_key, device=tokens.device, dtype=tokens.dtype, ndims=tokens.ndim)
+            )
+        return self.norm(tokens)
 
     def forward(
         self,

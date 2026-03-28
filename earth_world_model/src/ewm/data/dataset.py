@@ -77,6 +77,100 @@ def _slice_temporal_tensor(value: torch.Tensor | None, start: int, end: int) -> 
     return value[start:end]
 
 
+def _day_of_year_from_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (np.integer, int)):
+        day = int(value)
+        return day if day > 0 else None
+    if isinstance(value, (np.floating, float)):
+        if not np.isfinite(value):
+            return None
+        day = int(round(float(value)))
+        return day if day > 0 else None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lstrip("+-").isdigit():
+        day = int(text)
+        return day if day > 0 else None
+    try:
+        timestamp = pd.Timestamp(text)
+    except Exception:
+        return None
+    if pd.isna(timestamp):
+        return None
+    return int(timestamp.dayofyear)
+
+
+def _parse_frame_metadata_records(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _parse_frame_metadata_records(value.item())
+        if value.size == 1:
+            return _parse_frame_metadata_records(value.reshape(-1)[0].item())
+        if value.dtype == object:
+            return [dict(item) for item in value.tolist() if isinstance(item, dict)]
+        return []
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [dict(item) for item in parsed if isinstance(item, dict)]
+
+
+def _sensor_day_of_year_tensor(
+    frame_metadata: Any,
+    *,
+    sensor_key: str,
+    fallback_dates: torch.Tensor,
+    present: torch.Tensor | None = None,
+) -> torch.Tensor:
+    fallback = fallback_dates.to(torch.int32).clone()
+    present_mask = (
+        torch.ones_like(fallback, dtype=torch.bool)
+        if present is None
+        else present.to(device=fallback.device, dtype=torch.bool)
+    )
+    result = torch.where(present_mask, fallback, torch.full_like(fallback, -1))
+    records = _parse_frame_metadata_records(frame_metadata)
+    if not records:
+        return result
+    for index, record in enumerate(records[: result.shape[0]]):
+        if not bool(present_mask[index]):
+            result[index] = -1
+            continue
+        candidate = None
+        sensor_record = record.get(sensor_key)
+        if isinstance(sensor_record, dict):
+            for key in ("datetime", "timestamp", "date", "acquired"):
+                candidate = sensor_record.get(key)
+                if candidate:
+                    break
+        if candidate is None:
+            for key in (f"{sensor_key}_datetime", f"{sensor_key}_timestamp", f"{sensor_key}_date"):
+                candidate = record.get(key)
+                if candidate:
+                    break
+        day_of_year = _day_of_year_from_value(candidate)
+        if day_of_year is not None:
+            result[index] = int(day_of_year)
+    return result
+
+
 def _temporal_subclip_start(total_steps: int, clip_length: int, mode: str) -> int:
     if clip_length <= 0 or total_steps <= clip_length:
         return 0
@@ -358,6 +452,8 @@ def _prepare_dense_temporal_sample(
     s2_frame_mask: torch.Tensor | None,
     s1_frame_mask: torch.Tensor | None,
     dates: torch.Tensor,
+    s2_dates: torch.Tensor | None,
+    s1_dates: torch.Tensor | None,
     s2_valid_mask: torch.Tensor,
     s1_valid_mask: torch.Tensor,
     patch_size: int,
@@ -409,10 +505,16 @@ def _prepare_dense_temporal_sample(
         else s1_valid_mask.reshape(s1_valid_mask.shape[0], -1).any(dim=1)
     )
     timestep_mask = frame_mask.to(torch.bool) | s2_present | s1_present
+    resolved_s2_dates = dates.to(torch.int32).clone() if s2_dates is None else s2_dates.to(torch.int32)
+    resolved_s1_dates = dates.to(torch.int32).clone() if s1_dates is None else s1_dates.to(torch.int32)
+    resolved_s2_dates = torch.where(s2_present, resolved_s2_dates, torch.full_like(resolved_s2_dates, -1))
+    resolved_s1_dates = torch.where(s1_present, resolved_s1_dates, torch.full_like(resolved_s1_dates, -1))
     return {
         "s2": full_s2,
         "s1": s1,
         "dates": dates.to(torch.int32),
+        "s2_dates": resolved_s2_dates,
+        "s1_dates": resolved_s1_dates,
         "mask": timestep_mask,
         "paired_mask": frame_mask.to(torch.bool),
         "s2_present": s2_present,
@@ -468,6 +570,8 @@ class FakeTemporalDataset(Dataset):
         s1 = torch.randn(self.timesteps, 2, self.patch_size, self.patch_size, generator=generator)
         mask = torch.ones(self.timesteps, dtype=torch.bool)
         dates = torch.linspace(1.0, 365.0, steps=self.timesteps, dtype=torch.float32).round().to(torch.int32)
+        s2_dates = dates.clone()
+        s1_dates = torch.clamp(dates + 2, max=366).to(torch.int32)
         s2_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
         s1_valid_mask = torch.ones(self.timesteps, self.patch_size, self.patch_size, dtype=torch.bool)
         clip_length = self._current_temporal_subclip_length()
@@ -478,12 +582,16 @@ class FakeTemporalDataset(Dataset):
             s1 = _slice_temporal_tensor(s1, start, end)
             mask = _slice_temporal_tensor(mask, start, end)
             dates = _slice_temporal_tensor(dates, start, end)
+            s2_dates = _slice_temporal_tensor(s2_dates, start, end)
+            s1_dates = _slice_temporal_tensor(s1_dates, start, end)
             s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
             s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
         return {
             "s2": s2.float(),
             "s1": s1.float(),
             "dates": dates,
+            "s2_dates": s2_dates,
+            "s1_dates": s1_dates,
             "mask": mask,
             "paired_mask": mask,
             "s2_present": mask,
@@ -533,6 +641,18 @@ class ManifestTemporalDataset(Dataset):
             s1 = torch.from_numpy(np.asarray(sample["s1"])).float()
             dates = torch.from_numpy(np.asarray(sample["dates"])).to(torch.int32) if "dates" in sample.files else DEFAULT_DATES.clone()
             mask = torch.from_numpy(np.asarray(sample["mask"])).to(torch.bool) if "mask" in sample.files else torch.ones(4, dtype=torch.bool)
+            if "s2_day_of_year" in sample.files:
+                s2_dates = torch.from_numpy(np.asarray(sample["s2_day_of_year"])).to(torch.int32)
+            elif "s2_dates" in sample.files:
+                s2_dates = torch.from_numpy(np.asarray(sample["s2_dates"])).to(torch.int32)
+            else:
+                s2_dates = _sensor_day_of_year_tensor(row.get("frame_metadata_json"), sensor_key="s2", fallback_dates=dates, present=mask)
+            if "s1_day_of_year" in sample.files:
+                s1_dates = torch.from_numpy(np.asarray(sample["s1_day_of_year"])).to(torch.int32)
+            elif "s1_dates" in sample.files:
+                s1_dates = torch.from_numpy(np.asarray(sample["s1_dates"])).to(torch.int32)
+            else:
+                s1_dates = _sensor_day_of_year_tensor(row.get("frame_metadata_json"), sensor_key="s1", fallback_dates=dates, present=mask)
 
         if s2.ndim != 4 or s2.shape[:2] != (4, 12):
             raise ValueError(f"Row {index} has invalid s2 shape {tuple(s2.shape)}")
@@ -545,7 +665,7 @@ class ManifestTemporalDataset(Dataset):
         s2 = (s2 - S2_MEAN.unsqueeze(0)) / (S2_STD.unsqueeze(0) + 1e-6)
         s1 = (s1 - S1_MEAN.unsqueeze(0)) / (S1_STD.unsqueeze(0) + 1e-6)
 
-        return {"s2": s2, "s1": s1, "dates": dates, "mask": mask}
+        return {"s2": s2, "s1": s1, "dates": dates, "s2_dates": s2_dates, "s1_dates": s1_dates, "mask": mask}
 
 
 class HLSChipTemporalDataset(Dataset):
@@ -690,6 +810,11 @@ class DenseTemporalNPZDataset(Dataset):
                 if "day_of_year" in sample.files
                 else DEFAULT_DATES[: s2.shape[0]].clone()
             )
+            frame_metadata_value = (
+                np.asarray(sample["frame_metadata_json"])
+                if "frame_metadata_json" in sample.files
+                else row.get("frame_metadata_json")
+            )
             s2_valid_mask = (
                 torch.from_numpy(np.asarray(sample["s2_valid_mask"])).to(torch.bool)
                 if "s2_valid_mask" in sample.files
@@ -710,6 +835,18 @@ class DenseTemporalNPZDataset(Dataset):
                 if "s1_frame_mask" in sample.files
                 else s1_valid_mask.reshape(s1_valid_mask.shape[0], -1).any(dim=1)
             )
+            if "s2_day_of_year" in sample.files:
+                s2_dates = torch.from_numpy(np.asarray(sample["s2_day_of_year"])).to(torch.int32)
+            elif "s2_dates" in sample.files:
+                s2_dates = torch.from_numpy(np.asarray(sample["s2_dates"])).to(torch.int32)
+            else:
+                s2_dates = _sensor_day_of_year_tensor(frame_metadata_value, sensor_key="s2", fallback_dates=dates, present=s2_frame_mask)
+            if "s1_day_of_year" in sample.files:
+                s1_dates = torch.from_numpy(np.asarray(sample["s1_day_of_year"])).to(torch.int32)
+            elif "s1_dates" in sample.files:
+                s1_dates = torch.from_numpy(np.asarray(sample["s1_dates"])).to(torch.int32)
+            else:
+                s1_dates = _sensor_day_of_year_tensor(frame_metadata_value, sensor_key="s1", fallback_dates=dates, present=s1_frame_mask)
         clip_length = self._current_temporal_subclip_length()
         if clip_length > 0 and s2.shape[0] > clip_length:
             start = _temporal_subclip_start(s2.shape[0], clip_length, self.temporal_subclip_mode)
@@ -718,6 +855,8 @@ class DenseTemporalNPZDataset(Dataset):
             s1 = _slice_temporal_tensor(s1, start, end)
             frame_mask = _slice_temporal_tensor(frame_mask, start, end)
             dates = _slice_temporal_tensor(dates, start, end)
+            s2_dates = _slice_temporal_tensor(s2_dates, start, end)
+            s1_dates = _slice_temporal_tensor(s1_dates, start, end)
             s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
             s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
             s2_frame_mask = _slice_temporal_tensor(s2_frame_mask, start, end)
@@ -729,6 +868,8 @@ class DenseTemporalNPZDataset(Dataset):
             s2_frame_mask=s2_frame_mask,
             s1_frame_mask=s1_frame_mask,
             dates=dates,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
             s2_valid_mask=s2_valid_mask,
             s1_valid_mask=s1_valid_mask,
             patch_size=self.patch_size,
@@ -838,6 +979,24 @@ class DenseTemporalZarrDataset(Dataset):
         dates = torch.from_numpy(np.asarray(group["day_of_year"][row_idx, :frame_count])).to(torch.int32)
         s2_valid_mask = torch.from_numpy(np.asarray(group["s2_valid_mask"][row_idx, :frame_count])).to(torch.bool)
         s1_valid_mask = torch.from_numpy(np.asarray(group["s1_valid_mask"][row_idx, :frame_count])).to(torch.bool)
+        if "s2_day_of_year" in group:
+            s2_dates = torch.from_numpy(np.asarray(group["s2_day_of_year"][row_idx, :frame_count])).to(torch.int32)
+        elif "s2_dates" in group:
+            s2_dates = torch.from_numpy(np.asarray(group["s2_dates"][row_idx, :frame_count])).to(torch.int32)
+        else:
+            frame_metadata_value = (
+                np.asarray(group["frame_metadata_json"][row_idx]) if "frame_metadata_json" in group else row.get("frame_metadata_json")
+            )
+            s2_dates = _sensor_day_of_year_tensor(frame_metadata_value, sensor_key="s2", fallback_dates=dates, present=s2_frame_mask)
+        if "s1_day_of_year" in group:
+            s1_dates = torch.from_numpy(np.asarray(group["s1_day_of_year"][row_idx, :frame_count])).to(torch.int32)
+        elif "s1_dates" in group:
+            s1_dates = torch.from_numpy(np.asarray(group["s1_dates"][row_idx, :frame_count])).to(torch.int32)
+        else:
+            frame_metadata_value = (
+                np.asarray(group["frame_metadata_json"][row_idx]) if "frame_metadata_json" in group else row.get("frame_metadata_json")
+            )
+            s1_dates = _sensor_day_of_year_tensor(frame_metadata_value, sensor_key="s1", fallback_dates=dates, present=s1_frame_mask)
         clip_length = self._current_temporal_subclip_length()
         if clip_length > 0 and s2.shape[0] > clip_length:
             start = _temporal_subclip_start(s2.shape[0], clip_length, self.temporal_subclip_mode)
@@ -848,6 +1007,8 @@ class DenseTemporalZarrDataset(Dataset):
             s2_frame_mask = _slice_temporal_tensor(s2_frame_mask, start, end)
             s1_frame_mask = _slice_temporal_tensor(s1_frame_mask, start, end)
             dates = _slice_temporal_tensor(dates, start, end)
+            s2_dates = _slice_temporal_tensor(s2_dates, start, end)
+            s1_dates = _slice_temporal_tensor(s1_dates, start, end)
             s2_valid_mask = _slice_temporal_tensor(s2_valid_mask, start, end)
             s1_valid_mask = _slice_temporal_tensor(s1_valid_mask, start, end)
 
@@ -858,6 +1019,8 @@ class DenseTemporalZarrDataset(Dataset):
             s2_frame_mask=s2_frame_mask,
             s1_frame_mask=s1_frame_mask,
             dates=dates,
+            s2_dates=s2_dates,
+            s1_dates=s1_dates,
             s2_valid_mask=s2_valid_mask,
             s1_valid_mask=s1_valid_mask,
             patch_size=self.patch_size,
@@ -1200,7 +1363,12 @@ class SSL4EOZarrDataset(Dataset):
             "s2": s2,
             "s1": s1,
             "dates": dates.to(torch.int32),
+            "s2_dates": dates.to(torch.int32),
+            "s1_dates": dates.to(torch.int32),
             "mask": frame_mask.to(torch.bool),
+            "paired_mask": frame_mask.to(torch.bool),
+            "s2_present": frame_mask.to(torch.bool),
+            "s1_present": frame_mask.to(torch.bool),
         }
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
@@ -1219,7 +1387,17 @@ class SSL4EOZarrDataset(Dataset):
         if len(grouped_rows) == 1:
             return self._fetch_rows_batch([row for _position, row in next(iter(grouped_rows.values()))])
 
-        ordered: dict[str, list[torch.Tensor | None]] = {"s2": [None] * len(rows), "s1": [None] * len(rows), "dates": [None] * len(rows), "mask": [None] * len(rows)}
+        ordered: dict[str, list[torch.Tensor | None]] = {
+            "s2": [None] * len(rows),
+            "s1": [None] * len(rows),
+            "dates": [None] * len(rows),
+            "s2_dates": [None] * len(rows),
+            "s1_dates": [None] * len(rows),
+            "mask": [None] * len(rows),
+            "paired_mask": [None] * len(rows),
+            "s2_present": [None] * len(rows),
+            "s1_present": [None] * len(rows),
+        }
         for entries in grouped_rows.values():
             group_batch = self._fetch_rows_batch([row for _position, row in entries])
             for batch_offset, (position, _row) in enumerate(entries):

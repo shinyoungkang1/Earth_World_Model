@@ -189,6 +189,7 @@ class EarthWorldModel(nn.Module):
         scene_latent_dim: int | None = None,
         state_latent_dim: int | None = None,
         delta_hidden_dim: int | None = None,
+        async_sensor_events: bool = False,
         enable_observation_planning: bool = False,
         planning_hidden_dim: int | None = None,
         planning_action_dim: int | None = None,
@@ -213,6 +214,7 @@ class EarthWorldModel(nn.Module):
             raise ValueError(f"Unsupported factorized_latent_version: {self.factorized_latent_version}")
         self.use_factorized_latents = self.factorized_latent_version in {"v1", "v2"}
         self.use_explicit_delta_latent = self.factorized_latent_version == "v2"
+        self.async_sensor_events = bool(async_sensor_events)
         self.scene_latent_dim = int(scene_latent_dim or embed_dim)
         self.state_latent_dim = int(state_latent_dim or embed_dim)
         self.enable_latent_dynamics = bool(enable_latent_dynamics)
@@ -1028,6 +1030,222 @@ class EarthWorldModel(nn.Module):
             return None
         return {name: value[:, index] for name, value in sensor_dict.items()}
 
+    def _should_use_async_sensor_events(
+        self,
+        *,
+        s2: torch.Tensor | None,
+        s1: torch.Tensor | None,
+        hls: torch.Tensor | None,
+        extra_sensors: dict[str, torch.Tensor] | None,
+    ) -> bool:
+        return (
+            self.async_sensor_events
+            and self.token_mode == "dense"
+            and self.temporal_block_type == "factorized_rope"
+            and str(self.input_mode) == "s2s1"
+            and self.spatial.separate_sensor_encoders
+            and hls is None
+            and not extra_sensors
+            and s2 is not None
+            and s1 is not None
+        )
+
+    def _resolve_async_sensor_presence(
+        self,
+        *,
+        sensor: torch.Tensor | None,
+        dates: torch.Tensor,
+        mask: torch.Tensor | None,
+        sensor_present: torch.Tensor | None,
+        tokenizer_type: str,
+    ) -> torch.Tensor:
+        grouped_mask = self.spatial.aggregate_temporal_boolean(mask, tokenizer_type=tokenizer_type)
+        if sensor_present is not None:
+            resolved = self.spatial.aggregate_temporal_presence(sensor_present, tokenizer_type=tokenizer_type)
+        elif sensor is not None:
+            resolved = torch.isfinite(sensor).reshape(sensor.shape[0], sensor.shape[1], -1).any(dim=2)
+            resolved = self.spatial.aggregate_temporal_presence(resolved, tokenizer_type=tokenizer_type)
+        else:
+            resolved = self.spatial.aggregate_temporal_presence(mask, tokenizer_type=tokenizer_type)
+        if resolved is None:
+            resolved = torch.ones_like(self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type), dtype=torch.bool)
+        if grouped_mask is not None:
+            resolved = resolved & grouped_mask.to(device=resolved.device, dtype=torch.bool)
+        return resolved
+
+    def _resolve_async_sensor_dates(
+        self,
+        *,
+        grouped_dates: torch.Tensor,
+        tokenizer_type: str,
+        sensor_dates: torch.Tensor | None,
+        sensor_present: torch.Tensor,
+    ) -> torch.Tensor:
+        if sensor_dates is None:
+            resolved = grouped_dates
+        else:
+            resolved = self.spatial.aggregate_temporal_dates(sensor_dates, tokenizer_type=tokenizer_type)
+            resolved = torch.where(resolved > 0, resolved, grouped_dates)
+        return torch.where(sensor_present, resolved.to(dtype=torch.long), torch.full_like(grouped_dates, -1))
+
+    def _build_async_sensor_event_timeline_inputs(
+        self,
+        *,
+        s2: torch.Tensor,
+        s1: torch.Tensor,
+        dates: torch.Tensor,
+        mask: torch.Tensor | None,
+        s2_present: torch.Tensor | None,
+        s1_present: torch.Tensor | None,
+        s2_dates: torch.Tensor | None,
+        s1_dates: torch.Tensor | None,
+        visible_token_indices: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokenizer_type = self._resolved_tokenizer_type(dates)
+        if tokenizer_type == "conv3d" and self.spatial.tubelet_size != 1:
+            raise ValueError("async_sensor_events currently requires tubelet_size=1 when using conv3d tokenization")
+        grouped_dates = self.spatial.aggregate_temporal_dates(dates, tokenizer_type=tokenizer_type).to(dtype=torch.long)
+        grouped_steps = int(grouped_dates.shape[1])
+        grouped_s2_present = self._resolve_async_sensor_presence(
+            sensor=s2,
+            dates=dates,
+            mask=mask,
+            sensor_present=s2_present,
+            tokenizer_type=tokenizer_type,
+        )
+        grouped_s1_present = self._resolve_async_sensor_presence(
+            sensor=s1,
+            dates=dates,
+            mask=mask,
+            sensor_present=s1_present,
+            tokenizer_type=tokenizer_type,
+        )
+        grouped_s2_dates = self._resolve_async_sensor_dates(
+            grouped_dates=grouped_dates,
+            tokenizer_type=tokenizer_type,
+            sensor_dates=s2_dates,
+            sensor_present=grouped_s2_present,
+        )
+        grouped_s1_dates = self._resolve_async_sensor_dates(
+            grouped_dates=grouped_dates,
+            tokenizer_type=tokenizer_type,
+            sensor_dates=s1_dates,
+            sensor_present=grouped_s1_present,
+        )
+        if tokenizer_type == "conv3d":
+            s2_tokens = self.spatial.encode_single_sensor_sequence_tokens(
+                "s2",
+                s2,
+                present=s2_present,
+                tokenizer_type=tokenizer_type,
+            )
+            s1_tokens = self.spatial.encode_single_sensor_sequence_tokens(
+                "s1",
+                s1,
+                present=s1_present,
+                tokenizer_type=tokenizer_type,
+            )
+        else:
+            s2_steps = []
+            s1_steps = []
+            for timestep in range(dates.shape[1]):
+                s2_steps.append(
+                    self.spatial.encode_single_sensor_step_tokens(
+                        "s2",
+                        s2[:, timestep],
+                        present=None if s2_present is None else s2_present[:, timestep],
+                        tokenizer_type=tokenizer_type,
+                    )
+                )
+                s1_steps.append(
+                    self.spatial.encode_single_sensor_step_tokens(
+                        "s1",
+                        s1[:, timestep],
+                        present=None if s1_present is None else s1_present[:, timestep],
+                        tokenizer_type=tokenizer_type,
+                    )
+                )
+            s2_tokens = torch.stack(s2_steps, dim=1)
+            s1_tokens = torch.stack(s1_steps, dim=1)
+        if s2_tokens.shape != s1_tokens.shape:
+            raise ValueError(f"Async sensor event token shape mismatch: {tuple(s2_tokens.shape)} vs {tuple(s1_tokens.shape)}")
+        batch, _, tokens_per_step, embed_dim = s2_tokens.shape
+        self._last_tokens_per_timestep = int(tokens_per_step)
+        event_tokens = torch.stack([s2_tokens, s1_tokens], dim=2).reshape(batch, grouped_steps * 2, tokens_per_step, embed_dim)
+        base_step_ids = torch.arange(grouped_steps, device=event_tokens.device, dtype=torch.long).repeat_interleave(2)
+        sensor_priority = torch.tensor([0.0, 0.01], device=event_tokens.device, dtype=torch.float32).repeat(grouped_steps)
+        event_step_ids = base_step_ids.unsqueeze(0).expand(batch, -1)
+        event_dates = torch.stack([grouped_s2_dates, grouped_s1_dates], dim=2).reshape(batch, grouped_steps * 2)
+        event_valid = torch.stack([grouped_s2_present, grouped_s1_present], dim=2).reshape(batch, grouped_steps * 2)
+
+        grouped_visibility = self._dense_visibility_mask(
+            batch,
+            grouped_steps,
+            tokens_per_step,
+            device=event_tokens.device,
+            visible_token_indices=visible_token_indices,
+        )
+        event_visibility = None if grouped_visibility is None else grouped_visibility.index_select(1, base_step_ids)
+        invalid_fill = torch.full_like(event_dates, 10000)
+        sort_key = torch.where(event_valid, event_dates, invalid_fill).to(torch.float32) * 2.0 + sensor_priority.view(1, -1)
+        sort_indices = torch.argsort(sort_key, dim=1)
+        sorted_tokens = event_tokens.gather(
+            1,
+            sort_indices.view(batch, -1, 1, 1).expand(-1, -1, tokens_per_step, embed_dim),
+        )
+        sorted_dates = event_dates.gather(1, sort_indices)
+        sorted_valid = event_valid.gather(1, sort_indices)
+        sorted_step_ids = event_step_ids.gather(1, sort_indices)
+        sorted_visibility = None
+        if event_visibility is not None:
+            sorted_visibility = event_visibility.gather(
+                1,
+                sort_indices.view(batch, -1, 1).expand(-1, -1, tokens_per_step),
+            )
+        timeline = sorted_tokens + self.temporal_pos(
+            sorted_dates,
+            valid_fraction=sorted_valid.to(dtype=sorted_tokens.dtype),
+        ).unsqueeze(2)
+        visibility_mask = sorted_valid.unsqueeze(-1).expand(-1, -1, tokens_per_step)
+        if sorted_visibility is not None:
+            visibility_mask = visibility_mask & sorted_visibility
+        timeline = timeline * visibility_mask.unsqueeze(-1).to(dtype=timeline.dtype)
+        return timeline, sorted_dates.to(dtype=torch.long), visibility_mask, grouped_dates, sorted_step_ids
+
+    @staticmethod
+    def _pool_async_event_states(
+        encoded_events: torch.Tensor,
+        *,
+        visibility_mask: torch.Tensor,
+        grouped_steps: int,
+        event_step_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_weights = visibility_mask.to(device=encoded_events.device, dtype=encoded_events.dtype)
+        event_states = EarthWorldModel._weighted_mean(encoded_events, token_weights, dim=2)
+        event_visible_fraction = token_weights.mean(dim=2)
+        batch, _, embed_dim = event_states.shape
+        state_sums = encoded_events.new_zeros((batch, grouped_steps, embed_dim))
+        state_weight_sums = encoded_events.new_zeros((batch, grouped_steps))
+        state_event_counts = encoded_events.new_zeros((batch, grouped_steps))
+        state_sums.scatter_add_(
+            1,
+            event_step_ids.unsqueeze(-1).expand(-1, -1, embed_dim),
+            event_states * event_visible_fraction.unsqueeze(-1),
+        )
+        state_weight_sums.scatter_add_(1, event_step_ids, event_visible_fraction)
+        state_event_counts.scatter_add_(
+            1,
+            event_step_ids,
+            (event_visible_fraction > 0).to(dtype=event_visible_fraction.dtype),
+        )
+        state_inputs = state_sums / state_weight_sums.clamp_min(1.0e-6).unsqueeze(-1)
+        state_weights = torch.where(
+            state_event_counts > 0,
+            state_weight_sums / state_event_counts.clamp_min(1.0),
+            torch.zeros_like(state_weight_sums),
+        )
+        return state_inputs, state_weights, state_weights.unsqueeze(-1)
+
     def encode_factorized_latents(
         self,
         s2: torch.Tensor | None,
@@ -1047,7 +1265,37 @@ class EarthWorldModel(nn.Module):
         if not self.use_factorized_latents:
             raise RuntimeError("Factorized latent encoding requested, but factorized latents are disabled")
 
-        if self.token_mode == "dense":
+        if self._should_use_async_sensor_events(
+            s2=s2,
+            s1=s1,
+            hls=hls,
+            extra_sensors=extra_sensors,
+        ):
+            timeline, event_dates, visibility_mask, grouped_dates, event_step_ids = self._build_async_sensor_event_timeline_inputs(
+                s2=s2,
+                s1=s1,
+                dates=dates,
+                mask=mask,
+                s2_present=s2_present,
+                s1_present=s1_present,
+                s2_dates=s2_dates,
+                s1_dates=s1_dates,
+                visible_token_indices=token_indices,
+            )
+            encoded_events = self._run_temporal_encoder(
+                timeline,
+                position_ids=event_dates,
+                visibility_mask=visibility_mask,
+                return_hierarchical=False,
+            )
+            state_inputs, state_weights, token_weights = self._pool_async_event_states(
+                encoded_events,
+                visibility_mask=visibility_mask,
+                grouped_steps=int(grouped_dates.shape[1]),
+                event_step_ids=event_step_ids,
+            )
+            encoded_structured = state_inputs.unsqueeze(2)
+        elif self.token_mode == "dense":
             if self.temporal_block_type != "factorized_rope":
                 raise ValueError("Factorized latent encoding currently requires token_mode=dense with temporal_block_type=factorized_rope")
             timeline, grouped_dates, visibility_mask = self._build_structured_timeline_inputs(

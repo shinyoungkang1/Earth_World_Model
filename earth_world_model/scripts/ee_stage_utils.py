@@ -24,28 +24,33 @@ def require_ee() -> Any:
 def initialize_ee(ee: Any, *, project: str, authenticate: bool = False) -> None:
     """Initialize Earth Engine with a durable auth preference order.
 
-    Prefer the VM compute service account first so fresh VMs do not depend on
-    cached human ADC credentials. Fall back to standard EE initialization only
-    if the service-account path is unavailable.
+    Prefer already-available local credentials first so laptops do not stall on
+    VM-only metadata lookup. Fall back to ADC, which will resolve to the VM
+    service account automatically on Compute Engine when properly configured.
     """
 
     if authenticate:  # pragma: no cover - interactive auth
         ee.Authenticate()
     try:
-        from google.auth import compute_engine  # type: ignore
-
-        credentials = compute_engine.Credentials(scopes=[EE_SCOPE])
-        ee.Initialize(credentials=credentials, project=project)
+        ee.Initialize(project=project)
         return
-    except Exception:
+    except Exception as persistent_exc:
         try:
-            ee.Initialize(project=project)
-            return
-        except Exception:
             import google.auth  # type: ignore
 
             credentials, _ = google.auth.default(scopes=[EE_SCOPE])
             ee.Initialize(credentials=credentials, project=project)
+            return
+        except Exception as adc_exc:
+            raise SystemExit(
+                "Could not initialize Earth Engine with either persistent EE credentials or "
+                "Application Default Credentials.\n"
+                "Local fix: run `earthengine authenticate` or `gcloud auth application-default login`.\n"
+                "VM fix: ensure the attached service account belongs to an Earth-Engine-enabled "
+                f"project and has ADC available for project {project!r}.\n"
+                f"Persistent-credential error: {persistent_exc}\n"
+                f"ADC error: {adc_exc}"
+            ) from adc_exc
 
 
 def read_csv_bytes(path: Path) -> bytes:
