@@ -843,6 +843,10 @@ For the `yearly_10000 + ssl4eo_50000` study, the intended run order is:
 4. `factorized_z_zt_delta_v2_sensor_dropout`
    - run `#3` plus student-only sensor dropout
    - intended to make the latent state robust to missing `S1` or `S2`
+   - retains the `v2` delta path, but with a weaker delta setting than run `#3`
+   - recommended launch defaults:
+     - delta loss weight `0.1`
+     - random delta horizon max `2`
 
 5. `factorized_z_zt_delta_v2_sensor_dropout_observation_planning`
    - run `#4` plus an action-conditioned observation-planning auxiliary loss
@@ -851,6 +855,7 @@ For the `yearly_10000 + ssl4eo_50000` study, the intended run order is:
      - time delta
      - acquisition cost
    - the model predicts the future latent state for the realized future observation and learns a planning score for candidate actions
+   - also uses the weaker `v2` delta setting rather than the more aggressive `0.25 / 4-step` configuration
 
 The observation-planning training signal is self-supervised. For a sampled horizon, the model uses the current latent state and scene latent, then:
 
