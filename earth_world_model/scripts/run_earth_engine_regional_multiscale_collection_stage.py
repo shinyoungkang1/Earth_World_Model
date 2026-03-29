@@ -167,7 +167,7 @@ def run_year(args: argparse.Namespace, year: int) -> dict[str, object]:
             run_role(
                 args=args,
                 year=year,
-                role_name="local_3x3",
+                role_name="local_grid",
                 requests_path=str(args.local_requests_path),
                 parallelism=int(args.local_parallelism),
                 stage_root=stage_root,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert grouped regional multiscale EE exports into local-tile and regional-context sequences."""
+"""Convert grouped regional multiscale EE exports into local-grid and regional-context sequences."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ TILE_SUFFIX_PATTERN = re.compile(r"(?P<prefix>.+?)(?P<x>\d{10})-(?P<y>\d{10})$")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert grouped 3x3 + regional-context Earth Engine exports into sequence artifacts.",
+        description="Convert grouped local-grid plus regional-context Earth Engine exports into sequence artifacts.",
     )
     parser.add_argument("--input-dir", required=True, help="Root directory containing grouped request subdirectories.")
     parser.add_argument("--manifest-path", required=True, help="Regional multiscale manifest parquet or CSV.")
@@ -267,6 +267,10 @@ def _grid_lookup(local_manifest: pd.DataFrame) -> dict[str, list[dict[str, Any]]
                     "tile_chip_size": tile_chip_size,
                     "dx_idx": dx_idx,
                     "dy_idx": dy_idx,
+                    "grid_ring_index": int(getattr(row, "grid_ring_index", max(abs(dx_idx), abs(dy_idx)))),
+                    "local_grid_side": int(getattr(row, "local_grid_side", 0) or 0),
+                    "is_valid_local_target": bool(getattr(row, "is_valid_local_target", dx_idx == 0 and dy_idx == 0)),
+                    "is_inner_local_tile": bool(getattr(row, "is_inner_local_tile", max(abs(dx_idx), abs(dy_idx)) <= 1)),
                 }
             )
         dy_values = sorted({entry["dy_idx"] for entry in request_rows}, reverse=True)
@@ -383,6 +387,7 @@ def _finalize_record(
     week_records: list[dict[str, Any]],
     failed_chunks: list[dict[str, Any]],
     normalization_events: list[dict[str, Any]],
+    extra_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     np = require_numpy()
     week_records.sort(key=lambda entry: int(entry["week_index"]))
@@ -393,7 +398,7 @@ def _finalize_record(
     frame_mask = np.asarray([bool(entry["s2_ok"] and entry["s1_ok"]) for entry in week_records], dtype=bool)
     s2_frame_mask = np.asarray([bool(entry["s2_ok"]) for entry in week_records], dtype=bool)
     s1_frame_mask = np.asarray([bool(entry["s1_ok"]) for entry in week_records], dtype=bool)
-    return {
+    record = {
         "sequence_id": f"{sequence_prefix}::{sample_id}::{year}",
         "sample_id": sample_id,
         "search_group_id": region_id,
@@ -420,6 +425,9 @@ def _finalize_record(
         "collection_role": collection_role,
         "split": split,
     }
+    if extra_metadata:
+        record.update(extra_metadata)
+    return record
 
 
 def _local_records_for_group(
@@ -501,6 +509,14 @@ def _local_records_for_group(
                 week_records=tile_records[str(spec["tile_id"])],
                 failed_chunks=list(failed_chunks),
                 normalization_events=list(normalization_events),
+                extra_metadata={
+                    "grid_dx_idx": int(spec["dx_idx"]),
+                    "grid_dy_idx": int(spec["dy_idx"]),
+                    "grid_ring_index": int(spec["grid_ring_index"]),
+                    "local_grid_side": int(spec["local_grid_side"]),
+                    "is_valid_local_target": bool(spec["is_valid_local_target"]),
+                    "is_inner_local_tile": bool(spec["is_inner_local_tile"]),
+                },
             )
         )
     return records
@@ -623,6 +639,12 @@ def _write_npz_records(output_dir: Path, records: list[dict[str, Any]], *, index
             "tile_role": str(record["tile_role"]),
             "collection_role": str(record["collection_role"]),
             "split": str(record["split"]),
+            "grid_dx_idx": record.get("grid_dx_idx"),
+            "grid_dy_idx": record.get("grid_dy_idx"),
+            "grid_ring_index": record.get("grid_ring_index"),
+            "local_grid_side": record.get("local_grid_side"),
+            "is_valid_local_target": record.get("is_valid_local_target"),
+            "is_inner_local_tile": record.get("is_inner_local_tile"),
         }
         for record in records
     }
@@ -666,6 +688,12 @@ def _write_zarr_records(
             "tile_role": str(record["tile_role"]),
             "collection_role": str(record["collection_role"]),
             "split": str(record["split"]),
+            "grid_dx_idx": record.get("grid_dx_idx"),
+            "grid_dy_idx": record.get("grid_dy_idx"),
+            "grid_ring_index": record.get("grid_ring_index"),
+            "local_grid_side": record.get("local_grid_side"),
+            "is_valid_local_target": record.get("is_valid_local_target"),
+            "is_inner_local_tile": record.get("is_inner_local_tile"),
         }
         for record in records
     }
@@ -700,7 +728,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = _read_table(Path(args.manifest_path))
-    local_manifest = manifest[manifest["collection_role"] == "local_3x3_highres"].copy()
+    local_manifest = manifest[manifest["collection_role"].isin({"local_grid_highres", "local_3x3_highres"})].copy()
     regional_manifest = manifest[manifest["collection_role"] == "regional_context_lowres"].copy()
     local_lookup = _grid_lookup(local_manifest)
     regional_lookup = _regional_lookup(regional_manifest)
@@ -739,7 +767,7 @@ def main() -> int:
 
     if args.output_format in {"npz", "both"}:
         if local_records:
-            local_dir = output_dir / "local_3x3"
+            local_dir = output_dir / "local_grid"
             local_dir.mkdir(parents=True, exist_ok=True)
             local_rows = _write_npz_records(local_dir, local_records, index_name="dense_temporal_index.parquet")
         if regional_records:
@@ -749,13 +777,13 @@ def main() -> int:
 
     if args.output_format in {"zarr", "both"}:
         if local_records:
-            local_dir = output_dir / "local_3x3"
+            local_dir = output_dir / "local_grid"
             local_dir.mkdir(parents=True, exist_ok=True)
             local_zarr_rows = _write_zarr_records(
                 local_dir,
                 local_records,
                 index_name="dense_temporal_zarr_index.parquet",
-                shard_prefix="local_3x3_shard",
+                shard_prefix="local_grid_shard",
                 zarr_shard_size=int(args.zarr_shard_size),
                 zarr_compressor_clevel=int(args.zarr_compressor_clevel),
             )
@@ -772,8 +800,8 @@ def main() -> int:
             )
 
     if local_records:
-        _write_failures(output_dir / "local_3x3" / "failed_chunks.parquet", local_records)
-        _write_normalization(output_dir / "local_3x3" / "normalization_events.parquet", local_records)
+        _write_failures(output_dir / "local_grid" / "failed_chunks.parquet", local_records)
+        _write_normalization(output_dir / "local_grid" / "normalization_events.parquet", local_records)
     if regional_records:
         _write_failures(output_dir / "regional_context" / "failed_chunks.parquet", regional_records)
         _write_normalization(output_dir / "regional_context" / "normalization_events.parquet", regional_records)

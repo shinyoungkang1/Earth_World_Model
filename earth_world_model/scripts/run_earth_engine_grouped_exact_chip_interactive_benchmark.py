@@ -25,7 +25,7 @@ def require_pandas():
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run grouped exact-chip Earth Engine interactive downloads for local 3x3 and regional-context requests.",
+        description="Run grouped exact-chip Earth Engine interactive downloads for local-grid and regional-context requests.",
     )
     parser.add_argument("--project", required=True)
     parser.add_argument("--requests-path", required=True, help="CSV or parquet with grouped request rows.")
