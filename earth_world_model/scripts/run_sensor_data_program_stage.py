@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the combined HLS obs_events + decoder-target benchmark data program."""
+"""Build the combined HLS obs_events, static context, and decoder-target benchmark data program."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the sensor data program: HLS obs_events plus daily decoder targets and benchmark assembly.",
+        description="Run the sensor data program: HLS obs_events, static context, daily decoder targets, and benchmark assembly.",
     )
     parser.add_argument("--project", default="")
     parser.add_argument("--locations-path", default="")
@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--require-core-ready", action="store_true")
     parser.add_argument(
         "--stages",
-        default="core_check,hls,decoder",
-        help="Comma-separated stage set. Allowed: core_check,hls,decoder.",
+        default="core_check,hls,static,decoder",
+        help="Comma-separated stage set. Allowed: core_check,hls,static,decoder.",
     )
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--skip-existing", action="store_true")
@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path for program-level profile metadata JSON. Defaults to <output-root>/status/sensor_data_program_profile.json.",
     )
+    parser.add_argument(
+        "--inventory-json",
+        default="",
+        help="Optional path for unified inventory/resume manifest JSON. Defaults to <output-root>/status/sensor_data_inventory.json.",
+    )
     return parser.parse_args()
 
 
@@ -74,7 +79,7 @@ def parse_csv_tokens(raw: str) -> list[str]:
 
 
 def parse_stages(raw: str) -> list[str]:
-    allowed = {"core_check", "hls", "decoder"}
+    allowed = {"core_check", "hls", "static", "decoder"}
     stages = parse_csv_tokens(raw)
     if not stages:
         raise SystemExit("At least one stage must be selected.")
@@ -95,6 +100,33 @@ def run_command(argv: list[str]) -> None:
     subprocess.run(argv, check=True)
 
 
+def write_inventory(*, args: argparse.Namespace, output_root: Path, status_dir: Path) -> Path:
+    inventory_json = Path(args.inventory_json) if args.inventory_json else (status_dir / "sensor_data_inventory.json")
+    obs_events_dir = output_root / "obs_events"
+    static_dir = output_root / "static_context"
+    targets_dir = output_root / "state_targets_daily"
+    benchmarks_dir = output_root / "benchmarks"
+    inventory_argv = [
+        sys.executable,
+        str(SCRIPT_DIR / "build_sensor_data_inventory.py"),
+        "--yearly-root", args.yearly_root,
+        "--ssl4eo-root", args.ssl4eo_root,
+        "--yearly-train-index-path", args.yearly_train_index_path,
+        "--yearly-val-index-path", args.yearly_val_index_path,
+        "--hls-index-path", args.hls_index_path,
+        "--obs-events-parquet", str(obs_events_dir / "hls_obs_events_v1.parquet"),
+        "--obs-events-metadata-json", str(obs_events_dir / "hls_obs_events_v1_metadata.json"),
+        "--static-parquet", str(static_dir / "static_context_v1.parquet"),
+        "--static-metadata-json", str(static_dir / "static_context_v1_metadata.json"),
+        "--targets-dir", str(targets_dir),
+        "--benchmarks-dir", str(benchmarks_dir),
+        "--products", args.products,
+        "--output-json", str(inventory_json),
+    ]
+    run_command(inventory_argv)
+    return inventory_json
+
+
 def main() -> None:
     started_at = time.perf_counter()
     args = parse_args()
@@ -102,18 +134,22 @@ def main() -> None:
     output_root = Path(args.output_root)
     obs_events_dir = output_root / "obs_events"
     targets_dir = output_root / "state_targets_daily"
+    static_dir = output_root / "static_context"
     benchmarks_dir = output_root / "benchmarks"
     status_dir = output_root / "status"
     obs_events_dir.mkdir(parents=True, exist_ok=True)
     targets_dir.mkdir(parents=True, exist_ok=True)
+    static_dir.mkdir(parents=True, exist_ok=True)
     benchmarks_dir.mkdir(parents=True, exist_ok=True)
     status_dir.mkdir(parents=True, exist_ok=True)
     profile_json = Path(args.profile_json) if args.profile_json else (status_dir / "sensor_data_program_profile.json")
     profile_json.parent.mkdir(parents=True, exist_ok=True)
+    inventory_json = write_inventory(args=args, output_root=output_root, status_dir=status_dir)
     profile: dict[str, object] = {
         "stage": "sensor_data_program_v1",
         "selected_stages": stages,
         "max_parallel_products": int(max(1, args.max_parallel_products)),
+        "inventory_json": str(inventory_json),
         "stages": {},
     }
 
@@ -182,6 +218,46 @@ def main() -> None:
                 "output_metadata_json": str(hls_metadata),
             }
 
+    if "static" in stages:
+        stage_started = time.perf_counter()
+        if not args.locations_path:
+            raise SystemExit("--locations-path is required when stages include static")
+        static_parquet = static_dir / "static_context_v1.parquet"
+        static_metadata = static_dir / "static_context_v1_metadata.json"
+        if not (args.skip_existing and static_parquet.exists() and static_metadata.exists()):
+            static_argv = [
+                sys.executable,
+                str(SCRIPT_DIR / "extract_static_context_features.py"),
+                "--project", args.project,
+                "--locations-path", args.locations_path,
+                "--sample-id-column", args.sample_id_column,
+                "--latitude-column", args.latitude_column,
+                "--longitude-column", args.longitude_column,
+                "--batch-size", str(int(args.batch_size)),
+                "--max-samples", str(int(args.max_samples)),
+                "--aggregation", args.aggregation,
+                "--region-side-meters", str(float(args.region_side_meters)),
+                "--output-parquet", str(static_parquet),
+                "--output-metadata-json", str(static_metadata),
+            ]
+            if args.authenticate:
+                static_argv.append("--authenticate")
+            run_command(static_argv)
+            profile["stages"]["static"] = {
+                "status": "completed",
+                "elapsed_sec": float(time.perf_counter() - stage_started),
+                "output_parquet": str(static_parquet),
+                "output_metadata_json": str(static_metadata),
+            }
+        else:
+            print("Skipping static context extraction: existing outputs found.", flush=True)
+            profile["stages"]["static"] = {
+                "status": "skipped_existing",
+                "elapsed_sec": 0.0,
+                "output_parquet": str(static_parquet),
+                "output_metadata_json": str(static_metadata),
+            }
+
     if "decoder" in stages:
         stage_started = time.perf_counter()
         if not args.project:
@@ -231,6 +307,7 @@ def main() -> None:
         }
 
     profile["total_elapsed_sec"] = float(time.perf_counter() - started_at)
+    write_inventory(args=args, output_root=output_root, status_dir=status_dir)
     profile_json.write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
 

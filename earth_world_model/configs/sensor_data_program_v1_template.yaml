@@ -7,6 +7,7 @@ program:
 stages:
   - core_check
   - hls
+  - static
   - decoder
 
 inputs:
@@ -19,9 +20,13 @@ inputs:
 outputs:
   root: data/programs/sensor_data_program_v1
   status_json: data/programs/sensor_data_program_v1/status/core_observation_status.json
+  inventory_json: data/programs/sensor_data_program_v1/status/sensor_data_inventory.json
   obs_events:
     parquet: data/programs/sensor_data_program_v1/obs_events/hls_obs_events_v1.parquet
     metadata_json: data/programs/sensor_data_program_v1/obs_events/hls_obs_events_v1_metadata.json
+  static_context:
+    parquet: data/programs/sensor_data_program_v1/static_context/static_context_v1.parquet
+    metadata_json: data/programs/sensor_data_program_v1/static_context/static_context_v1_metadata.json
   state_targets_daily:
     dir: data/programs/sensor_data_program_v1/state_targets_daily
     files:
@@ -54,3 +59,8 @@ defaults:
     band_schema: hls6
     spatial_resolution_m: 30
     min_quality_score: 0.0
+  static_context:
+    dem_dataset: NASA/NASADEM_HGT/001
+    worldcover_dataset: ESA/WorldCover/v200
+    continuous_scale_meters: 30
+    landcover_scale_meters: 10

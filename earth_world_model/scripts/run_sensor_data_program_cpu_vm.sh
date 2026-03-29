@@ -4,6 +4,7 @@ set -euo pipefail
 # =============================================================================
 # Build the full sensor-data program on a CPU VM:
 # - HLS obs_events
+# - static context
 # - daily decoder targets
 # - aligned decoder benchmark
 # =============================================================================
@@ -12,7 +13,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 PROJECT_ID="${PROJECT_ID:-omois-483220}"
-STAGES="${STAGES:-core_check,hls,decoder}"
+STAGES="${STAGES:-core_check,hls,static,decoder}"
 HLS_INDEX_PATH="${HLS_INDEX_PATH:-}"
 YEARLY_ROOT="${YEARLY_ROOT:-}"
 SSL4EO_ROOT="${SSL4EO_ROOT:-}"
@@ -66,6 +67,11 @@ if [[ "$STAGES" == *"decoder"* ]]; then
     echo "Either REQUESTS_PATH or both START_DATE and END_DATE are required when STAGES includes decoder." >&2
     exit 1
   fi
+fi
+
+if [[ "$STAGES" == *"static"* && -z "$LOCATIONS_PATH" ]]; then
+  echo "LOCATIONS_PATH is required when STAGES includes static." >&2
+  exit 1
 fi
 
 mkdir -p "$OUTPUT_ROOT"

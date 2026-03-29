@@ -75,9 +75,28 @@ def load_locations(path: Path, *, sample_offset: int, sample_limit: int) -> list
     return load_location_rows(path, sample_offset=sample_offset, sample_limit=sample_limit)
 
 
+def to_jsonable(value: Any) -> Any:
+    """Recursively coerce numpy/pandas-style scalars into plain JSON types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_jsonable(item) for item in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return to_jsonable(item())
+        except Exception:
+            pass
+    return str(value)
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(to_jsonable(payload), indent=2), encoding="utf-8")
 
 
 def chunk_ranges(total_weeks: int, week_step: int) -> list[tuple[int, int]]:
