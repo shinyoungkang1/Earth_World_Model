@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an Earth Engine interactive-point CSV from candidate regions."""
+"""Build an Earth Engine interactive-point CSV from candidate regions or sampled center tables."""
 
 from __future__ import annotations
 
@@ -17,12 +17,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="0 means all remaining rows.")
     parser.add_argument("--sample-id-start", type=int, default=0)
     parser.add_argument("--sample-id-prefix", default="ee_batch_")
+    parser.add_argument(
+        "--force-regenerate-sample-ids",
+        action="store_true",
+        help="Regenerate sample_id even if the input table already contains one.",
+    )
     return parser.parse_args()
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
+    raise SystemExit(f"Unsupported regions format for {path}. Expected .csv or .parquet")
 
 
 def main() -> int:
     args = parse_args()
-    df = pd.read_parquet(args.regions_path)
+    df = read_table(args.regions_path)
     if args.offset > 0:
         df = df.iloc[int(args.offset) :].copy()
     if int(args.limit) > 0:
@@ -30,9 +44,12 @@ def main() -> int:
     if df.empty:
         raise SystemExit("No region rows selected")
 
-    start = int(args.sample_id_start)
     df = df.reset_index(drop=True)
-    df["sample_id"] = [f"{args.sample_id_prefix}{start + idx:08d}" for idx in range(len(df))]
+    if "sample_id" in df.columns and not args.force_regenerate_sample_ids:
+        df["sample_id"] = df["sample_id"].astype(str)
+    else:
+        start = int(args.sample_id_start)
+        df["sample_id"] = [f"{args.sample_id_prefix}{start + idx:08d}" for idx in range(len(df))]
     out = pd.DataFrame(
         {
             "sample_id": df["sample_id"],
@@ -44,6 +61,24 @@ def main() -> int:
             "latitude_band": df["latitude_band"],
         }
     )
+    passthrough_columns = [
+        "sampling_design",
+        "sampling_group_id",
+        "cluster_id",
+        "cluster_anchor_region_id",
+        "cluster_anchor_grid_x",
+        "cluster_anchor_grid_y",
+        "cluster_dx_idx",
+        "cluster_dy_idx",
+        "cluster_grid_radius",
+        "cluster_grid_side",
+        "bucket_id",
+        "grid_x",
+        "grid_y",
+    ]
+    for column in passthrough_columns:
+        if column in df.columns and column not in out.columns:
+            out[column] = df[column]
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(args.output_path, index=False)
     print({"rows": int(len(out)), "output_path": str(args.output_path)})

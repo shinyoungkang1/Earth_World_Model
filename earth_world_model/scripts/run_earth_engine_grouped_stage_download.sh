@@ -19,6 +19,7 @@ LOG_DIR="${LOG_DIR:-$HOME/bench_logs}"
 PRECHECK="${PRECHECK:-1}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
 AUTHENTICATE="${AUTHENTICATE:-0}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if [[ -z "$REQUESTS_PATH" ]]; then
   echo "REQUESTS_PATH is required" >&2
@@ -37,7 +38,7 @@ mkdir -p "$LOG_DIR" "$STAGE_ROOT"
 cd "$PROJECT_ROOT"
 
 write_manifest() {
-  python3 - <<'PY'
+  "$PYTHON_BIN" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -68,14 +69,11 @@ if [[ "$PRECHECK" == "1" ]]; then
     --locations-path "$REQUESTS_PATH"
     --stage-root "$STAGE_ROOT"
     --min-free-gb "$MIN_FREE_GB"
-    --sample-id-column sample_id
-    --latitude-column latitude
-    --longitude-column longitude
   )
   if [[ "$AUTHENTICATE" == "1" ]]; then
     PREFLIGHT_ARGS+=(--authenticate)
   fi
-  python3 "${PREFLIGHT_ARGS[@]}" >"$STAGE_ROOT/preflight.json"
+  "$PYTHON_BIN" "${PREFLIGHT_ARGS[@]}" >"$STAGE_ROOT/preflight.json"
 fi
 
 WEEK_STEP="${WEEK_STEP:-4}"
@@ -130,10 +128,15 @@ fi
   echo "[gee-grouped-stage] stage_name=$STAGE_NAME"
   echo "[gee-grouped-stage] stage_root=$STAGE_ROOT"
   echo "[gee-grouped-stage] log_path=$LOG_PATH"
+  echo "[gee-grouped-stage] python_bin=$PYTHON_BIN"
   printf '[gee-grouped-stage] command='
-  printf '%q ' python3 "${ARGS[@]}"
+  printf '%q ' "$PYTHON_BIN" "${ARGS[@]}"
   echo
-  /usr/bin/time -v python3 "${ARGS[@]}"
+  if [[ -x /usr/bin/time ]]; then
+    /usr/bin/time -v "$PYTHON_BIN" "${ARGS[@]}"
+  else
+    "$PYTHON_BIN" "${ARGS[@]}"
+  fi
   echo "[gee-grouped-stage] finish $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$LOG_PATH" 2>&1
 
